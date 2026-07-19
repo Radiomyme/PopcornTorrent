@@ -257,7 +257,7 @@ using namespace libtorrent;
     //set global variables
     firstPiece = startPiece;
     endPiece = finalPiece;
-    NSLog(@"fast forwarding to new start piece: %d", (int)startPiece);
+    // NSLog(@"fast forwarding to new start piece: %d", (int)startPiece); // silenced: debug spam
     
     //if we already have the requested part of the movie return immediately
     for(auto j = startPiece; j <= finalPiece; j++){
@@ -268,7 +268,7 @@ using namespace libtorrent;
         }
     }
     
-    NSLog(@"new start piece missing, downloading...");
+    // NSLog(@"new start piece missing, downloading..."); // silenced: debug spam
     //take control of the array from all of the other threads that might be accessing it
     mtx.lock();
     required_pieces.clear(); //clear all the pieces we wanted to download previously
@@ -503,9 +503,9 @@ using namespace libtorrent;
     // download first pieces
     MIN_PIECES = (ti->files().file_size(file_index) * 0.03) / ti->piece_length();
     MIN_PIECES = std::min(MIN_PIECES, 20);
-    NSLog(@"min pieces: %d", MIN_PIECES);
+    // NSLog(@"min pieces: %d", MIN_PIECES); // silenced: debug spam
     piece_index_t first_piece = ti->map_file(file_index, 0, 0).piece;
-    NSLog(@"first piece: %d", (int)first_piece);
+    // NSLog(@"first piece: %d", (int)first_piece); // silenced: debug spam
     for (int i = 0; i < MIN_PIECES; i++) {
         required_pieces.push_back(first_piece);
         first_piece++;
@@ -513,7 +513,7 @@ using namespace libtorrent;
     
     // download last pieces
     piece_index_t last_piece = ti->map_file(file_index, file_size - 1, 0).piece;
-    NSLog(@"last piece: %d", (int)last_piece);
+    // NSLog(@"last piece: %d", (int)last_piece); // silenced: debug spam
     lastFilePiece = last_piece;
     int maxEndPieces = MIN_PIECES <= 6 ? 1 : 2;
     for (int i = 0; i < maxEndPieces; i++) {
@@ -563,7 +563,7 @@ using namespace libtorrent;
 }
 
 - (void)pieceFinishedAlert:(torrent_handle)th forPieceIndex:(piece_index_t)index {
-    NSLog(@"downloaded piece: %d", (int)index);
+    // NSLog(@"downloaded piece: %d", (int)index); // silenced: debug spam
     _status = th.status();
     
     int requiredPiecesDownloaded = 0;
