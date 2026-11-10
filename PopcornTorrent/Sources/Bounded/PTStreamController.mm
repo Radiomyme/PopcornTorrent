@@ -638,30 +638,28 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
 }
 
 void StreamController::applyPriorities(lt::torrent& torrent, std::vector<uint8_t> const& priorities) {
-    int const pieceCount = torrent.torrent_file().num_pieces();
-    if (m_appliedPriorities.size() != size_t(m_count)) {
+    // Compared with libtorrent's own priorities every time, not with what was applied
+    // last: prioritize_files() takes a disk-thread round trip and then rewrites every
+    // piece of the file (to 7 for the selected file) after our first plan.
+    std::vector<int32_t> changed;
+    for (int32_t i = 0; i < m_count; ++i) {
+        auto const actual = static_cast<std::uint8_t>(torrent.piece_priority(lt::piece_index_t(m_first + i)));
+        if (actual != priorities[size_t(i)]) changed.push_back(i);
+    }
+    if (changed.empty()) return;
+    if (changed.size() > 64) {
+        int const pieceCount = torrent.torrent_file().num_pieces();
         lt::aux::vector<lt::download_priority_t, lt::piece_index_t> all(size_t(pieceCount), lt::dont_download);
         for (int32_t i = 0; i < m_count; ++i) {
             all[lt::piece_index_t(m_first + i)] = lt::download_priority_t(priorities[size_t(i)]);
         }
         torrent.prioritize_pieces(all);
-        m_appliedPriorities = priorities;
-        return;
+    } else {
+        for (int32_t i : changed) {
+            torrent.set_piece_priority(lt::piece_index_t(m_first + i), lt::download_priority_t(priorities[size_t(i)]));
+        }
     }
-    std::vector<int32_t> changed;
-    for (int32_t i = 0; i < m_count; ++i) {
-        if (m_appliedPriorities[size_t(i)] != priorities[size_t(i)]) changed.push_back(i);
-    }
-    if (changed.empty()) return;
-    if (changed.size() > 64) {
-        m_appliedPriorities.clear();
-        applyPriorities(torrent, priorities);
-        return;
-    }
-    for (int32_t i : changed) {
-        torrent.set_piece_priority(lt::piece_index_t(m_first + i), lt::download_priority_t(priorities[size_t(i)]));
-        m_appliedPriorities[size_t(i)] = priorities[size_t(i)];
-    }
+    m_appliedPriorities = priorities;
 }
 
 void StreamController::applyDeadlines(lt::torrent& torrent, std::vector<std::pair<int32_t, int>> const& deadlines) {
