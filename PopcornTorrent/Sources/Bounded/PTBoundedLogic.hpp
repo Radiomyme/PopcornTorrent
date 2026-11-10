@@ -116,6 +116,12 @@ struct PlanInput {
     int deadlineFirstMs = 0;        // deadline of the first window piece
     int deadlineStepMs = 0;         // added for each further piece (0 = flat)
     std::vector<uint8_t> const* states = nullptr; // pieceCount() entries, index = piece - firstPiece
+    std::vector<int32_t> urgentPieces; // pieces a reader waits for: fetched first wherever they are,
+                                       // unless freed or already consumed
+    int aheadLimitPieces = 0;       // bounded: while pieces the reader needs are missing, pieces
+                                    // further than this from the read piece are not wanted, so a
+                                    // late piece does not let the rest of the file fill the disk
+                                    // (0 = no cap)
 };
 
 struct PlanOutput {
@@ -124,6 +130,7 @@ struct PlanOutput {
     std::vector<int32_t> toFree;                    // pieces with data that are now consumed
     int32_t readPiece = 0;
     int32_t windowEndPiece = 0;     // first piece after the deadline window
+    bool urgent = false;            // pieces the reader needs now are missing (window, pins, waits)
     int64_t aheadBytes = 0;         // data at or after the read piece (pins excluded)
     int64_t behindBytes = 0;        // data before the read piece still kept (pins excluded)
     int64_t pinnedBytes = 0;        // data in pinned pieces
@@ -154,6 +161,8 @@ struct PaceInput {
     int64_t reserveBytes = 0;
     int floorRate = 64 * 1024;     // keeps peers busy while the window is full
     int trickleRate = 8 * 1024;    // window overfull or disk below the reserve
+    bool urgent = false;           // pieces the reader needs now are missing (deadline window,
+                                   // pins, waited pieces): never throttle then
 };
 
 struct PaceOutput {
@@ -162,6 +171,8 @@ struct PaceOutput {
 };
 
 /// Never pauses: it only ever lowers the rate to a small floor so peers stay connected.
+/// While libtorrent has time-critical pieces it keeps one normal request per peer, so
+/// the overshoot of an unthrottled urgent phase stays within the deadline window.
 PaceOutput pace(PaceInput const& input);
 
 #pragma mark - Container head parser

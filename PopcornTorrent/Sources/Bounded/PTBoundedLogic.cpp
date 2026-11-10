@@ -190,8 +190,35 @@ PlanOutput planWindow(PlanInput const& in) {
 
     if (!in.bounded) out.windowEndPiece = std::max(out.readPiece, lastDeadlinePiece + 1);
 
+    for (int32_t piece : in.urgentPieces) {
+        if (piece < first || piece > last) continue;
+        size_t const i = size_t(piece - first);
+        if ((*in.states)[i] != PieceMissing) continue;
+        bool const consumedPiece = in.bounded && !isPinned(geo, in.pins, piece)
+            && geo.pieceEnd(piece) + guardBytes <= consumed;
+        if (consumedPiece) continue;
+        bool const scheduled = out.priorities[i] == 7 && std::any_of(out.deadlines.begin(), out.deadlines.end(),
+            [piece](std::pair<int32_t, int> const& d) { return d.first == piece; });
+        out.priorities[i] = 7;
+        if (!scheduled) out.deadlines.emplace_back(piece, in.deadlineFirstMs);
+        out.urgent = true;
+    }
+
+
     int const pinMs = in.deadlineFirstMs + windowPieces * in.deadlineStepMs;
     for (int32_t piece : missingPins) out.deadlines.emplace_back(piece, pinMs);
+    out.urgent = !out.deadlines.empty();
+
+    // A piece the reader needs is late: until it is here, nothing beyond the ahead
+    // budget is wanted. Back to priority 1 afterwards (the torrent never "finishes"
+    // early, since the late piece is still wanted meanwhile).
+    if (in.bounded && out.urgent && in.aheadLimitPieces > 0) {
+        int32_t const capPiece = out.readPiece + std::max(in.aheadLimitPieces, windowPieces);
+        for (int32_t piece = std::max(capPiece, first); piece <= last; ++piece) {
+            size_t const i = size_t(piece - first);
+            if ((*in.states)[i] == PieceMissing && out.priorities[i] == 1) out.priorities[i] = 0;
+        }
+    }
 
     out.lowestAvailableOffset = in.bounded ? std::min(lowest, geo.fileSize) : 0;
     return out;
@@ -216,6 +243,14 @@ std::vector<int32_t> piecesToDrop(PlanInput const& in, PlanOutput const& plan, i
 
 PaceOutput pace(PaceInput const& in) {
     PaceOutput out;
+    if (in.urgent) {
+        // The reader waits: the pieces it needs come first (priority 7), so the rate is
+        // not what fills the disk. Only a disk below half the reserve slows them down.
+        bool const critical = in.freeBytes < in.reserveBytes / 2;
+        out.downloadLimit = critical ? in.floorRate : 0;
+        out.state = critical ? PaceState::Emergency : PaceState::Open;
+        return out;
+    }
     if (in.freeBytes < in.reserveBytes) {
         out.downloadLimit = in.trickleRate;
         out.state = PaceState::Emergency;

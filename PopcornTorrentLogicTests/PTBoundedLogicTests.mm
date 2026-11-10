@@ -241,6 +241,72 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertTrue(plan.toFree.empty());
 }
 
+- (void)testPiecesReadersWaitForAreFetchedFirst {
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceMissing);
+    for (int i = 0; i <= 60; ++i) states[size_t(i)] = PieceOnDisk;
+    states[20] = PieceFreed;
+    states[45] = PieceMissing;
+    PlanInput input;
+    input.geometry = geo;
+    input.bounded = true;
+    input.readPosition = 50 * kMiB;
+    input.consumedBefore = 30 * kMiB;
+    input.pins.headEnd = 2 * kMiB;
+    input.deadlinePieces = 4;
+    input.deadlineFirstMs = 100;
+    input.deadlineStepMs = 50;
+    input.states = &states;
+    // A gap behind the reader, a piece far ahead, a freed piece and a consumed one.
+    input.urgentPieces = {45, 90, 20, 10};
+    states[10] = PieceMissing;
+    PlanOutput const plan = planWindow(input);
+    XCTAssertEqual(plan.priorities[45], 7);
+    XCTAssertEqual(plan.priorities[90], 7);
+    XCTAssertEqual(plan.priorities[20], 0);
+    XCTAssertEqual(plan.priorities[10], 0);
+    int found = 0;
+    for (auto const& d : plan.deadlines) {
+        if (d.first == 45 || d.first == 90) { ++found; XCTAssertEqual(d.second, 100); }
+        XCTAssertNotEqual(d.first, 20);
+        XCTAssertNotEqual(d.first, 10);
+    }
+    XCTAssertEqual(found, 2);
+}
+
+- (void)testLatePiecesCapTheRestOfTheFile {
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceMissing);
+    for (int i = 20; i < 40; ++i) states[size_t(i)] = PieceOnDisk; // arrived before the window
+    PlanInput input;
+    input.geometry = geo;
+    input.bounded = true;
+    input.readPosition = 0;
+    input.pins.headEnd = 1 * kMiB;
+    input.pins.tailStart = 99 * kMiB;
+    input.deadlinePieces = 4;
+    input.aheadLimitPieces = 30;
+    input.states = &states;
+    PlanOutput plan = planWindow(input);
+    XCTAssertTrue(plan.urgent);
+    XCTAssertEqual(plan.priorities[2], 7);   // window
+    XCTAssertEqual(plan.priorities[10], 1);  // within the ahead budget
+    XCTAssertEqual(plan.priorities[30], 1);  // on disk: unchanged
+    XCTAssertEqual(plan.priorities[45], 0);  // beyond it: not wanted while the window is late
+    XCTAssertEqual(plan.priorities[99], 7);  // pinned tail
+    // Window on disk: everything ahead is wanted again (paced instead).
+    for (int i = 0; i < 4; ++i) states[size_t(i)] = PieceOnDisk;
+    states[99] = PieceOnDisk;
+    plan = planWindow(input);
+    XCTAssertFalse(plan.urgent);
+    XCTAssertEqual(plan.priorities[45], 1);
+    // Full mode is never capped.
+    input.bounded = false;
+    states[2] = PieceMissing;
+    plan = planWindow(input);
+    XCTAssertEqual(plan.priorities[45], 1);
+}
+
 - (void)testUnboundedPlanKeepsTheWholeFileWanted {
     FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
     std::vector<uint8_t> states(100, PieceMissing);
@@ -318,6 +384,17 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     out = pace(input);
     XCTAssertTrue(out.state == PaceState::Trickle);
     XCTAssertGreaterThan(out.downloadLimit, 0); // a limit of 0 would mean unlimited
+
+    input.urgent = true; // the reader waits for a piece: not throttled
+    out = pace(input);
+    XCTAssertTrue(out.state == PaceState::Open);
+    XCTAssertEqual(out.downloadLimit, 0);
+    input.freeBytes = 200 * kMiB; // ... unless the disk is below half the reserve
+    out = pace(input);
+    XCTAssertTrue(out.state == PaceState::Emergency);
+    XCTAssertEqual(out.downloadLimit, input.floorRate);
+    input.freeBytes = 2 * kGiB;
+    input.urgent = false;
 
     input.aheadBytes = 10 * kMiB;
     input.freeBytes = 100 * kMiB;
