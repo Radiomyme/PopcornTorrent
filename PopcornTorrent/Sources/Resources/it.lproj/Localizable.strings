@@ -7,3 +7,6 @@
 /* (No Commment) */
 "Could not create download directory" = "Impossibile creare la cartella di download";
 
+
+/* (No Commment) */
+"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "Non c'è abbastanza spazio per riprodurre questo video, nemmeno con lo spazio limitato. Cancella almeno %1$@ e riprova.";

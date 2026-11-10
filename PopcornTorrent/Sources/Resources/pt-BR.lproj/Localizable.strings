@@ -7,3 +7,6 @@
 /* (No Commment) */
 "There is not enough space to download the torrent. Please clear at least %@ and try again." = "Não há espaço suficiente para baixar o torrent. Limpe pelo menos %1$@ e tente novamente.";
 
+
+/* (No Commment) */
+"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "Não há espaço suficiente para reproduzir este vídeo, nem mesmo com armazenamento limitado. Limpe pelo menos %1$@ e tente novamente.";

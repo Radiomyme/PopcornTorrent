@@ -7,3 +7,6 @@
 
 "Could not create download directory" = "Could not create download directory";
 
+
+/* Bounded storage cannot start. {Amount of space the user has to free} */
+"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "There is not enough space to stream this video, even with limited storage. Please clear at least %1$@ and try again.";

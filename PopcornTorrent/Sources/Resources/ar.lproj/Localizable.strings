@@ -7,3 +7,6 @@
 /* (No Commment) */
 "Could not create download directory" = "لا يمكن إنشاء تحميل مباشر";
 
+
+/* (No Commment) */
+"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "لا توجد مساحة كافية لتشغيل هذا الفيديو حتى مع التخزين المحدود. الرجاء تنظيف %1$@ على الأقل وحاول مجدداً";
