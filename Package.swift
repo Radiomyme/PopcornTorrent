@@ -31,6 +31,13 @@ let package = Package(
                 .linkedFramework("SystemConfiguration")
             ]
         ),
+        // Pure logic of bounded storage (offline, no network): swift test --filter PopcornTorrentLogicTests
+        .testTarget(name: "PopcornTorrentLogicTests",
+                    dependencies: ["PopcornTorrent"],
+                    path: "PopcornTorrentLogicTests",
+                    linkerSettings: [
+                        .linkedFramework("MediaPlayer")
+                    ]),
         .testTarget(name: "PopcornTorrent-Tests",
                     dependencies: [.targetItem(name: "PopcornTorrent", condition: nil)],
                     path: "PopcornTorrentTests",
