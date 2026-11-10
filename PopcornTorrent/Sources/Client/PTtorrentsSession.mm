@@ -27,6 +27,9 @@ using namespace libtorrent;
 
 #define ALERTS_LOOP_WAIT_MILLIS 500
 
+// Testing aid: -1 = normal session, otherwise the loopback port (0 = any).
+static int PTLoopbackTestingPort = -1;
+
 @interface PTTorrentsSession () {
 }
 
@@ -39,6 +42,14 @@ using namespace libtorrent;
 
 @implementation PTTorrentsSession {
     libtorrent::session *_session;
+}
+
++ (void)prepareSharedSessionForLoopbackTestingOnPort:(int)port {
+    PTLoopbackTestingPort = MAX(0, port);
+}
+
+- (int)listenPort {
+    return _session ? (int)_session->listen_port() : 0;
 }
 
 + (instancetype)sharedSession {
@@ -86,7 +97,6 @@ using namespace libtorrent;
 }
 
 - (void)setupSession {
-    _session = new session();
     settings_pack pack = default_settings();
     
     auto dht_nodes = pack.get_str(settings_pack::dht_bootstrap_nodes);
@@ -111,7 +121,19 @@ using namespace libtorrent;
     pack.set_bool(settings_pack::enable_natpmp, false);
     pack.set_bool(settings_pack::upnp_ignore_nonrouters, true);
     pack.set_int(settings_pack::file_pool_size, 2);
-    _session->apply_settings(pack);
+
+    if (PTLoopbackTestingPort >= 0) {
+        // Offline tests: localhost only, no DHT, LSD, UPnP or NAT-PMP.
+        pack.set_str(settings_pack::listen_interfaces, "127.0.0.1:" + std::to_string(PTLoopbackTestingPort));
+        pack.set_int(settings_pack::max_retry_port_bind, 0);
+        pack.set_str(settings_pack::dht_bootstrap_nodes, "");
+        pack.set_bool(settings_pack::enable_dht, false);
+        pack.set_bool(settings_pack::enable_lsd, false);
+        pack.set_bool(settings_pack::allow_multiple_connections_per_ip, true);
+    }
+
+    // Settings take effect before the session starts (no split second of defaults).
+    _session = new session(session_params(std::move(pack)));
     
     // Enabling plugins
     _session->add_extension(&lt::create_smart_ban_plugin);
@@ -222,35 +244,57 @@ using namespace libtorrent;
         [UIApplication sharedApplication].networkActivityIndicatorVisible = YES;
     });
 #endif
+    return th;
 }
 
 - (void)torrentFinishedAlert:(torrent_handle)th {
+    // The streamer decides: full mode pauses the finished torrent, bounded mode keeps it.
     NSString *hashID = [self hashIDForTorrentHandle:th];
     [self.streamers[hashID] torrentFinishedAlert:th];
-    [self removeTorrent:self.streamers[hashID]];
+}
+
+- (void)finishTorrent:(PTTorrentStreamer *)torrentStreamer {
+    auto torrent = torrentStreamer.torrentHandle;
+    if (!torrent.is_valid()) {
+        return;
+    }
+    // Not auto-managed any more, or libtorrent's auto-manager would resume it and seed in the background.
+    torrent.unset_flags(torrent_flags::auto_managed);
+    if (torrent.need_save_resume_data()) {
+        torrent.save_resume_data();
+    }
+    torrent.flush_cache();
+    torrent.pause(torrent_handle::graceful_pause);
 }
 
 - (void)removeTorrent:(PTTorrentStreamer *)torrentStreamer {
+    [self removeTorrent:torrentStreamer deleteFiles:NO saveResumeData:YES];
+}
+
+- (void)removeTorrent:(PTTorrentStreamer *)torrentStreamer deleteFiles:(BOOL)deleteFiles saveResumeData:(BOOL)saveResumeData {
     if (!torrentStreamer.torrentHandle.is_valid()) {
         return;
     }
     
     auto torrent = torrentStreamer.torrentHandle;
     NSString *hashId = [self hashIDForTorrentHandle:torrent];
-    if (!self.streamers[hashId]) {
-        return;
+    PTTorrentStreamer *registered = self.streamers[hashId];
+    if (registered != nil && registered != torrentStreamer) {
+        return; // the torrent belongs to another streamer of this session
     }
     
     self.streamers[hashId] = NULL;
     
-    if (torrent.need_save_resume_data()) {
+    if (saveResumeData && !deleteFiles && torrent.need_save_resume_data()) {
         torrent.save_resume_data();
     }
     torrent.flush_cache();
     
-    // Remove the torrent when its finished
+    // A paused auto-managed torrent is resumed by libtorrent's auto-manager and keeps
+    // downloading in the background: take it out of the session for good.
+    torrent.unset_flags(torrent_flags::auto_managed);
     torrent.pause(torrent_handle::graceful_pause);
-//    _session->remove_torrent(torrent); // not removing because it might crash on stale tracker that don't respond
+    _session->remove_torrent(torrent, deleteFiles ? session_handle::delete_files : remove_flags_t{});
 
 #if TARGET_OS_IOS
     if (_session->get_torrents().empty()) {
@@ -262,19 +306,15 @@ using namespace libtorrent;
 }
 
 - (void)fileErrorAlert:(file_error_alert *)alert {
-    auto torrent = alert->handle;
-    
     NSString *description = [NSString stringWithFormat:@"%s", alert->message().c_str()];
-    NSError *error = [[NSError alloc] initWithDomain:@"com.popcorntimetv.popcorntorrent.error" code:-4 userInfo:@{NSLocalizedDescriptionKey: description}];
+    BOOL diskFull = alert->error == boost::system::errc::no_space_on_device || alert->error.value() == EDQUOT;
     NSString *hashID = [self hashIDForTorrentHandle:alert->handle];
-    [self.streamers[hashID] handleTorrentError:error];
+    [self.streamers[hashID] fileErrorAlert:description diskFull:diskFull];
 }
 
 - (void)saveResumeDataWithAlert:(save_resume_data_alert *)alert {
-    torrent_status st = alert->handle.status(torrent_handle::query_save_path
-                                             | torrent_handle::query_name);
-    NSString *directory =  [NSString stringWithUTF8String:(st.save_path + "/resumeData.fastresume").c_str()];
-    NSString *hashID = [self hashIDForTorrentHandle:alert->handle];
+    // The alert carries the save path: the torrent may already be removed from the session.
+    NSString *directory =  [NSString stringWithUTF8String:(alert->params.save_path + "/resumeData.fastresume").c_str()];
 
     auto const buf = write_resume_data_buf(alert->params);
     std::string str(buf.begin(), buf.end());

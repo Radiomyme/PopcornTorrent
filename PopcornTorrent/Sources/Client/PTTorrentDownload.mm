@@ -111,6 +111,8 @@ using namespace libtorrent;
     if (self) {
         _downloadStatus = downloadStatus;
         _mediaMetadata = mediaMetadata;
+        // A download keeps the whole file: never bounded storage.
+        self.allowsBoundedStorage = NO;
     }
     return self;
 }

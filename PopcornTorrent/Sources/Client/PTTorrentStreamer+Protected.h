@@ -10,6 +10,12 @@
 
 #import <GCDWebServer.h>
 
+#include <memory>
+
+namespace ptbounded {
+class StreamController;
+}
+
 using namespace libtorrent;
 
 /**
@@ -30,10 +36,12 @@ using namespace libtorrent;
     std::mutex mtx;
     int MIN_PIECES; //they are calculated by divind the 3% of a torrent file size with the size of a torrent piece / selected file in case we load a multi movie torrent
     int selectedFileIndex;
+    // Piece availability, download window and bounded storage of the current stream.
+    // Shared with the HTTP responses and the libtorrent plugin: use -controller (atomic load).
+    std::shared_ptr<ptbounded::StreamController> _controller;
 }
 
 @property (nonatomic, getter=isStreaming) BOOL streaming;
-@property (nonatomic, strong, nonnull) NSMutableDictionary *requestedRangeInfo;
 
 @property (nonatomic, strong, nonnull) PTTorrentsSession *session;
 @property (nonatomic) bool deleteOnlyDownloadedFile;
@@ -48,6 +56,7 @@ using namespace libtorrent;
 @property (nonatomic) bool isFinished;
 
 - (void)startWebServerAndPlay;
+- (std::shared_ptr<ptbounded::StreamController>)controller;
 
 @end
 
@@ -57,6 +66,7 @@ using namespace libtorrent;
 - (void)pieceFinishedAlert:(torrent_handle)th forPieceIndex:(piece_index_t)index;
 - (void)torrentFinishedAlert:(torrent_handle)th;
 - (void)handleTorrentError:(NSError *_Nullable)error;
+- (void)fileErrorAlert:(NSString *_Nonnull)description diskFull:(BOOL)diskFull;
 - (void)prioritizeNextPieces:(torrent_handle)th;
 
 @end
