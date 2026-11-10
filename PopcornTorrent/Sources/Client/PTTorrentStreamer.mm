@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 #import <string>
 #import <sys/stat.h>
+#import <mutex>
 #import <libtorrent/bencode.hpp>
 #import "../Security/CocoaSecurity.h"
 #import "../Resources/NSString+Localization.h"
@@ -29,6 +30,8 @@ using namespace libtorrent;
     int64_t _storageBudget;
     NSTimeInterval _mediaDurationHint;
     PTStorageMode _storageMode;
+    // _status holds strings: it is written from the alerts queue and the main queue.
+    std::mutex _statusMutex;
 }
 
 - (instancetype)init {
@@ -73,7 +76,7 @@ using namespace libtorrent;
     endPiece = libtorrent::piece_index_t(0);
     lastFilePiece = libtorrent::piece_index_t(0);
 
-    _status = torrent_status();
+    self.status = torrent_status();
     if(self.mediaServer == nil)self.mediaServer = [[GCDWebServer alloc] init];
 
 }
@@ -279,7 +282,7 @@ using namespace libtorrent;
     required_pieces.clear();
     required_pieces.shrink_to_fit();
 
-    _status = torrent_status();
+    self.status = torrent_status();
 
     self.progressBlock = nil;
     self.readyToPlayBlock = nil;
@@ -323,7 +326,7 @@ using namespace libtorrent;
 }
 
 - (void)processTorrent:(torrent_handle)th {
-    _status = th.status();
+    self.status = th.status();
     dispatch_async(dispatch_get_main_queue(), ^{
         [self evaluateReadiness];
     });
@@ -584,12 +587,13 @@ using namespace libtorrent;
 
 - (void)updateAndMonitorTorrentProgress {
     BOOL const bounded = self.storageMode == PTStorageModeBounded;
-    if (!_progressBlock || !_torrentHandle.is_valid() || (_status.is_finished && !bounded)) {
+    if (!_progressBlock || !_torrentHandle.is_valid() || (self.status.is_finished && !bounded)) {
         return;
     }
 
-    _status = _torrentHandle.status();
-    [self refreshTorrentStatus:_status];
+    torrent_status const status = _torrentHandle.status();
+    self.status = status;
+    [self refreshTorrentStatus:status];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (_progressBlock) _progressBlock(_torrentStatus);
@@ -602,8 +606,9 @@ using namespace libtorrent;
 }
 
 - (void)pieceFinishedAlert:(torrent_handle)th forPieceIndex:(piece_index_t)index {
-    _status = th.status();
-    [self refreshTorrentStatus:_status];
+    torrent_status const status = th.status();
+    self.status = status;
+    [self refreshTorrentStatus:status];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (_progressBlock) _progressBlock(_torrentStatus);
@@ -614,11 +619,12 @@ using namespace libtorrent;
 
 - (void)torrentFinishedAlert:(torrent_handle)th {
     [self processTorrent:th];
+    torrent_status const status = self.status;
 
     if (self.storageMode == PTStorageModeBounded) {
         // Every wanted piece is here, but the reader may still seek into a gap:
         // keep the torrent running. It is removed at cancel.
-        [self refreshTorrentStatus:_status];
+        [self refreshTorrentStatus:status];
         dispatch_async(dispatch_get_main_queue(), ^{
             if (_progressBlock) _progressBlock(_torrentStatus);
             [[NSNotificationCenter defaultCenter] postNotificationName:PTTorrentStatusDidChangeNotification object:self];
@@ -628,14 +634,14 @@ using namespace libtorrent;
 
     _torrentStatus = {
         1, 1,
-        _status.download_rate,
-        _status.upload_rate,
-        _status.num_seeds,
-        _status.num_peers
+        status.download_rate,
+        status.upload_rate,
+        status.num_seeds,
+        status.num_peers
     };
 
-    _totalDownloaded = _status.total_wanted_done;
-    _isFinished = _status.is_finished;
+    _totalDownloaded = status.total_wanted_done;
+    _isFinished = status.is_finished;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (_progressBlock) _progressBlock(_torrentStatus);
@@ -644,6 +650,18 @@ using namespace libtorrent;
 
     // Stop the finished torrent (no seeding); it is removed from the session at cancel.
     [self.session finishTorrent:self];
+}
+
+@synthesize status = _status;
+
+- (torrent_status)status {
+    std::lock_guard<std::mutex> lock(_statusMutex);
+    return _status;
+}
+
+- (void)setStatus:(torrent_status)status {
+    std::lock_guard<std::mutex> lock(_statusMutex);
+    _status = std::move(status);
 }
 
 #pragma mark - Bounded storage
