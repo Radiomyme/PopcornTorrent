@@ -10,7 +10,7 @@ At metadata time (`metadataReceivedAlert`), `planBudget` (`Sources/Bounded/PTBou
 
 | Situation | Mode |
 |---|---|
-| selected file (minus what is already allocated on disk) + `storageReserve` ≤ free space | **Full**: legacy behaviour, the whole file is downloaded and kept |
+| selected file (minus what is already allocated on disk) + `storageReserve` + `appWorkingSetSeconds` of the bitrate ≤ free space | **Full**: legacy behaviour, the whole file is downloaded and kept |
 | otherwise, free space ≥ minimum working set | **Bounded** |
 | otherwise | **Refused**: error `PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage` (-5), localized message with the space to clear |
 | `allowsBoundedStorage == NO` (the default; always for `PTTorrentDownload`), or a volume without holes (not APFS: `pathconf(_PC_MIN_HOLE_SIZE)`) | legacy check, unchanged: refused with -4 when the file does not fit |
@@ -22,11 +22,20 @@ a window stuck at the start of the file that fills its budget and stalls, instea
 of today's clear refusal.
 
 Free space is `NSURLVolumeAvailableCapacityKey` read on a fresh URL (a reused
-`NSURL` caches its values). The minimum working set is
-`reserve + pins (64 MiB + the tail pin) + max(256 MiB, 60 s) + inflight (max(32 MiB, 4 pieces)) + 240 s`
-of the bitrate (the app's HLS copy: 180 s ahead, 60 s behind). The bitrate is
-`fileSize / mediaDurationHint`, or `fileSize / 2 h` when the duration is unknown.
-About 1.25 GiB for a 13 GB 2 h film, 2.6 GiB for a 60 GB 4K film at 7 MB/s.
+`NSURL` caches its values), minus `pendingExternalBytes` (what offline downloads in
+progress will still write: their files are sparse, the free space does not show it
+yet). The minimum working set is
+`reserve + pins (64 MiB + the tail pin) + max(256 MiB, 60 s) + inflight (max(32 MiB, 4 pieces)) + 240 s + max(32 MiB, 20 s)`
+of the bitrate (the app's HLS copy: 180 s ahead, 60 s behind, and its headroom: the
+segment being written). The bitrate is `fileSize / mediaDurationHint`, or
+`fileSize / 2 h` when the duration is unknown. About 1.26 GiB for a 13 GB 2 h 10 film,
+2.76 GiB for a 60 GB 4K film at 7 MB/s.
+
+`appWorkingSetSeconds` (default 0) is what the app keeps next to the WHOLE file in
+full mode (the PopcornTimeTV remux: 400 s of HLS around the playhead, which no disk
+budget deletes): without it a film that fits only by itself streams in full mode and
+the sparse download and the HLS copy fill the volume together late in the film
+(ENOSPC → -4). With it such a film streams bounded.
 
 ## API (PTTorrentStreamer.h)
 
@@ -36,6 +45,8 @@ About 1.25 GiB for a 13 GB 2 h film, 2.6 GiB for a 60 GB 4K film at 7 MB/s.
 @property (atomic) int64_t storageReserve;           // default 512 MiB, never used
 @property (atomic) int64_t storageBudget;            // torrent's share; 0 = automatic; any time
 @property (atomic) NSTimeInterval mediaDurationHint; // seconds, 0 = unknown
+@property (atomic) NSTimeInterval appWorkingSetSeconds; // media the app keeps next to a full file (0)
+@property (atomic) int64_t pendingExternalBytes;     // other writers' bytes to come: not free; any time
 @property (atomic, readonly) PTStorageMode storageMode;  // Undetermined / Full / Bounded
 @property (atomic, readonly, getter=isStorageBounded) BOOL storageBounded;
 @property (atomic) int64_t readPosition;             // setReadPosition: next byte the consumer needs
@@ -150,7 +161,7 @@ Only pieces of the selected file are ever wanted (fixes the old
 | Pieces | Priority |
 |---|---|
 | other files | 0 |
-| pinned head: up to the first MKV Cluster / end of the MP4 `moov` (parsed from the file, `parseHeadPins`), 32 MiB if unknown, at most 64 MiB; 64 MiB until parsed | 7 |
+| pinned head: MKV up to the first Cluster and at least 64 MiB (`kMatroskaHeadPinBytes`: what a player opening the file again reads before its first seek lands — VLCKit 4 over HTTP read 20-30 MB of the first clusters and prefetch), end of the MP4 `moov` (parsed from the file, `parseHeadPins`), 32 MiB if unknown, at most 64 MiB; 64 MiB until parsed | 7 |
 | pinned tail: at least 8 MiB in whole pieces (`tailPinPieces`: 2 pieces of 4 MiB or more, at most 10 small pieces, never fewer than before) + an MP4 `moov` stored after `mdat` | 7 |
 | a piece the head parser waits for | 7 |
 | window: `[read piece, +N)` with N ≥ 32 MiB | 7 |
@@ -266,6 +277,23 @@ rewinding further back than what is on disk is blocked).
 
 ### Disk full
 
+Nothing is ever dropped once every piece from the read piece to the end of the file is
+on disk (`onDiskToTheEnd`): nothing more is downloaded then, and the consumer may take
+the rest of the file as final (the app's remux marks its input complete there, cuts
+its last segment, and reads zeros as data from then on).
+
+Backstop, allocation runaway (`reclaimAllocatedHoles`): in the offline end-to-end runs
+of the app the file's allocation twice grew to nearly the whole file within a second of
+the first write of the tail pins, while its data was a few pieces (cause not found:
+libtorrent's sparse storage never preallocates, and plain writes, SEEK_HOLE and
+F_PUNCHHOLE on the same volumes stayed sparse); the volume filled up and libtorrent
+stayed in upload mode. While free space is below the reserve and the file holds more
+than its data, its pieces' partial downloads, the pending holes and the in-flight
+allowance plus max(64 MiB, 4 pieces), every missing piece libtorrent has no block of
+(not in its download queue) is punched back to a hole, on the network thread (no block
+can be requested meanwhile), at most every 2 s. Statistics key `reclaimedBytes`; the
+`PT_BOUNDED_DEBUG` trace and the console log `allocation runaway`.
+
 In bounded mode a `file_error_alert` with ENOSPC/EDQUOT does not end the stream:
 the controller shrinks the ahead budget by 25 % (down to 50 %), drops on-disk
 pieces farthest ahead of the reader (they are punched, then wanted again; never
@@ -379,7 +407,7 @@ aheadBudget, aheadBytes, behindBytes, pinnedBytes, dataBytes, bytesOnDisk,
 freeBytes, reserveBytes, readPosition, consumedBefore, lowestAvailableOffset,
 servedOffset, headPinEnd, tailPinStart, everDownloaded, freedPieces,
 droppedPieces, punchedBytes, punchErrors, diskFullEvents, fileErrors,
-dontHaveSent, partialPiecesPunched, waitingReads, downloadLimit, paceState
+dontHaveSent, partialPiecesPunched, reclaimedBytes, waitingReads, downloadLimit, paceState
 (0 open, 1 proportional, 2 floor, 3 trickle, 4 emergency), consumeRate`.
 
 `PT_BOUNDED_DEBUG=1` in the environment (Xcode scheme) logs the controller's
@@ -475,6 +503,22 @@ AddressSanitizer build (`swift build --sanitize=address`), with no report.
 Previous results (2026-11-10, before the review fixes): bounded 24/24 by the
 older check list, full 13/13, ballast 23/24 (pause check), forced ENOSPC 22/24
 (probe checks).
+
+### VLC after a hand-off (app side, measured with VLCKit 4.0.0a21)
+
+VLC's own Matroska demuxer does not seek through the Cues over HTTP: it reads every
+byte from the last cluster it has seen up to the target (on a local file it uses the
+Cues). In bounded mode those bytes are deleted (410: VLC stalls) or would be downloaded
+whole. libavformat's demuxer (`:demux=avformat`) seeks through the Cues at once; over a
+test server answering 410 past 64 MiB it read the head (≤ 30 MB), the Cues, then the
+target, and played. The app opens a bounded Matroska stream with it when VLC starts at a
+position; its subtitle tracks of the file and track names are not available then.
+
+### Results (Mac, 2026-11-11, part 2 fixes)
+
+| Run | Result |
+|---|---|
+| unit tests (`PopcornTorrentLogicTests`) | 31/31 (4 new: no drop once the rest of the file is on disk, app headroom in the minimum, full mode leaves room for the app's copy, pending external bytes; the Matroska head pin test extended) |
 
 ## Limits and open points
 
