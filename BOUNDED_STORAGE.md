@@ -23,7 +23,7 @@ of today's clear refusal.
 
 Free space is `NSURLVolumeAvailableCapacityKey` read on a fresh URL (a reused
 `NSURL` caches its values). The minimum working set is
-`reserve + pins (64 MiB + 2 pieces) + max(256 MiB, 60 s) + inflight (max(32 MiB, 4 pieces)) + 240 s`
+`reserve + pins (64 MiB + the tail pin) + max(256 MiB, 60 s) + inflight (max(32 MiB, 4 pieces)) + 240 s`
 of the bitrate (the app's HLS copy: 180 s ahead, 60 s behind). The bitrate is
 `fileSize / mediaDurationHint`, or `fileSize / 2 h` when the duration is unknown.
 About 1.25 GiB for a 13 GB 2 h film, 2.6 GiB for a 60 GB 4K film at 7 MB/s.
@@ -44,6 +44,7 @@ About 1.25 GiB for a 13 GB 2 h film, 2.6 GiB for a 60 GB 4K film at 7 MB/s.
 @property (atomic, readonly) int64_t servedOffset;   // HTTP server's read position
 - (int64_t)firstMissingOffsetFrom:(int64_t)fileOffset;
 - (BOOL)isRangeAvailable:(int64_t)fileOffset length:(int64_t)length;
+- (int64_t)contiguousAvailableOffsetBefore:(int64_t)fileOffset; // rewind floor (see Rewinds)
 @property (atomic, readonly, getter=isFileComplete) BOOL fileComplete;
 @property (atomic, readonly) int64_t bytesOnDisk;    // st_blocks of the file, fresh
 @property (atomic, readonly) NSDictionary<NSString *, NSNumber *> *storageStatistics;
@@ -51,7 +52,10 @@ About 1.25 GiB for a 13 GB 2 h film, 2.6 GiB for a 60 GB 4K film at 7 MB/s.
 
 Error codes (`PTTorrentStreamerErrorDomain`): -4 not enough space (legacy
 refusal, or disk full in full mode), -5 below the minimum working set of bounded
-storage, -6 any other file error (I/O, permissions; before, it was reported as -4).
+storage, -6 any other file error (I/O, permissions; before, it was reported as -4),
+-7 the torrent is already used in a way that cannot be shared (see Torrents in the
+session), -8 a stream was reading an offline download's file and the download was
+stopped before the file was complete. All have a localized description.
 
 Everything else is unchanged and source-compatible (Mac app). Semantics that
 changed on purpose:
@@ -62,7 +66,10 @@ changed on purpose:
   `totalDownloaded` only grows (freed pieces stay counted).
 - `cancelStreamingAndDeleteData:` removes the torrent from the session (before:
   paused, and libtorrent's auto-manager could resume it). In bounded mode the
-  data is always deleted.
+  data is always deleted. A stream that joined an offline download's torrent never
+  removes, pauses or deletes anything of it.
+- No torrent is auto-managed: libtorrent never queues a stream nor resumes a
+  paused download.
 - The HTTP server never serves bytes that are not on disk (see below).
 
 Swift:
@@ -81,8 +88,8 @@ streamer.startStreaming(fromMultiTorrentFileOrMagnetLink: link, progress: { _ in
 // remux pump (reads the file directly):
 streamer.readPosition = reader.offset          // also on every seek
 streamer.consumedBefore = reader.offset        // the remux never reads behind itself
-// rewind policy:
-if target < streamer.lowestAvailableOffset || !streamer.isRangeAvailable(target, length: 1) { /* block */ }
+// rewind policy (the reader then reads forward from `target` up to where it is):
+if target < streamer.contiguousAvailableOffset(before: streamer.readPosition) { /* block */ }
 ```
 
 ### Thread safety
@@ -112,6 +119,27 @@ from it: libtorrent's flush is trusted then. The remux, which reads the file wit
 `FileHandle`, must only read ranges for which `isRangeAvailable` is `YES`, and
 must only release (`consumedBefore`) what it will never read again.
 
+## Rewinds (what is on disk, for the app)
+
+The user's choice: a rewind further back than what is still on disk is blocked
+(no download again). Exact semantics, all cheap reads of the controller's piece
+states (atomics), usable from any thread, valid at the moment of the call:
+
+| Accessor | Meaning |
+|---|---|
+| `lowestAvailableOffset` | Bounded: end of the highest consumed piece, a piece being consumed when it lies entirely below `consumedBefore` minus one guard piece, pinned pieces excepted. Below it (apart from the pinned head) data is deleted or about to be (freed in batches within a second) and never comes back. It follows `setConsumedBefore:` at once and never decreases. 0 in full mode. It says nothing about data above it: a gap left by a forward seek is not on disk either. |
+| `isRangeAvailable:length:` | Every piece overlapping the range is on disk now (passed its hash check and verified as written). `NO` for an empty range or one outside the file. A snapshot: consumed pieces still on disk count until they are freed; a piece ahead of the reader can be dropped when the disk is full (it is downloaded again). |
+| `firstMissingOffsetFrom:` | First offset at or after the argument whose piece is not on disk now (the argument itself if its piece is missing), or the file size. |
+| `contiguousAvailableOffsetBefore:` | Backward counterpart: the lowest `start` such that every byte of `[start, offset)` is on disk now and stays there (pinned, or not consumed). The argument itself when the byte before it is not available. |
+
+Rewind check for a reader at `readPosition` that reads forward again from the
+target (VLC over HTTP, or the remux restarted at a segment):
+`target >= contiguousAvailableOffsetBefore(readPosition)`. A gap left by a forward
+seek, or deleted data, between the target and the reader blocks it, as it should:
+the reader would hit a 410 there. A rewind into the app's own HLS copy does not need
+the torrent at all. Rewinding to the very start is only allowed while everything
+from 0 to the reader is still on disk (the pinned head alone is not enough).
+
 ## How it works
 
 ### Window (PTBoundedLogic.cpp `planWindow`, applied in PTStreamController.mm `apply`)
@@ -123,7 +151,7 @@ Only pieces of the selected file are ever wanted (fixes the old
 |---|---|
 | other files | 0 |
 | pinned head: up to the first MKV Cluster / end of the MP4 `moov` (parsed from the file, `parseHeadPins`), 32 MiB if unknown, at most 64 MiB; 64 MiB until parsed | 7 |
-| pinned tail: last 2 pieces (+ an MP4 `moov` stored after `mdat`) | 7 |
+| pinned tail: at least 8 MiB in whole pieces (`tailPinPieces`: 2 pieces of 4 MiB or more, at most 10 small pieces, never fewer than before) + an MP4 `moov` stored after `mdat` | 7 |
 | a piece the head parser waits for | 7 |
 | window: `[read piece, +N)` with N ≥ 32 MiB | 7 |
 | pieces an HTTP reader waits for ("urgent") | 7 |
@@ -135,7 +163,13 @@ Only pieces of the selected file are ever wanted (fixes the old
 | freed | 0, forever |
 
 Full mode keeps today's window: the next MIN_PIECES missing pieces at or after
-the read position with 100 ms deadlines, every piece of the file wanted.
+the read position with 100 ms deadlines, every piece of the file wanted. The tail
+pin is the same byte-sized one (MKV Cues, an MP4 `moov` at the end are there at
+open), but the stream still waits only for the last 1 or 2 pieces, as before: only
+those get deadlines (`urgentTailStart`), the rest of the tail comes at priority 7
+right after the head window. (Gating readiness on the whole tail was tried: in the
+session harness, with 256 KiB pieces at 256 KiB/s, a stream became ready in 15.5 s
+instead of 8 s.)
 
 Piece priorities are compared with libtorrent's own on every update (not with a
 cache): `prioritize_files()` takes a disk-thread round trip and then rewrites every
@@ -265,9 +299,65 @@ time) is replaced by a streamed response:
 ### Cancel
 
 `cancelStreamingAndDeleteData:` fails the waiting reads, closes the
-controller's descriptor, unsets `auto_managed`, and calls
-`session::remove_torrent` (with `delete_files` when deleting, never when another
-session shares the files), then removes the directory as before.
+controller's descriptor, and calls `session::remove_torrent` (with `delete_files`
+when deleting), then removes the directory as before. libtorrent deletes files by
+path on its disk thread, after the jobs already queued for the torrent: the same
+torrent added again right away (a replay, the disk-full retry) waits for that
+deletion (`torrent_deleted_alert`, at most 5 s; the replay's start returned in
+0.45 s in the session harness) so it is not
+deleted under the new stream. A second cancel never touches a newer torrent of the
+same info-hash (libtorrent's `remove_torrent` finds torrents by info-hash).
+
+## Torrents in the session
+
+All streams and downloads share `PTTorrentsSession.sharedSession`.
+
+**Never auto-managed.** Torrents are added without `auto_managed` and not paused:
+libtorrent's auto-manager (3 active downloads by default) used to queue a stream
+started next to 3 active downloads (0 peers, never ready) and resumed paused
+downloads about 30 s later. Streams always run; downloads run until paused, and
+`PTTorrentDownload pause`/`resume` are explicit. Every download runs at once, as
+with the CocoaPods pod (one session per download, so never queued).
+
+**A stream of a torrent that is already in the session** (the -2 path, which used
+to create a new, never freed `PTTorrentsSession` per stream and to flag both
+streamers `deleteOnlyDownloadedFile`) joins it (`joinTorrent:`):
+
+| Already there | New | Result |
+|---|---|---|
+| an offline download (`PTTorrentDownload`), any state | a stream | joins as a guest: reads the download's file (no second copy, no second download), full mode always (the download keeps the whole file: no space check), its own controller and plugin (`torrent_handle::add_extension`); the newest guest drives the torrent's priorities and deadlines (the download's controller is suspended: state kept, nothing planned), so the stream's window is fetched first; a paused download runs while a stream reads it and is paused again when the last one leaves |
+| a stream in full mode (or not decided yet and not allowed to be bounded) | a stream | joins as a guest the same way (two players of one film on the Mac) |
+| a stream that is or may be bounded | a stream | refused, -7 |
+| anything | a download | refused, -7 (a download keeps its own copy) |
+| another file of the same torrent | a stream | refused, -7, at metadata time |
+
+A guest's cancel never removes, pauses or deletes anything of the torrent it joined,
+whatever `deleteData` is: it resets its deadlines, removes its plugin from the torrent
+(`torrent::remove_extension`, on the network thread) and hands the torrent back to the
+previous guest or the owner, which plans again from libtorrent's actual priorities. A
+guest's initial piece states are trusted only after the torrent's write cache was
+flushed (`async_release_files`), since a piece libtorrent has may not be written yet.
+
+When the owner goes first: a download that finishes removes its torrent and the
+guests keep reading the complete file (their own descriptor); a download stopped or
+removed before the file is complete ends its guests with -8. A stream that is
+cancelled hands its torrent and its files over to its oldest guest, which owns them
+from then on (its own cancel removes and deletes them).
+
+**tvOS, back from more than 5 minutes in the background.** The fork used to create
+a new session for the next torrents (the "torrents not starting after sleep"
+workaround): the old session leaked (its threads, sockets, DHT) and the streams and
+downloads already running stayed on it, with the sockets that had stopped working,
+so an active stream could stall for good. Now the same session reopens its network
+(`reopenNetwork`): no listen socket (nor DHT), then the configured ones again, so
+sockets the system reclaimed while the app was suspended are recreated
+(`reopen_network_sockets` keeps sockets that look the same, and libtorrent stops
+reading from a socket after a fatal error but keeps it), then every torrent
+re-announces (trackers, DHT). uTP connections ran over the old UDP sockets: nothing
+tells them, and one that does not send hangs until its timeout (about a minute; seen
+in the harness), so they are dropped on the network thread. libtorrent retries a lost
+peer only after `min_reconnect_time` (60 s): for 30 s after a reopen it is 1 s, so
+dropped peers, and peers lost while the app was suspended, come back at once.
 
 ### Other fork fixes
 
@@ -278,8 +368,7 @@ session shares the files), then removes the directory as before.
   background seeding), and removed at cancel.
 - The resume data path is taken from the alert (the torrent may be removed).
 - `localizedString` falls back to the package's own `.lproj` (fr added).
-- `PTTorrentDownload pause` unsets `auto_managed` (libtorrent's auto-manager
-  resumed paused downloads).
+- No torrent is auto-managed (see Torrents in the session).
 - The loopback testing hook is no longer in the public header: it is declared in
   `Sources/Client/PTTorrentsSession+Testing.h`, which the harness imports.
 
@@ -308,6 +397,20 @@ xcodebuild test -scheme PopcornTorrent -destination "platform=macOS,arch=arm64" 
 ```
 
 Do not run the whole scheme: `PopcornTorrent-Tests` streams public torrents.
+
+Run the offline harnesses inside the sandbox profile
+`Tools/BoundedStorageHarness/localhost-only.sb` (`sandbox-exec -f localhost-only.sb ...`):
+it blocks every connection that is not on 127.0.0.1.
+
+Session lifecycle harness (`SessionHarness`, same package): generated payloads,
+private torrents, a seeder on 127.0.0.1, everything written under the work directory.
+
+```
+SessionHarness zombie <work>      # cancelled streams stop downloading; replay; replay right after a delete
+SessionHarness starve <work>      # 3 cancelled streams then a 4th; 3 active downloads then a stream; pause/resume
+SessionHarness guest <work>       # a stream joins a download's torrent (5 scenarios)
+SessionHarness background <work>  # the tvOS network reopen during a stream
+```
 
 Offline end-to-end harness (`Tools/BoundedStorageHarness`): generates a file of
 patterned pseudo-random data with an MKV head, a private torrent for it (no
@@ -338,6 +441,23 @@ seek forward (from F to G of the file, then as far again), checks the bytes of
 the ranges read and that a skipped, consumed range gets 410;
 `--seed-rate-mbs R` caps the seeder (pieces stay in flight longer, so a seek
 leaves partial pieces behind); `--piece-kib N`, `--budget-mib N`.
+
+### Results (Mac, 2026-11-11, part 2: sessions, shared torrents, tail pin, rewinds)
+
+All runs inside `localhost-only.sb`. The four SessionHarness modes also pass in an
+AddressSanitizer build (`swift build --sanitize=address`), with no report.
+
+| Run | Result |
+|---|---|
+| unit tests (`PopcornTorrentLogicTests`) | 27/27 |
+| SessionHarness zombie | 8/8: after a cancel with `deleteData`, 0 KiB more from the seeder over 20 s and the folder stays deleted; the same torrent streamed again is ready and serves the right bytes (head, and 40 MiB in, waited for); started again right after a cancel with delete, its start returned in 0.44 s (waiting for the deletion) and its file survives; a second cancel touches nothing |
+| SessionHarness starve | 8/8: three streams cancelled, their uploads stop; a 4th stream ready in 8.0 s (before: never, 0 peers, queued); with 3 active downloads a stream is ready in 7.1 s; a paused download gets 0 KiB over 35 s (before: resumed after about 30 s), and downloads again after `resume` |
+| SessionHarness guest | 16/16: a stream of a paused download in progress joins it (same folder and handle, no second copy, one connection to the seeder); the download runs while it plays; 4 MiB at 100 MiB read in 2.6 s with the download at 17 %; cancel with `deleteData` keeps the download's file and pause, and the download then completes with the right hash; download stopped under a stream: -8; download finished under a stream: the stream reads all 48 MiB; two streams of one torrent: the first one's cancel hands it to the second, the last one deletes the folder; a download of a torrent a stream plays: -7 |
+| SessionHarness background | 5/5: reopen during a stream: same session, new listen port, torrent kept; the stream's uTP peer is dropped and reconnected, 16 MiB in 7.5 s (8 s at the seeder's rate; without the uTP drop, 3 of 6 runs stalled about 60 s); connections lost "while suspended" come back 1.0 s after the reopen; the new listen socket accepts connections |
+| bounded, 6 GiB, 3 GiB image, budget 2 GiB, 60 s pause | 21/21: at most 2066 MiB on disk, 1908-2066 MiB while 2.4 GiB went through; free never below 793 MiB; pause 2064 -> 2066 MiB over 55 s; same hash, 0 stall; 1518 pieces freed, 0 punch errors; freed range 410; probe peer refused a freed piece; nothing allocated below `lowestAvailableOffset` apart from the head pin; cancel gives the space back |
+| full, 6 GiB, 8 GiB image | 14/14: full mode, whole file kept (6144 MiB), nothing freed, same hash, cancel gives the 6 GiB back |
+| bounded, 3 GiB, 2 GiB image, 2 forward seeks | 23/23 (with a 60 s pause): at most 441 MiB on disk against a 436 MiB budget, skipped and consumed range 410 in 2 ms, bytes of the ranges read equal to the source |
+| same, 16 MiB pieces, seeder capped at 60 MB/s | 23/23: at most 455 MiB against 492 MiB, 3 partial pieces punched, nothing allocated below `lowestAvailableOffset` apart from the head pin |
 
 ### Results (Mac, 2026-11-11, after the review fixes)
 
@@ -370,6 +490,11 @@ older check list, full 13/13, ballast 23/24 (pause check), forced ENOSPC 22/24
   (up to `min_reconnect_time`, 60 s). Use `isRangeAvailable` before allowing such
   a rewind.
 - Fast resume is never saved in bounded mode, and the files are deleted at cancel.
+- The tvOS network reopen is tested on the Mac only (a forced reopen during a
+  stream): socket reclaiming by a suspended tvOS app, and how long real peers take
+  to come back, need the device.
+- Shared torrents: a guest of a download in progress verifies by content (SHA-1 read
+  back) every piece that passes while it is attached (the file already held data).
 - After a real ENOSPC the reader waits as long as the volume stays full; in the
   harness it resumed 1–2 s after space came back (one earlier run waited about
   35 s: requests libtorrent cancelled when it entered upload mode stayed
