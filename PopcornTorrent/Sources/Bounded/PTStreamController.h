@@ -42,6 +42,8 @@ struct StreamConfig {
     int64_t reserveBytes = kDefaultReserveBytes;
     int windowPieces = 1;                // deadline window (MIN_PIECES in full mode)
     int tailPieces = kTailPinPieces;     // pinned pieces at the end of the file
+    int urgentTailPieces = 0;            // full mode: only the last `urgentTailPieces` of them get
+                                         // deadlines (the stream waits for those), 0 = all
     int deadlineFirstMs = 100;
     int deadlineStepMs = 0;
     bool useDeadlines = true;            // libtorrent piece deadlines (time-critical pieces)
@@ -51,6 +53,9 @@ struct StreamConfig {
     std::string pieceHashes;             // SHA-1 of each piece of the file (20 bytes per piece, from
                                          // firstPiece()); zeros for a piece not wholly inside the file
     bool fileExisted = false;            // the file held data before the stream started
+    bool sharedTorrent = false;          // the torrent belongs to another streamer (a download this
+                                         // stream joined): the pieces it already has are trusted
+                                         // only after its write cache was flushed
 };
 
 enum ReadResult : int {
@@ -114,7 +119,9 @@ public:
     void setTorrentBudget(int64_t bytes);
     int64_t readPosition() const { return m_readPosition.load(); }
     int64_t consumedBefore() const { return m_consumedBefore.load(); }
-    int64_t lowestAvailableOffset() const { return m_lowestAvailable.load(); }
+    /// Bounded: below it (apart from the pinned head) data is deleted or about to be. Exact at
+    /// call time: it follows `consumedBefore` at once. 0 in full mode.
+    int64_t lowestAvailableOffset() const;
     int64_t servedOffset() const { return m_servedOffset.load(); }
     int64_t everDownloadedBytes() const { return m_everDownloaded.load(); }
     int64_t firstMissingOffset(int64_t from) const;
@@ -124,6 +131,11 @@ public:
     /// while it was not on disk). Reads there fail at once.
     bool isOffsetGone(int64_t offset) const;
     bool isFileComplete() const;
+    /// Lowest offset from which every byte up to `offset` is on disk and stays there (see
+    /// ptbounded::contiguousAvailableStart).
+    int64_t contiguousAvailableStart(int64_t offset) const;
+    /// Every piece of the file passed its hash check (on disk, or its write being confirmed).
+    bool allPiecesHaveData() const;
     int64_t bytesOnDisk() const;
     int64_t freeBytes() const;
     std::pair<int, int> requiredProgress() const;
@@ -139,9 +151,19 @@ public:
     void setAvailabilityHandler(std::function<void()> handler);
     void cancel();
     void requestUpdate();
+    /// Shared torrents (a stream joined a download's torrent): only the newest controller of
+    /// a torrent drives its priorities and deadlines. `suspendPlanning` hands the torrent
+    /// over (this controller's deadlines are reset; its state, verification and HTTP reads go
+    /// on); `resumePlanning` takes it back.
+    void suspendPlanning();
+    void resumePlanning();
+    /// A guest stops driving the torrent it joined: its deadlines are reset and its plugin is
+    /// removed from the torrent, then `next` (if any) resumes driving it, in that order on the
+    /// network thread. The torrent itself is left as it is.
+    void detach(std::shared_ptr<StreamController> const& next);
 
     // libtorrent network thread only (called by the plugin).
-    void attach(libtorrent::torrent& torrent);
+    void attach(libtorrent::torrent& torrent, std::weak_ptr<libtorrent::torrent_plugin> const& plugin);
     void addPeer(std::shared_ptr<PeerPlugin> const& peer);
     void onPiecePassed(libtorrent::torrent& torrent, int32_t piece);
     void onPieceFailed(int32_t piece);
@@ -155,6 +177,7 @@ private:
     void apply(libtorrent::torrent& torrent, bool fromTick);
     void applyPriorities(libtorrent::torrent& torrent, std::vector<uint8_t> const& priorities);
     void applyDeadlines(libtorrent::torrent& torrent, std::vector<std::pair<int32_t, int>> const& deadlines);
+    void resetDeadlines(libtorrent::torrent& torrent);
     void releasePieces(libtorrent::torrent& torrent, std::vector<int32_t> const& pieces, uint8_t newState);
     void punchPartialPieces(libtorrent::torrent& torrent);
     std::vector<uint8_t> snapshotStates() const;
@@ -181,6 +204,8 @@ private:
     std::atomic<bool> m_configured{false};
     std::atomic<bool> m_bounded{false};
     std::atomic<bool> m_cancelled{false};
+    std::atomic<bool> m_suspended{false};     // another controller drives the (shared) torrent
+    std::atomic<bool> m_cacheFlushed{false};  // sharedTorrent: the torrent's write cache was flushed
     std::unique_ptr<std::atomic<uint8_t>[]> m_states;
     // Pieces whose region of the file may hold stale bytes (a failed hash check, a file
     // that existed before), or every piece on a volume without holes: verified by content.
@@ -219,6 +244,8 @@ private:
 
     // Network thread.
     std::weak_ptr<libtorrent::torrent> m_torrent;
+    std::weak_ptr<libtorrent::torrent_plugin> m_plugin;
+    bool m_cacheFlushRequested = false;
     std::atomic<void *> m_io{nullptr};
     std::atomic<bool> m_updatePosted{false};
     std::vector<uint8_t> m_appliedPriorities;

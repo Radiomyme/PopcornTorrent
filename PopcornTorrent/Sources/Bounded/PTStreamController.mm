@@ -88,9 +88,7 @@ namespace {
 class StreamPlugin final : public lt::torrent_plugin {
 public:
     StreamPlugin(lt::torrent& torrent, std::shared_ptr<StreamController> controller)
-        : m_torrent(torrent), m_controller(std::move(controller)) {
-        m_controller->attach(torrent);
-    }
+        : m_torrent(torrent), m_controller(std::move(controller)) {}
 
     std::shared_ptr<lt::peer_plugin> new_connection(lt::peer_connection_handle const& connection) override {
         if (connection.type() != lt::connection_type::bittorrent) return nullptr;
@@ -125,7 +123,9 @@ makeStreamPluginFactory(std::shared_ptr<StreamController> const& controller) {
         auto controller = weak.lock();
         auto torrent = handle.native_handle();
         if (!controller || !torrent) return nullptr;
-        return std::make_shared<StreamPlugin>(*torrent, controller);
+        auto plugin = std::make_shared<StreamPlugin>(*torrent, controller);
+        controller->attach(*torrent, plugin);
+        return plugin;
     };
 }
 
@@ -247,6 +247,27 @@ bool StreamController::isOffsetGone(int64_t offset) const {
     return isGone(m_config.geometry, pins(), stateOf(piece), piece, m_consumedBefore.load());
 }
 
+int64_t StreamController::lowestAvailableOffset() const {
+    if (!m_configured.load() || !m_bounded.load()) return 0;
+    // The plan's value lags the consumer by one plan; the consumed floor does not.
+    int64_t const floor = consumedFloor(m_config.geometry, pins(), m_consumedBefore.load());
+    return std::min(m_config.geometry.fileSize, std::max(m_lowestAvailable.load(), floor));
+}
+
+int64_t StreamController::contiguousAvailableStart(int64_t offset) const {
+    if (!m_configured.load()) return std::max<int64_t>(0, offset);
+    return ptbounded::contiguousAvailableStart(m_config.geometry, snapshotStates(), pins(), m_bounded.load(),
+                                               m_consumedBefore.load(), offset);
+}
+
+bool StreamController::allPiecesHaveData() const {
+    if (!m_configured.load()) return false;
+    for (int32_t i = 0; i < m_count; ++i) {
+        if (!pieceHasData(m_states[size_t(i)].load())) return false;
+    }
+    return true;
+}
+
 bool StreamController::isFileComplete() const {
     if (!m_configured.load()) return false;
     for (int32_t i = 0; i < m_count; ++i) {
@@ -302,7 +323,7 @@ StreamStatistics StreamController::statistics() const {
     s.freeBytes = m_lastFreeBytes.load();
     s.readPosition = m_readPosition.load();
     s.consumedBefore = m_consumedBefore.load();
-    s.lowestAvailableOffset = m_lowestAvailable.load();
+    s.lowestAvailableOffset = lowestAvailableOffset();
     s.servedOffset = m_servedOffset.load();
     s.everDownloaded = m_everDownloaded.load();
     s.freedPieces = m_freedPieces.load();
@@ -394,9 +415,67 @@ void StreamController::requestUpdate() {
     });
 }
 
-void StreamController::attach(lt::torrent& torrent) {
+void StreamController::attach(lt::torrent& torrent, std::weak_ptr<lt::torrent_plugin> const& plugin) {
     m_torrent = torrent.shared_from_this();
+    m_plugin = plugin;
     m_io.store(&torrent.session().get_io_service(), std::memory_order_release);
+}
+
+#pragma mark Shared torrents (a stream joined a download's torrent)
+
+void StreamController::suspendPlanning() {
+    m_suspended.store(true);
+    void *io = m_io.load(std::memory_order_acquire);
+    if (io == nullptr) return;
+    auto self = shared_from_this();
+    std::weak_ptr<lt::torrent> weakTorrent = m_torrent;
+    // Deadlines are per piece, not per controller: drop ours before the next controller sets its own.
+    boost::asio::post(*static_cast<lt::io_service *>(io), [self, weakTorrent] {
+        auto torrent = weakTorrent.lock();
+        if (torrent && !torrent->is_aborted() && self->m_suspended.load()) self->resetDeadlines(*torrent);
+    });
+}
+
+void StreamController::resumePlanning() {
+    void *io = m_io.load(std::memory_order_acquire);
+    if (io == nullptr) { m_suspended.store(false); return; }
+    auto self = shared_from_this();
+    std::weak_ptr<lt::torrent> weakTorrent = m_torrent;
+    // Cleared on the network thread: an update already queued still sees the suspension.
+    boost::asio::post(*static_cast<lt::io_service *>(io), [self, weakTorrent] {
+        self->m_suspended.store(false);
+        auto torrent = weakTorrent.lock();
+        if (torrent) self->apply(*torrent, false);
+    });
+}
+
+void StreamController::detach(std::shared_ptr<StreamController> const& next) {
+    void *io = m_io.load(std::memory_order_acquire);
+    if (io == nullptr) {
+        // Never attached to the torrent: nothing of ours to undo.
+        if (next) next->resumePlanning();
+        return;
+    }
+    auto self = shared_from_this();
+    std::weak_ptr<lt::torrent> weakTorrent = m_torrent;
+    boost::asio::post(*static_cast<lt::io_service *>(io), [self, next, weakTorrent] {
+        auto torrent = weakTorrent.lock();
+        if (torrent && !torrent->is_aborted()) {
+            self->resetDeadlines(*torrent);
+            if (auto plugin = self->m_plugin.lock()) torrent->remove_extension(plugin);
+        }
+        self->m_plugin.reset();
+        if (next) {
+            next->m_suspended.store(false);
+            auto nextTorrent = next->m_torrent.lock();
+            if (nextTorrent) next->apply(*nextTorrent, false);
+        }
+    });
+}
+
+void StreamController::resetDeadlines(lt::torrent& torrent) {
+    for (auto const& entry : m_appliedDeadlines) torrent.reset_piece_deadline(lt::piece_index_t(entry.first));
+    m_appliedDeadlines.clear();
 }
 
 void StreamController::addPeer(std::shared_ptr<PeerPlugin> const& peer) {
@@ -542,7 +621,7 @@ void StreamController::onTick(lt::torrent& torrent) {
     }
     m_peers.erase(std::remove_if(m_peers.begin(), m_peers.end(),
                                  [](std::weak_ptr<PeerPlugin> const& p) { return p.expired(); }), m_peers.end());
-    if (m_bounded.load()) punchPartialPieces(torrent);
+    if (m_bounded.load() && !m_suspended.load()) punchPartialPieces(torrent);
     apply(torrent, true);
 }
 
@@ -561,7 +640,21 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     auto const state = torrent.state();
     bool const checking = state == lt::torrent_status::checking_files
         || state == lt::torrent_status::checking_resume_data;
-    if (!m_initialSynced && !checking) {
+    if (!m_initialSynced && !checking && m_config.sharedTorrent && !m_cacheFlushed.load()) {
+        // A torrent this stream joined: pieces it already has may still be in libtorrent's
+        // write cache, over stale bytes of the file. Trust them once the cache is written out
+        // (pieces passing from now on come through onPiecePassed).
+        if (!m_cacheFlushRequested && torrent.has_storage()) {
+            m_cacheFlushRequested = true;
+            std::weak_ptr<StreamController> weak = weak_from_this();
+            torrent.session().disk_thread().async_release_files(torrent.storage(), [weak] {
+                if (auto self = weak.lock()) {
+                    self->m_cacheFlushed.store(true);
+                    self->requestUpdate();
+                }
+            });
+        }
+    } else if (!m_initialSynced && !checking) {
         // Pieces libtorrent already had (existing file, resume data) never pass again.
         m_initialSynced = true;
         for (int32_t piece = m_first; piece < m_first + m_count; ++piece) {
@@ -588,6 +681,10 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     input.deadlineStepMs = m_config.deadlineStepMs;
     input.states = &states;
     input.capSentinel = m_capSentinel;
+    if (!bounded && m_config.urgentTailPieces > 0 && m_config.urgentTailPieces < m_config.tailPieces) {
+        FileGeometry const& geo = m_config.geometry;
+        input.urgentTailStart = geo.pieceBegin(std::max(geo.firstPiece(), geo.lastPiece() - m_config.urgentTailPieces + 1));
+    }
     {
         // Data freed but not punched yet still takes its space (right after a seek, the
         // whole old window): a late window may only fill what is left.
@@ -609,12 +706,14 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     m_plannedReadPiece.store(plan.readPiece);
     m_plannedConsumedPiece.store(m_config.geometry.pieceAt(input.consumedBefore));
 
-    if (!checking) {
+    // Shared torrent driven by another controller: keep the state, plan nothing.
+    bool const suspended = m_suspended.load();
+    if (!checking && !suspended) {
         applyPriorities(torrent, plan.priorities);
         applyDeadlines(torrent, m_config.useDeadlines ? plan.deadlines : std::vector<std::pair<int32_t, int>>());
     }
 
-    if (bounded && !plan.toFree.empty()) {
+    if (bounded && !suspended && !plan.toFree.empty()) {
         int64_t bytes = 0;
         for (int32_t piece : plan.toFree) bytes += m_config.geometry.pieceBytes(piece);
         if (fromTick || bytes >= kFreeBatchBytes || m_lastFreeBytes.load() < m_config.reserveBytes) {
@@ -642,7 +741,7 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     m_dataBytes.store(plan.dataBytes);
     m_lastPlanPriorities = plan.priorities;
 
-    if (!bounded) {
+    if (!bounded || suspended) {
         if (fromTick) sweepWaiters(plan);
         return;
     }
