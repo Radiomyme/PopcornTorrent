@@ -251,7 +251,14 @@ PlanOutput planWindow(PlanInput const& in) {
         bool const inWindow = in.bounded ? piece < out.windowEndPiece : deadlineIndex < windowPieces;
         if (inWindow) {
             int const step = in.bounded ? int(piece - out.readPiece) : deadlineIndex;
-            out.priorities[size_t(i)] = 7;
+            // Bounded: 6 (kBoundedWindowPriority), not 7. libtorrent's sequential picker takes the
+            // top-priority (7) pieces in a random order (its priority buckets are shuffled), and
+            // the other wanted pieces in index order from the first one missing: with the whole
+            // window at 7 the read piece came in among the last of its 80 MiB window after a seek
+            // (7.1 s with a 12 MB/s seed, against 1.07 s in full mode: part-3 coverage md4, mc3).
+            // At 6 the window comes in file order, after the pins and the pieces a reader waits for
+            // (7: the read piece itself after a seek, see urgentPieces below).
+            out.priorities[size_t(i)] = in.bounded ? kBoundedWindowPriority : 7;
             out.deadlines.emplace_back(piece, in.deadlineFirstMs + step * in.deadlineStepMs);
             ++deadlineIndex;
             lastDeadlinePiece = piece;

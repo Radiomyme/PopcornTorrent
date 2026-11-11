@@ -165,7 +165,7 @@ Only pieces of the selected file are ever wanted (fixes the old
 | pinned head: MKV up to the first Cluster and at least 64 MiB (`kMatroskaHeadPinBytes`: what a player opening the file again reads before its first seek lands — VLCKit 4 over HTTP read 20-30 MB of the first clusters and prefetch), end of the MP4 `moov` (parsed from the file, `parseHeadPins`), 32 MiB if unknown, at most 64 MiB; 64 MiB until parsed | 7 |
 | pinned tail: at least 8 MiB in whole pieces (`tailPinPieces`: 2 pieces of 4 MiB or more, at most 10 small pieces, never fewer than before) + an MP4 `moov` stored after `mdat` | 7 |
 | a piece the head parser waits for | 7 |
-| window: `[read piece, +N)` with N ≥ 32 MiB | 7 |
+| window: `[read piece, +N)` with N ≥ 32 MiB | bounded 6 (`kBoundedWindowPriority`), full 7 |
 | pieces an HTTP reader waits for ("urgent") | 7 |
 | ahead of the reader | 1 (paced) |
 | behind the reader, on disk | 1 |
@@ -190,8 +190,14 @@ piece of the selected file to 7, after the first plan.
 Bounded mode uses **no libtorrent deadlines**. While time-critical pieces exist,
 libtorrent keeps a single normal request per peer and only asks time-critical
 pieces due within about a second; in the offline tests a deadline window starved
-for tens of seconds while pieces far ahead kept arriving. Priority 7 with
-sequential download fetches the window first. While a piece the reader needs is
+for tens of seconds while pieces far ahead kept arriving. Priority 6 with
+sequential download fetches the window first, in file order: libtorrent's
+sequential picker takes the top-priority (7) pieces first but in a random order
+(its priority buckets are shuffled), then every other wanted piece in index order
+from the first one missing. With the whole window at 7 (until part 3) the read
+piece came in among the last of its 80 MiB window after a seek: 7.1 s with a
+12 MB/s seed, against 1.07 s in full mode (app runs md4, mc3). Only the pins and the
+pieces a reader waits for (the read piece itself after a seek) stay at 7. While a piece the reader needs is
 missing, pieces beyond the ahead budget (minus freed data whose hole is not
 punched yet, e.g. the old window right after a seek) are temporarily not wanted
 (priority 0, back to 1 once it arrives), so a late piece cannot let the rest of

@@ -59,6 +59,10 @@ constexpr double kStartStarvationSeconds = 30;
 constexpr int64_t kReclaimStepBytes = 64 * kMiB;
 /// Smaller step tried when a reclaim step fails with ENOSPC.
 constexpr int64_t kReclaimSmallStepBytes = 4 * kMiB;
+/// Bounded mode: priority of the window pieces. Below libtorrent's top priority (7, kept for
+/// the pins and the pieces a reader waits for), so the sequential picker fetches the window in
+/// file order instead of the random order it uses among top-priority pieces (see planWindow).
+constexpr uint8_t kBoundedWindowPriority = 6;
 
 /// Piece states as seen by the streamer. This is not libtorrent's view: a piece
 /// is only `OnDisk` once its bytes are verified as written to the file.

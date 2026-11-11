@@ -264,8 +264,8 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertEqual(plan.priorities[39], 1);
     XCTAssertEqual(plan.priorities[45], 0); // gap behind the reader is not fetched
     XCTAssertEqual(plan.priorities[60], 1);
-    XCTAssertEqual(plan.priorities[61], 7);
-    XCTAssertEqual(plan.priorities[65], 7);
+    XCTAssertEqual(plan.priorities[61], 6); // window: below the top priority, fetched in file order
+    XCTAssertEqual(plan.priorities[65], 6);
     XCTAssertEqual(plan.priorities[66], 1); // beyond the window: wanted, paced
     XCTAssertEqual(plan.priorities[98], 7);
     XCTAssertEqual(plan.priorities[99], 7);
@@ -294,6 +294,37 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     for (int i = 2; i < 8; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 0);
     XCTAssertEqual(plan.lowestAvailableOffset, 8 * kMiB);
     XCTAssertTrue(plan.toFree.empty());
+}
+
+- (void)testBoundedWindowIsBelowTopPriorityExceptWaitedPieces {
+    // Bounded: the window at 6 (file order in libtorrent's sequential picker), the read piece a
+    // reader waits for at 7 (taken first), the pins at 7. Full mode keeps the window at 7.
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceMissing);
+    PlanInput input;
+    input.geometry = geo;
+    input.bounded = true;
+    input.readPosition = 40 * kMiB;
+    input.pins.headEnd = 2 * kMiB;
+    input.pins.tailStart = 98 * kMiB;
+    input.deadlinePieces = 8;
+    input.states = &states;
+    input.urgentPieces = {40};
+    PlanOutput const plan = planWindow(input);
+    XCTAssertEqual(plan.readPiece, 40);
+    XCTAssertGreaterThan(plan.windowEndPiece, 42);
+    XCTAssertEqual(plan.priorities[40], 7);  // waited for: first
+    XCTAssertEqual(plan.priorities[41], 6);  // the rest of the window, in file order
+    XCTAssertEqual(plan.priorities[size_t(plan.windowEndPiece - 1)], 6);
+    XCTAssertEqual(plan.priorities[0], 7);   // pins
+    XCTAssertEqual(plan.priorities[99], 7);
+    XCTAssertTrue(plan.urgent);
+
+    input.bounded = false;
+    input.urgentPieces = {};
+    PlanOutput const full = planWindow(input);
+    XCTAssertEqual(full.priorities[40], 7);
+    XCTAssertEqual(full.priorities[41], 7);
 }
 
 - (void)testPiecesReadersWaitForAreFetchedFirst {
@@ -344,7 +375,7 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     input.states = &states;
     PlanOutput plan = planWindow(input);
     XCTAssertTrue(plan.urgent);
-    XCTAssertEqual(plan.priorities[2], 7);   // window
+    XCTAssertEqual(plan.priorities[2], 6);   // window
     XCTAssertEqual(plan.priorities[10], 1);  // within the ahead budget
     XCTAssertEqual(plan.priorities[30], 1);  // on disk: unchanged
     XCTAssertEqual(plan.priorities[45], 0);  // beyond it: not wanted while the window is late
