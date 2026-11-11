@@ -1006,10 +1006,10 @@ void StreamController::presizeFile() {
     // the kernel write zeros over the whole gap, from the old end of the file to the write,
     // before the write returns: one 256 KiB pwritev of a tail pin, 4.6 GB past the end of a
     // file that libtorrent was appending to, took 2 s and allocated 2.8 GB (the whole volume);
-    // st_size changed only when it returned. Offline probe (Tools: ptft trace + race probe of
-    // the part-3 run): 30-50 % of such writes after a burst of appends, for gaps of 1 GiB to
-    // 12 GiB; none after fsync, after a 1 s pause, or when the file already had its size;
-    // ftruncate itself never allocates, even right after a burst of appends. libtorrent's sparse
+    // st_size changed only when it returned. Offline probe (Tools/AllocationProbe): 38 % of
+    // such writes after a burst of appends, for gaps of 1 GiB to 12 GiB; none after fsync,
+    // fewer after a 1 s pause, none when the file already had its size; ftruncate itself never
+    // allocates, even right after a burst of appends. libtorrent's sparse
     // storage appends the head window and writes the tail pins gigabytes further at the same time.
     // So in bounded mode no write may extend the file: it is created here, at its final size
     // (a hole), once the files are checked and before the first plan wants any piece (apply()
@@ -1098,8 +1098,8 @@ int64_t StreamController::reclaimAllocatedHoles(lt::torrent& torrent, int64_t al
             if (fd == m_fd && !m_cancelled.load()) {
                 // In steps: each one gives its space back before the next. One F_PUNCHHOLE
                 // over gigabytes of zero-filled blocks fails with ENOSPC on a full volume
-                // (measured: that is why the first backstop freed nothing); 64 MiB steps
-                // succeed, and a failed step is tried again in 4 MiB steps.
+                // (probe: 2 of 2 after a runaway; the first backstop, one call per range,
+                // freed nothing); 64 MiB steps succeed, a failed one is retried in 4 MiB steps.
                 bool failed = false;
                 for (int64_t from = begin; from < end && !failed; from += kReclaimStepBytes) {
                     int64_t const to = std::min(end, from + kReclaimStepBytes);

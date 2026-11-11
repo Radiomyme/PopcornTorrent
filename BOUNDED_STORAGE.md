@@ -63,7 +63,8 @@ the sparse download and the HLS copy fill the volume together late in the film
 
 Error codes (`PTTorrentStreamerErrorDomain`): -4 not enough space (legacy
 refusal, or disk full in full mode), -5 below the minimum working set of bounded
-storage, -6 any other file error (I/O, permissions; before, it was reported as -4),
+storage (at metadata time; or, before the stream is ready, the volume stayed too full
+for the download to go on for 30 s: see Disk full), -6 any other file error (I/O, permissions; before, it was reported as -4),
 -7 the torrent is already used in a way that cannot be shared (see Torrents in the
 session), -8 a stream was reading an offline download's file and the download was
 stopped before the file was complete. All have a localized description.
@@ -282,26 +283,60 @@ on disk (`onDiskToTheEnd`): nothing more is downloaded then, and the consumer ma
 the rest of the file as final (the app's remux marks its input complete there, cuts
 its last segment, and reads zeros as data from then on).
 
-The file gets its final size at once in bounded mode (`presizeFile`: `ftruncate`, a hole
-on APFS), as soon as libtorrent has created it and before the tail pins are written: in
-the app's offline end-to-end runs, the first write of a tail pin, which extended the file
-by gigabytes, was followed in 2 of 7 starts (and once more in this round) by the
-allocation of the whole gap within a second. With the file already at its size, later
-writes far into it no longer extend it (an `ftruncate`-extended file stayed sparse in
-every probe, and a 4 MiB write at its end allocated 4 MiB).
+**No write ever extends the file in bounded mode.** The controller creates the file (and
+its directory) at its final size, as a hole (`presizeFile`: `open(O_CREAT)` + `ftruncate`),
+on the network thread as soon as the files are checked, before its first plan wants any
+piece; libtorrent then opens the existing file as is (its size is the expected one: no
+truncation, and sparse mode never preallocates). Why (the allocation runaway, e2e B1,
+found in part 3):
 
-Backstop, allocation runaway (`reclaimAllocatedHoles`): in the offline end-to-end runs
-of the app the file's allocation twice grew to nearly the whole file within a second of
-the first write of the tail pins, while its data was a few pieces (cause not found:
-libtorrent's sparse storage never preallocates, and plain writes, SEEK_HOLE and
-F_PUNCHHOLE on the same volumes stayed sparse); the volume filled up and libtorrent
-stayed in upload mode. While free space is below the reserve and the file holds more
+- On APFS, a write that starts beyond the end of the file while the file's last appends
+  are still dirty in the buffer cache makes the kernel write zeros over the whole gap,
+  from the old end of the file to the write, before the write returns. libtorrent's
+  sparse storage does exactly that at start-up: it appends the head window (256 KiB
+  write-cache lines) and writes the tail pins gigabytes further at the same time.
+- In-app trace (a DYLD interposer around every syscall on the file, `Tools/AllocationProbe/ptft.c`):
+  one `pwritev` of 256 KiB at 4,844,421,120 on a file of 83,886,080 bytes took 2.04 s;
+  meanwhile the allocation grew from 27.5 MiB to 2826 MiB (the whole 3 GiB volume) with
+  st_size unchanged, which jumped when the call returned (successfully). The two next tail
+  writes waited behind it. The volume filled up, every other write failed with ENOSPC
+  and libtorrent went into upload mode.
+- Reproduced without libtorrent (`Tools/AllocationProbe/zerofill_probe.c`, 3 appending
+  threads then one far write, fresh 3 GiB sparse image): 33 of 88 far writes (38 %) zero-fill
+  the gap, for gaps of 1 GiB, 2 GiB, 4.4 GiB and 12 GiB alike; the host's sparse image grew
+  by 2.9 GB (zeros really written, ~1 GB/s). 0 of 38 after `fsync`, 6 of 38 after a 1 s
+  pause (the dirty data is written back on the kernel's schedule), 0 of 105 when the file
+  already had its size (`ftruncate` right after the first append, or right after the burst
+  with the dirty data still there): `ftruncate` itself never allocates.
+- The first mitigation (c4ce94ab) sized the file only once libtorrent had created it, on
+  the next plan: usually before the tail pins, but not by construction.
+
+`PT_BOUNDED_NO_PRESIZE=1` in the environment turns the presize off (diagnostics only: it
+brings the runaway back).
+
+Backstop, allocation runaway (`reclaimAllocatedHoles`), should the file ever hold far more
+blocks than its data anyway: while free space is below the reserve and the file holds more
 than its data, its pieces' partial downloads, the pending holes and the in-flight
 allowance plus max(64 MiB, 4 pieces), every missing piece libtorrent has no block of
 (not in its download queue) is punched back to a hole, on the network thread (no block
-can be requested meanwhile), in 64 MiB steps, at most every 2 s (a failed step is logged
-with its errno). Statistics key `reclaimedBytes`; the
+can be requested meanwhile), in 64 MiB steps (a failed step is tried again in 4 MiB
+steps, then logged with its errno), at most every 2 s. One `F_PUNCHHOLE` over gigabytes
+of zero-filled blocks fails with ENOSPC on a full volume (probe: 2 of 2 right after a
+runaway, while a 64 MiB step on the same file succeeded; the first backstop punched each
+range in one call and freed nothing in the e2e run fmb2, errno not logged then). With 64 MiB
+steps and the presize turned off, the backstop gave back 2.3-2.7 GB in every
+runaway of part 3 and the stream started (see Results, part 3). Statistics key `reclaimedBytes`; the
 `PT_BOUNDED_DEBUG` trace and the console log `allocation runaway`.
+
+**A start never loads forever for lack of space.** The controller tracks how long the
+download has been unable to go on for lack of space (free space below half the reserve,
+or libtorrent in upload mode after ENOSPC; statistics key `diskStarvedSeconds`). A
+bounded stream that is not ready yet and has been starved for 30 s
+(`kStartStarvationSeconds`) fails with -5 (`NotEnoughSpaceForBoundedStorage`): its
+localized message gives the space to clear (the minimum working set minus the free space
+and what this stream's own file holds, which its cancel gives back), or asks to clear some
+space when deleting the stream's file is enough. A ready stream never fails this way: its
+reader waits for the space to come back, as before.
 
 In bounded mode a `file_error_alert` with ENOSPC/EDQUOT does not end the stream:
 the controller shrinks the ahead budget by 25 % (down to 50 %), drops on-disk
@@ -416,14 +451,22 @@ aheadBudget, aheadBytes, behindBytes, pinnedBytes, dataBytes, bytesOnDisk,
 freeBytes, reserveBytes, readPosition, consumedBefore, lowestAvailableOffset,
 servedOffset, headPinEnd, tailPinStart, everDownloaded, freedPieces,
 droppedPieces, punchedBytes, punchErrors, diskFullEvents, fileErrors,
-dontHaveSent, partialPiecesPunched, reclaimedBytes, waitingReads, downloadLimit, paceState
-(0 open, 1 proportional, 2 floor, 3 trickle, 4 emergency), consumeRate`.
+dontHaveSent, partialPiecesPunched, reclaimedBytes, presized, diskStarvedSeconds,
+waitingReads, downloadLimit, paceState (0 open, 1 proportional, 2 floor, 3 trickle,
+4 emergency), consumeRate`.
 
 `PT_BOUNDED_DEBUG=1` in the environment (Xcode scheme) logs the controller's
 state once a second: read position, piece states, ahead/budget, allocation,
 pending holes, limit, peers (choked, snubbed, queues), waiting reads,
 libtorrent's view of the first missing piece, drops, and passes of pieces that
 were not missing.
+
+`Tools/AllocationProbe` (diagnostics, not built with the package): `zerofill_probe.c`
+reproduces the APFS zero-fill offline (`zsh run_probe.sh [trials]`: every mode on a fresh
+sparse image); `ptft.c` is the syscall tracer used to find it (a dylib for
+`DYLD_INSERT_LIBRARIES` into a DEBUG app: every open/write/read/ftruncate/fcntl/lseek/mmap
+on the torrent's file with st_size and allocated bytes before and after, the duration and
+the thread, and a 10 ms sampler that logs the calls in flight whenever the allocation jumps).
 
 ## Tests
 
@@ -529,6 +572,42 @@ position; its subtitle tracks of the file and track names are not available then
 |---|---|
 | unit tests (`PopcornTorrentLogicTests`) | 31/31 (4 new: no drop once the rest of the file is on disk, app headroom in the minimum, full mode leaves room for the app's copy, pending external bytes; the Matroska head pin test extended) |
 
+### Results (Mac + tvOS simulator, 2026-11-11, part 3: allocation runaway)
+
+Offline starts of the app (DEBUG builds) with its remux film of 4.5 GiB (4 MiB pieces) on a fresh
+3 GiB APFS sparse image each, seeded at 12 MB/s on 127.0.0.1, ~75 s each (the start, then 60 s of
+playback). Runaway: the backstop fired, or the file held more than 1.4 GiB (its window is ~0.8 GiB).
+
+| Build | Starts | Runaways | Peak allocated (1 s monitor) | Ready after the metadata |
+|---|---|---|---|---|
+| c4ce94ab, presize swallowed by the tracer (`ptft`) | 9 Mac | 5 (2.4-2.8 GB, the whole volume; trace) | 715-2708 MiB | 8.2-14.7 s |
+| this fix, `PT_BOUNDED_NO_PRESIZE=1`, no tracer | 10 Mac | 4 | 769-2682 MiB | 8.3-13.8 s |
+| this fix | 22 Mac | 0 | 753-765 MiB (median 762) | 8.1-9.3 s (median 8.3) |
+| this fix | 4 tvOS 26.5 simulator | 0 | 756-764 MiB | 8.6-9.4 s |
+
+In every runaway the backstop gave the space back (2.3-2.7 GB in 64 MiB steps, 0 punch error)
+and the stream started, up to 6 s later than a clean start (11.9-14.7 s against 8.1-9.4 s;
+once the runaway came after the start). Every fixed start logs "file created at
+… bytes up front (a hole; it held 0)": the file exists at its size before libtorrent writes.
+
+Start starvation (the volume filled up by a ballast 2 s after the file was created, 85 MiB left,
+seeder at 1 MB/s so the stream is not ready): Mac, "too full to download" 5 s after the metadata,
+the stream failed with -5 30.5 s later ("to free 1194 MiB"); tvOS simulator, the same after 30.0 s,
+then the app's disk-full flow (caches wiped, one retry refused at metadata with -5) shows its alert
+"Pas assez d'espace libre pour lire cette vidéo, même en mode stockage limité. Libérez au moins 1,4 Go".
+
+| Run | Result |
+|---|---|
+| unit tests (`PopcornTorrentLogicTests`) | 35/35 (4 new: starvation, start expiry, space to free, reclaim steps) |
+| SessionHarness zombie / starve / guest / background | 8/8, 8/8, 16/16, 5/5 |
+| bounded, 6 GiB, 3 GiB image, budget 2 GiB, 60 s pause | 21/21: at most 2068 MiB on disk, free never below 791 MiB, 0 stall |
+| full, 6 GiB, 8 GiB image | 14/14 |
+| bounded, 3 GiB, 2 GiB image, 2 forward seeks | 23/23: at most 429 MiB against 436 MiB |
+| bounded + 900 MiB ballast, automatic budget | 21/21 (the ballast did not reach the reserve) |
+| bounded + 900 MiB ballast, budget 2 GiB (free down to 34-360 MiB) | 4 runs: 19/21 three times (the 2 probe-peer checks fail, exactly as with the previous commit c4ce94ab, 19/21 in its 2 runs); once 17/21: the main read also waited 120 s for a piece at 4.0 GiB (164 pieces dropped and fetched again in that run; see Limits) |
+| bounded + ballast keeping the volume full for 30 s | 19/21: 149 ENOSPC handled, one 28.1 s stall while the volume was full, same hash, no failure (the stream was ready); the 2 probe-peer checks fail, as before |
+| builds macOS, tvOS, tvOS Simulator, iOS | 0 errors (the 2 existing iOS deprecation warnings) |
+
 ## Limits and open points
 
 - tvOS on device is untested: `F_PUNCHHOLE` and `SEEK_HOLE` in the app sandbox,
@@ -559,6 +638,19 @@ position; its subtitle tracks of the file and track names are not available then
   hash failure, no pre-existing file offline), and a pause long enough for the
   floor band to fill (the over-budget drop is unit-tested; the harness pause is
   60 s).
+- Full mode does not size the file up front (unchanged on purpose): its first tail write can
+  still make APFS write zeros up to the tail (a 13 GB film: about 13 GB written at ~1 GB/s,
+  libtorrent's disk thread blocked meanwhile). The file fits by definition, so no space is lost,
+  but the start is slower and the flash is written twice. Sizing the file in full mode too is a
+  one-line change in `presizeFile` (not done: full mode stays as it was).
+- The APFS behaviour was measured on macOS 27.2 (and the tvOS 26.5 simulator, which writes
+  through the host's kernel). tvOS on device is expected to behave the same, untested; the
+  presize does not depend on it.
+- With a ballast keeping the volume below the reserve (budget 2 GiB), 1 harness run in 4
+  waited 120 s for a piece at 4.0 GiB that was never fetched again after the drops (0 in the
+  2 runs of the previous commit: too few to tell; the code paths of part 3 are not involved:
+  no starvation, no reclaim in that run). Same family as the late piece and the seeds dropped
+  by a "finished" torrent above.
 - The time-critical (deadline) path of libtorrent misbehaved with one very fast
   local seed (a window starved, cancels left requests outstanding until the
   request timeout); bounded mode avoids it, full mode keeps it as before.
