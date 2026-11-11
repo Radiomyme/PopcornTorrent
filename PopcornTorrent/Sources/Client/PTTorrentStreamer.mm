@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 #import <string>
 #import <sys/stat.h>
+#import <unistd.h>
 #import <mutex>
 #import <libtorrent/bencode.hpp>
 #import "../Security/CocoaSecurity.h"
@@ -38,7 +39,9 @@ using namespace libtorrent;
     self = [super init];
     if (self) {
         selectedFileIndex = -1;
-        _allowsBoundedStorage = YES;
+        // Opt-in: bounded storage only works when the consumer releases what it read
+        // (setConsumedBefore:), which an app has to do on purpose.
+        _allowsBoundedStorage = NO;
         _storageReserve = ptbounded::kDefaultReserveBytes;
         self.session = [PTTorrentsSession sharedSession];
         [self setupSession];
@@ -264,7 +267,8 @@ using namespace libtorrent;
         NSLog(@"PopcornTorrent: disk full in bounded mode, recovering (%@)", description);
         return;
     }
-    NSError *error = [[NSError alloc] initWithDomain:PTTorrentStreamerErrorDomain code:-4 userInfo:@{NSLocalizedDescriptionKey: description}];
+    PTTorrentStreamerError const code = diskFull ? PTTorrentStreamerErrorNotEnoughSpace : PTTorrentStreamerErrorFile;
+    NSError *error = [[NSError alloc] initWithDomain:PTTorrentStreamerErrorDomain code:code userInfo:@{NSLocalizedDescriptionKey: description}];
     [self handleTorrentError:error];
 }
 
@@ -424,6 +428,11 @@ using namespace libtorrent;
     return availableSpace ? availableSpace.longLongValue : LLONG_MAX;
 }
 
+/// Bounded storage gives space back by punching holes in the file (APFS).
+- (BOOL)volumeSupportsHolesAtPath:(NSString *)path {
+    return pathconf(path.fileSystemRepresentation, _PC_MIN_HOLE_SIZE) > 0;
+}
+
 #pragma mark - Alerts
 
 - (void)metadataReceivedAlert:(torrent_handle)th {
@@ -458,6 +467,10 @@ using namespace libtorrent;
     input.requestedBudget = self.storageBudget;
     input.durationSeconds = self.mediaDurationHint;
     input.allowBounded = self.allowsBoundedStorage;
+    if (input.allowBounded && ![self volumeSupportsHolesAtPath:self.savePath]) {
+        NSLog(@"PopcornTorrent: no hole punching on the volume of %@, bounded storage disabled", self.savePath);
+        input.allowBounded = false;
+    }
     ptbounded::BudgetPlan const plan = ptbounded::planBudget(input);
 
     if (plan.decision == ptbounded::StorageDecision::Refuse) {
@@ -482,23 +495,7 @@ using namespace libtorrent;
     // download first pieces
     MIN_PIECES = (ti->files().file_size(file_index) * 0.03) / ti->piece_length();
     MIN_PIECES = std::max(1, std::min(MIN_PIECES, 20));
-    piece_index_t first_piece = ti->map_file(file_index, 0, 0).piece;
-    mtx.lock();
-    required_pieces.clear();
-    for (int i = 0; i < MIN_PIECES; i++) {
-        required_pieces.push_back(first_piece);
-        first_piece++;
-    }
-
-    // download last pieces
-    piece_index_t last_piece = ti->map_file(file_index, file_size - 1, 0).piece;
-    lastFilePiece = last_piece;
-    int maxEndPieces = MIN_PIECES <= 6 ? 1 : 2;
-    for (int i = 0; i < maxEndPieces; i++) {
-        required_pieces.push_back(last_piece);
-        last_piece--;
-    }
-    mtx.unlock();
+    int const maxEndPieces = MIN_PIECES <= 6 ? 1 : 2;
 
     ptbounded::StreamConfig config;
     config.geometry.fileOffset = ti->files().file_offset(file_index);
@@ -509,12 +506,7 @@ using namespace libtorrent;
     config.reserveBytes = input.reserveBytes;
     config.filePath = std::string(filePath.fileSystemRepresentation);
     config.directoryPath = std::string(self.savePath.fileSystemRepresentation);
-    for (piece_index_t piece : required_pieces) {
-        int32_t const index = int32_t(static_cast<int>(piece));
-        if (std::find(config.requiredPieces.begin(), config.requiredPieces.end(), index) == config.requiredPieces.end()) {
-            config.requiredPieces.push_back(index);
-        }
-    }
+    config.fileExisted = input.heldBytes > 0;
     if (bounded) {
         // A window of at least 32 MiB at top priority, fetched first by the sequential
         // picker. No libtorrent deadlines here: while time-critical pieces exist it keeps
@@ -537,6 +529,46 @@ using namespace libtorrent;
         config.tailPieces = maxEndPieces;
         config.deadlineFirstMs = PIECE_DEADLINE_MILLIS;
         config.deadlineStepMs = 0;
+    }
+
+    // Pieces needed before the stream is ready. Bounded: no more than the window, so they
+    // are all fetched at once and unthrottled (beyond it they would be paced like any
+    // data ahead, at the floor rate when the minimum working set is tight).
+    int const headPieces = bounded ? std::min(MIN_PIECES, config.windowPieces) : MIN_PIECES;
+    piece_index_t first_piece = ti->map_file(file_index, 0, 0).piece;
+    mtx.lock();
+    required_pieces.clear();
+    for (int i = 0; i < headPieces; i++) {
+        required_pieces.push_back(first_piece);
+        first_piece++;
+    }
+
+    // download last pieces
+    piece_index_t last_piece = ti->map_file(file_index, file_size - 1, 0).piece;
+    lastFilePiece = last_piece;
+    for (int i = 0; i < maxEndPieces; i++) {
+        required_pieces.push_back(last_piece);
+        last_piece--;
+    }
+    mtx.unlock();
+
+    for (piece_index_t piece : required_pieces) {
+        int32_t const index = int32_t(static_cast<int>(piece));
+        if (std::find(config.requiredPieces.begin(), config.requiredPieces.end(), index) == config.requiredPieces.end()) {
+            config.requiredPieces.push_back(index);
+        }
+    }
+    // Hashes of the pieces wholly inside the file: a piece that may land over stale
+    // bytes is verified by its content (see StreamController::verify).
+    int32_t const filePieces = config.geometry.pieceCount();
+    config.pieceHashes.assign(size_t(filePieces) * 20, '\0');
+    int64_t const fileEnd = config.geometry.fileOffset + file_size;
+    for (int32_t i = 0; i < filePieces; ++i) {
+        piece_index_t const piece(config.geometry.firstPiece() + i);
+        int64_t const pieceStart = int64_t(static_cast<int>(piece)) * ti->piece_length();
+        if (pieceStart < config.geometry.fileOffset || pieceStart + ti->piece_size(piece) > fileEnd) continue;
+        sha1_hash const hash = ti->hash_for_piece(piece);
+        std::memcpy(&config.pieceHashes[size_t(i) * 20], hash.data(), 20);
     }
     if (controller) {
         controller->configure(config);
@@ -789,6 +821,7 @@ using namespace libtorrent;
         @"diskFullEvents": @(s.diskFullEvents),
         @"fileErrors": @(s.fileErrors),
         @"dontHaveSent": @(s.dontHaveSent),
+        @"partialPiecesPunched": @(s.partialPunched),
         @"waitingReads": @(s.waiters),
         @"downloadLimit": @(s.downloadLimit),
         @"paceState": @(s.paceState),

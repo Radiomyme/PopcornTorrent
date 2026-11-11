@@ -51,10 +51,12 @@ FOUNDATION_EXPORT NSErrorDomain const PTTorrentStreamerErrorDomain;
  Codes of the errors passed to the failure block (`PTTorrentStreamerErrorDomain`).
  */
 typedef NS_ERROR_ENUM(PTTorrentStreamerErrorDomain, PTTorrentStreamerError) {
-    /// The selected file does not fit in the free space (bounded storage not allowed), or a disk error stopped the torrent.
+    /// The selected file does not fit in the free space (bounded storage not allowed), or the disk became full while downloading (full mode; bounded mode recovers instead).
     PTTorrentStreamerErrorNotEnoughSpace = -4,
     /// Even bounded storage cannot run: the free space is below its minimum working set. `NSLocalizedDescriptionKey` says how much to free.
     PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage = -5,
+    /// Another file error (I/O error, permissions...) stopped the torrent. `NSLocalizedDescriptionKey` is libtorrent's message.
+    PTTorrentStreamerErrorFile = -6,
 };
 
 /**
@@ -145,7 +147,9 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
  */
 
 /**
- Allows bounded storage when the selected file plus `storageReserve` does not fit in the free space. Defaults to `YES` (`NO` for `PTTorrentDownload`, which needs the whole file). When `NO`, such a file is refused with `PTTorrentStreamerErrorNotEnoughSpace` as before.
+ Allows bounded storage when the selected file plus `storageReserve` does not fit in the free space. Defaults to `NO`: such a file is refused with `PTTorrentStreamerErrorNotEnoughSpace` as before (always for `PTTorrentDownload`, which needs the whole file).
+
+ Set it to `YES` only if the consumer releases what it has read with `setConsumedBefore:` (and, when it does not read through the HTTP server, reports its position with `setReadPosition:`): without that nothing is freed, the window stays at the start of the file and the stream stalls once the budget is full. Bounded storage also needs a volume that supports holes (APFS); elsewhere the legacy refusal applies.
  */
 @property (atomic) BOOL allowsBoundedStorage;
 
@@ -185,7 +189,7 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
 @property (atomic) int64_t consumedBefore;
 
 /**
- Bounded mode: data below this offset (apart from the pinned head) is deleted, or consumed and queued for deletion (pieces are deleted in batches of 32 MiB or once a second), and can never be read again: a rewind before it must be blocked. 0 in full mode or when nothing was consumed yet. To know whether data at or above it can be read now, use `isRangeAvailable:length:` (pieces skipped by a forward seek are not on disk either).
+ Bounded mode: data below this offset (apart from the pinned head) is deleted, or consumed and queued for deletion (pieces are deleted in batches of 32 MiB or once a second), and can never be read again: a rewind before it must be blocked. 0 in full mode or when nothing was consumed yet. To know whether data at or above it can be read now, use `isRangeAvailable:length:` (pieces skipped by a forward seek are not on disk either; once consumed they are never downloaded, and the HTTP server answers 410 for them as for deleted data).
  */
 @property (atomic, readonly) int64_t lowestAvailableOffset;
 

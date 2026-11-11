@@ -197,6 +197,8 @@ using namespace libtorrent;
 - (void)pause {
     if (_downloadStatus != PTTorrentDownloadStatusDownloading) return;
     
+    // Not auto-managed any more, or libtorrent's auto-manager resumes the paused download.
+    self.torrentHandle.unset_flags(torrent_flags::auto_managed);
     self.torrentHandle.pause(torrent_handle::graceful_pause);
     [self setDownloadStatus:PTTorrentDownloadStatusPaused];
 }

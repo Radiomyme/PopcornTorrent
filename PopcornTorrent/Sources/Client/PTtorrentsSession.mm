@@ -7,6 +7,7 @@
 
 #import <Foundation/Foundation.h>
 #import "PTTorrentsSession.h"
+#import "PTTorrentsSession+Testing.h"
 #import "PTTorrentStreamer+Protected.h"
 #import <libtorrent/session.hpp>
 #import <libtorrent/torrent.hpp>
