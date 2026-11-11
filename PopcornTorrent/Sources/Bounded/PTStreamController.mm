@@ -44,6 +44,13 @@ constexpr int64_t kContentRetryNanos = 200 * NSEC_PER_MSEC;
 
 int64_t alignUp(int64_t value) { return (value + kBlock - 1) / kBlock * kBlock; }
 
+// PT_BOUNDED_NO_PRESIZE=1 (diagnostics only): the file is not created at its size up front,
+// which brings the allocation runaway (e2e B1) back. Never set it otherwise.
+bool presizeDisabled() {
+    static bool const disabled = getenv("PT_BOUNDED_NO_PRESIZE") != nullptr;
+    return disabled;
+}
+
 // Set PT_BOUNDED_DEBUG=1 in the environment to trace the controller once a second.
 bool debugTrace() {
     static bool const enabled = getenv("PT_BOUNDED_DEBUG") != nullptr;
@@ -341,6 +348,8 @@ StreamStatistics StreamController::statistics() const {
     s.dontHaveSent = m_dontHaveSent.load();
     s.partialPunched = m_partialPunched.load();
     s.reclaimedBytes = m_reclaimedBytes.load();
+    s.presized = m_presized.load() && !presizeDisabled();
+    s.diskStarvedSeconds = diskStarvedSeconds();
     s.downloadLimit = m_downloadLimit.load();
     s.paceState = m_paceState.load();
     s.consumeRate = m_consumeRate.load();
@@ -829,7 +838,29 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
         m_diskFullPending.store(false);
     }
 
+    // How long the download has been unable to go on for lack of space: the streamer fails a
+    // stream that is not ready yet after kStartStarvationSeconds (no endless loading).
+    if (isDiskStarved(free, m_config.reserveBytes, torrent.upload_mode())) {
+        int64_t expected = 0;
+        int64_t const now = int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (m_starvedSinceNanos.compare_exchange_strong(expected, now)) {
+            NSLog(@"PopcornTorrent bounded: the volume is too full to download (free %lld MiB, upload mode %d)",
+                  free / kMiB, int(torrent.upload_mode()));
+        }
+    } else if (m_starvedSinceNanos.exchange(0) != 0) {
+        NSLog(@"PopcornTorrent bounded: space is back (free %lld MiB)", free / kMiB);
+    }
+
     if (fromTick) sweepWaiters(plan);
+}
+
+double StreamController::diskStarvedSeconds() const {
+    int64_t const since = m_starvedSinceNanos.load();
+    if (since == 0 || m_cancelled.load()) return 0;
+    int64_t const now = int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    return double(now - since) / 1e9;
 }
 
 void StreamController::applyPriorities(lt::torrent& torrent, std::vector<uint8_t> const& priorities) {
@@ -970,25 +1001,65 @@ void StreamController::punchPartialPieces(lt::torrent& torrent) {
 }
 
 void StreamController::presizeFile() {
-    // The first write of a tail pin used to extend the file by gigabytes at once. In the app's
-    // offline runs APFS then sometimes allocated the whole gap within a second (2 of 7 starts:
-    // the volume filled up, libtorrent stayed in upload mode); the kernel path that does it was
-    // not found, and no probe reproduced it. A file extended with ftruncate stays a hole on
-    // APFS (checked), and later writes far into it no longer extend it. libtorrent creates the
-    // file on its first write; this runs once it exists, before the tail pins are written.
-    if (m_presized.load() || m_cancelled.load() || !m_bounded.load()) return;
-    int const fd = fileDescriptor();
-    if (fd < 0) return; // not created yet: on the next plan
-    std::shared_lock<std::shared_mutex> lock(m_fdLock);
-    if (fd != m_fd || m_cancelled.load()) return;
-    struct stat info;
-    if (fstat(fd, &info) != 0 || m_presized.exchange(true)) return;
+    // Root cause of the allocation runaway (e2e B1). On APFS, a write that starts beyond the
+    // end of the file while the file's last appends are still dirty in the buffer cache makes
+    // the kernel write zeros over the whole gap, from the old end of the file to the write,
+    // before the write returns: one 256 KiB pwritev of a tail pin, 4.6 GB past the end of a
+    // file that libtorrent was appending to, took 2 s and allocated 2.8 GB (the whole volume);
+    // st_size changed only when it returned. Offline probe (Tools: ptft trace + race probe of
+    // the part-3 run): 30-50 % of such writes after a burst of appends, for gaps of 1 GiB to
+    // 12 GiB; none after fsync, after a 1 s pause, or when the file already had its size;
+    // ftruncate itself never allocates, even right after a burst of appends. libtorrent's sparse
+    // storage appends the head window and writes the tail pins gigabytes further at the same time.
+    // So in bounded mode no write may extend the file: it is created here, at its final size
+    // (a hole), once the files are checked and before the first plan wants any piece (apply()
+    // calls this first, on the network thread). libtorrent opens the existing file as is (its size
+    // is the expected one: no truncation, no allocation in sparse mode).
+    if (m_presized.load() || m_cancelled.load() || !m_bounded.load() || m_config.filePath.empty()) return;
+    if (presizeDisabled()) {
+        m_presized.store(true);
+        NSLog(@"PopcornTorrent bounded: PT_BOUNDED_NO_PRESIZE set, the file is NOT sized up front");
+        return;
+    }
     int64_t const size = m_config.geometry.fileSize;
-    if (info.st_size >= size) return;
-    if (ftruncate(fd, off_t(size)) == 0) {
-        NSLog(@"PopcornTorrent bounded: file sized to %lld bytes up front (a hole; it held %lld)", size, int64_t(info.st_size));
+    std::unique_lock<std::shared_mutex> lock(m_fdLock);
+    if (m_cancelled.load()) return;
+    bool created = false;
+    if (m_fd < 0) {
+        m_fd = open(m_config.filePath.c_str(), O_RDWR | O_CLOEXEC);
+        if (m_fd < 0 && errno == ENOENT) {
+            NSString *path = [NSString stringWithUTF8String:m_config.filePath.c_str()];
+            NSString *directory = path.stringByDeletingLastPathComponent;
+            if (directory.length > 0) {
+                [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+            }
+            // libtorrent's own permissions (rw for everyone, filtered by the umask).
+            m_fd = open(m_config.filePath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+            created = m_fd >= 0;
+        }
+        if (m_fd < 0) {
+            int const error = errno;
+            // Tried again on the next plans; after a few failures libtorrent creates the file
+            // and the allocation-runaway backstop below covers what may follow.
+            if (++m_presizeFailures >= 5) m_presized.store(true);
+            NSLog(@"PopcornTorrent bounded: could not create the file up front (errno %d, attempt %d)", error, m_presizeFailures);
+            return;
+        }
+    }
+    struct stat info;
+    if (fstat(m_fd, &info) != 0) return;
+    if (info.st_size >= size) {
+        m_presized.store(true);
+        return;
+    }
+    if (ftruncate(m_fd, off_t(size)) == 0) {
+        m_presized.store(true);
+        NSLog(@"PopcornTorrent bounded: file %s at %lld bytes up front (a hole; it held %lld)",
+              created ? "created" : "sized", size, int64_t(info.st_size));
     } else {
-        NSLog(@"PopcornTorrent bounded: could not size the file up front (errno %d)", errno);
+        int const error = errno;
+        if (++m_presizeFailures >= 5) m_presized.store(true);
+        NSLog(@"PopcornTorrent bounded: could not size the file up front (errno %d, attempt %d)", error, m_presizeFailures);
     }
 }
 
@@ -1025,16 +1096,31 @@ int64_t StreamController::reclaimAllocatedHoles(lt::torrent& torrent, int64_t al
         if (end > begin) {
             std::shared_lock<std::shared_mutex> lock(m_fdLock);
             if (fd == m_fd && !m_cancelled.load()) {
-                // In 64 MiB steps: each one gives its space back before the next.
-                for (int64_t from = begin; from < end; from += 64 * kMiB) {
-                    int64_t const to = std::min(end, from + 64 * kMiB);
+                // In steps: each one gives its space back before the next. One F_PUNCHHOLE
+                // over gigabytes of zero-filled blocks fails with ENOSPC on a full volume
+                // (measured: that is why the first backstop freed nothing); 64 MiB steps
+                // succeed, and a failed step is tried again in 4 MiB steps.
+                bool failed = false;
+                for (int64_t from = begin; from < end && !failed; from += kReclaimStepBytes) {
+                    int64_t const to = std::min(end, from + kReclaimStepBytes);
                     fpunchhole_t hole = {0, 0, off_t(from), off_t(to - from)};
                     if (fcntl(fd, F_PUNCHHOLE, &hole) == 0) {
                         punched += to - from;
-                    } else {
-                        m_punchErrors.fetch_add(1);
-                        NSLog(@"PopcornTorrent bounded: F_PUNCHHOLE failed for [%lld, %lld) (errno %d)", from, to, errno);
-                        break;
+                        continue;
+                    }
+                    int const stepError = errno;
+                    for (int64_t small = from; small < to; small += kReclaimSmallStepBytes) {
+                        int64_t const smallEnd = std::min(to, small + kReclaimSmallStepBytes);
+                        fpunchhole_t piece = {0, 0, off_t(small), off_t(smallEnd - small)};
+                        if (fcntl(fd, F_PUNCHHOLE, &piece) == 0) {
+                            punched += smallEnd - small;
+                        } else {
+                            m_punchErrors.fetch_add(1);
+                            NSLog(@"PopcornTorrent bounded: F_PUNCHHOLE failed for [%lld, %lld) (errno %d, %d for the 64 MiB step)",
+                                  small, smallEnd, errno, stepError);
+                            failed = true;
+                            break;
+                        }
                     }
                 }
                 ++ranges;

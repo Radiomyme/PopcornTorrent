@@ -95,6 +95,8 @@ struct StreamStatistics {
     int64_t dontHaveSent = 0;
     int64_t partialPunched = 0;
     int64_t reclaimedBytes = 0;     // allocation runaway: blocks punched out of regions with no data
+    bool presized = false;          // bounded: the file was created at its final size (a hole)
+    double diskStarvedSeconds = 0;  // bounded: how long the volume has been too full to download (0 = not)
     int64_t waiters = 0;
     int downloadLimit = 0;
     int paceState = 0;
@@ -144,6 +146,9 @@ public:
     /// Free space of the volume as this stream may use it: minus the pending external bytes.
     int64_t freeBytes() const;
     std::pair<int, int> requiredProgress() const;
+    /// Bounded: seconds the volume has been too full for the download to go on
+    /// (ptbounded::isDiskStarved, evaluated on every plan); 0 when it is not.
+    double diskStarvedSeconds() const;
     float windowProgress() const;
     StreamStatistics statistics() const;
     /// HTTP readers. The primary reader (the one streaming) drives the read
@@ -189,7 +194,8 @@ private:
     /// its data while the disk is short; punches every missing piece libtorrent has no
     /// block of back to a hole. Returns the bytes punched.
     int64_t reclaimAllocatedHoles(libtorrent::torrent& torrent, int64_t allocated, int64_t dataBytes);
-    /// Bounded: gives the file its final size as a hole once libtorrent created it (any thread).
+    /// Bounded: creates the file at its final size, as a hole, before libtorrent writes any of
+    /// it, so that no write ever extends the file (network thread; see the .mm for why).
     void presizeFile();
     std::vector<uint8_t> snapshotStates() const;
     bool isPinnedOffset(int64_t offset) const;
@@ -249,7 +255,9 @@ private:
     std::atomic<int64_t> m_diskFullEvents{0}, m_fileErrors{0}, m_dontHaveSent{0}, m_partialPunched{0};
     std::atomic<int64_t> m_reclaimedBytes{0};
     std::atomic<bool> m_presized{false};
+    std::atomic<int64_t> m_starvedSinceNanos{0}; // steady clock, 0 = not starved
     double m_lastReclaimTime = 0; // network thread
+    int m_presizeFailures = 0;    // network thread
     std::atomic<int64_t> m_pendingPunches{0}, m_pendingPunchBytes{0}, m_allocatedBytes{0};
     std::atomic<int> m_downloadLimit{0}, m_paceState{0};
     std::atomic<int> m_windowTotal{0}, m_windowOnDisk{0};

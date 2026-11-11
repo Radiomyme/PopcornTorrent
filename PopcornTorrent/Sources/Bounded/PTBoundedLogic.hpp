@@ -49,6 +49,16 @@ constexpr int kTailPinMaxPieces = 10;
 constexpr double kAssumedDurationSeconds = 2 * 3600;
 /// Most bytes the head parser reads at one offset (an EBML element header, an MP4 box header).
 constexpr int64_t kHeadParserLookahead = 16;
+/// Bounded mode, before the stream is ready: how long the volume may stay too full for the
+/// download to go on (see isDiskStarved) before the stream fails with
+/// NotEnoughSpaceForBoundedStorage instead of loading forever.
+constexpr double kStartStarvationSeconds = 30;
+/// Hole punching of an allocation runaway, in steps of this size: APFS refuses one
+/// F_PUNCHHOLE over gigabytes of zero-filled blocks on a full volume (ENOSPC, measured),
+/// while each 64 MiB step gives its space back before the next one.
+constexpr int64_t kReclaimStepBytes = 64 * kMiB;
+/// Smaller step tried when a reclaim step fails with ENOSPC.
+constexpr int64_t kReclaimSmallStepBytes = 4 * kMiB;
 
 /// Piece states as seen by the streamer. This is not libtorrent's view: a piece
 /// is only `OnDisk` once its bytes are verified as written to the file.
@@ -250,6 +260,20 @@ PaceOutput pace(PaceInput const& input);
 int64_t excessAheadBytes(PaceInput const& input, int64_t pieceLength);
 
 #pragma mark - Container head parser
+
+/// The download cannot go on for lack of space: the free space is below half the reserve
+/// (INT64_MAX: unknown, never starved by it), or libtorrent is in upload mode (its reaction
+/// to ENOSPC).
+bool isDiskStarved(int64_t freeBytes, int64_t reserveBytes, bool uploadMode);
+
+/// Bounded mode: a stream that is not ready yet and has been starved of space for at least
+/// kStartStarvationSeconds fails (NotEnoughSpaceForBoundedStorage). A ready stream never does:
+/// its reader waits as long as the volume stays full.
+bool startStarvationExpired(bool ready, double starvedSeconds);
+
+/// What to free so that bounded storage can start again once this stream is gone: its file
+/// (`heldBytes`) is deleted at cancel. 0 when that alone is enough.
+int64_t bytesToFreeAfterStarvation(int64_t minimumFreeBytes, int64_t freeBytes, int64_t heldBytes);
 
 /// Reads `length` bytes at `offset` of the file; false when they are not on disk yet.
 using ReadAt = std::function<bool(int64_t offset, uint8_t* buffer, size_t length)>;

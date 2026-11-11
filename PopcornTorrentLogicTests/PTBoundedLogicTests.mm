@@ -761,4 +761,43 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertEqual(result.headPinEnd, kHeadPinFallback);
 }
 
+#pragma mark - Start starvation (the volume stays too full before the stream is ready)
+
+- (void)testDiskStarvedBelowHalfTheReserveOrInUploadMode {
+    int64_t const reserve = 512 * kMiB;
+    XCTAssertFalse(isDiskStarved(2 * kGiB, reserve, false));
+    XCTAssertFalse(isDiskStarved(reserve / 2, reserve, false));  // exactly half: still downloading
+    XCTAssertTrue(isDiskStarved(reserve / 2 - 1, reserve, false));
+    XCTAssertTrue(isDiskStarved(0, reserve, false));
+    XCTAssertTrue(isDiskStarved(2 * kGiB, reserve, true));       // libtorrent's ENOSPC reaction
+    XCTAssertFalse(isDiskStarved(INT64_MAX, reserve, false));     // free space unknown
+}
+
+- (void)testStartStarvationFailsOnlyAStreamThatIsNotReady {
+    XCTAssertFalse(startStarvationExpired(false, 0));
+    XCTAssertFalse(startStarvationExpired(false, kStartStarvationSeconds - 0.5));
+    XCTAssertTrue(startStarvationExpired(false, kStartStarvationSeconds));
+    XCTAssertTrue(startStarvationExpired(false, 600));
+    XCTAssertFalse(startStarvationExpired(true, 600));             // a ready stream waits for space
+    XCTAssertLessThanOrEqual(kStartStarvationSeconds, 60);         // bounded: no endless loading
+}
+
+- (void)testBytesToFreeAfterStarvationCountsTheStreamsOwnFile {
+    int64_t const minimum = 1300 * kMiB;
+    // Another app filled the volume: what is missing beyond this stream's own data.
+    XCTAssertEqual(bytesToFreeAfterStarvation(minimum, 20 * kMiB, 100 * kMiB), minimum - 120 * kMiB);
+    // The stream's own file holds the space (an allocation runaway): nothing to free.
+    XCTAssertEqual(bytesToFreeAfterStarvation(minimum, 20 * kMiB, 2800 * kMiB), 0);
+    XCTAssertEqual(bytesToFreeAfterStarvation(minimum, INT64_MAX, 0), minimum);
+    XCTAssertEqual(bytesToFreeAfterStarvation(minimum, -5, -5), minimum);
+}
+
+- (void)testReclaimStepsStaySmallEnoughForAFullVolume {
+    // One F_PUNCHHOLE over gigabytes of zero-filled blocks fails with ENOSPC on a full APFS volume.
+    XCTAssertLessThanOrEqual(kReclaimStepBytes, 64 * kMiB);
+    XCTAssertLessThan(kReclaimSmallStepBytes, kReclaimStepBytes);
+    XCTAssertEqual(kReclaimStepBytes % 4096, 0);
+    XCTAssertEqual(kReclaimSmallStepBytes % 4096, 0);
+}
+
 @end

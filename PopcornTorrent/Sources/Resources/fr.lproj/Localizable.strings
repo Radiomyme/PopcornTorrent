@@ -14,3 +14,6 @@
 
 /* A stream that was reading the file of an offline download of the same torrent stops: the download was stopped before the file was complete. */
 "This video was playing from its download, and the download was stopped." = "Cette vidéo était lue depuis son téléchargement, et le téléchargement a été arrêté.";
+
+/* Bounded storage: the volume stayed full while the video was loading; the space this video itself held is given back when it stops. */
+"There is not enough free space to start this video. Please clear some space and try again." = "Il n’y a pas assez d’espace libre pour lancer cette vidéo. Libérez de l’espace et réessayez.";

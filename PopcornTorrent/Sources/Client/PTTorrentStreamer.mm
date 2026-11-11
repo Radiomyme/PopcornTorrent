@@ -37,6 +37,9 @@ using namespace libtorrent;
     std::mutex _statusMutex;
     // This stream joined a torrent another streamer of the session added (see joinTorrent:).
     BOOL _guest;
+    // Bounded mode: free space needed to start (planBudget), for the start-starvation error.
+    int64_t _minimumFreeBytes;
+    BOOL _starvationReported;
 }
 
 - (instancetype)init {
@@ -525,6 +528,8 @@ using namespace libtorrent;
     @synchronized (self) {
         _storageMode = bounded ? PTStorageModeBounded : PTStorageModeFull;
     }
+    _minimumFreeBytes = plan.minimumFreeBytes;
+    _starvationReported = NO;
     if (bounded) {
         NSLog(@"PopcornTorrent: bounded storage for %@ (%lld bytes, %lld free, torrent budget %lld, reserve %lld)",
               _fileName, file_size, input.freeBytes, plan.torrentBudget, input.reserveBytes);
@@ -724,6 +729,7 @@ using namespace libtorrent;
     if (!_progressBlock || !_torrentHandle.is_valid() || (self.status.is_finished && !bounded)) {
         return;
     }
+    if (bounded && [self failStarvedStart]) return;
 
     torrent_status const status = _torrentHandle.status();
     self.status = status;
@@ -737,6 +743,36 @@ using namespace libtorrent;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         [self updateAndMonitorTorrentProgress];
     });
+}
+
+/// Main queue. Bounded mode: a stream that is not ready yet while the volume has stayed too full
+/// for the download to go on for kStartStarvationSeconds fails with
+/// NotEnoughSpaceForBoundedStorage (before: it loaded forever, e2e B1). A ready stream never
+/// fails this way: its reader waits for the space to come back. YES if it failed.
+- (BOOL)failStarvedStart {
+    if (_starvationReported || [self isStreaming]) return NO;
+    auto controller = [self controller];
+    if (!controller || !controller->isBounded()) return NO;
+    double const starved = controller->diskStarvedSeconds();
+    if (!ptbounded::startStarvationExpired(false, starved)) return NO;
+    _starvationReported = YES;
+    int64_t const freeBytes = controller->freeBytes();
+    int64_t const held = controller->bytesOnDisk();
+    int64_t const needed = ptbounded::bytesToFreeAfterStarvation(_minimumFreeBytes, freeBytes, held);
+    NSLog(@"PopcornTorrent bounded: the volume stayed too full for %.0f s before the stream was ready "
+          "(free %lld MiB, the file holds %lld MiB, to free %lld MiB): stream failed", starved,
+          freeBytes / ptbounded::kMiB, held / ptbounded::kMiB, needed / ptbounded::kMiB);
+    NSString *description;
+    if (needed > 0) {
+        PTSize *amount = [PTSize sizeWithLongLong:needed];
+        description = [NSString localizedStringWithFormat:@"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again.".localizedString, amount.stringValue];
+    } else {
+        description = @"There is not enough free space to start this video. Please clear some space and try again.".localizedString;
+    }
+    [self handleTorrentError:[NSError errorWithDomain:PTTorrentStreamerErrorDomain
+                                                 code:PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage
+                                             userInfo:@{NSLocalizedDescriptionKey: description}]];
+    return YES;
 }
 
 - (void)pieceFinishedAlert:(torrent_handle)th forPieceIndex:(piece_index_t)index {
@@ -1001,6 +1037,8 @@ using namespace libtorrent;
         @"dontHaveSent": @(s.dontHaveSent),
         @"partialPiecesPunched": @(s.partialPunched),
         @"reclaimedBytes": @(s.reclaimedBytes),
+        @"presized": @(s.presized),
+        @"diskStarvedSeconds": @(s.diskStarvedSeconds),
         @"waitingReads": @(s.waiters),
         @"downloadLimit": @(s.downloadLimit),
         @"paceState": @(s.paceState),

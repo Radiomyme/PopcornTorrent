@@ -539,6 +539,20 @@ HeadPins parseMP4(ReadAt const& read, int64_t fileSize, int64_t headLimit, int64
 
 } // namespace
 
+bool isDiskStarved(int64_t freeBytes, int64_t reserveBytes, bool uploadMode) {
+    if (uploadMode) return true;
+    return freeBytes != INT64_MAX && freeBytes < reserveBytes / 2;
+}
+
+bool startStarvationExpired(bool ready, double starvedSeconds) {
+    return !ready && starvedSeconds >= kStartStarvationSeconds;
+}
+
+int64_t bytesToFreeAfterStarvation(int64_t minimumFreeBytes, int64_t freeBytes, int64_t heldBytes) {
+    int64_t const available = std::max<int64_t>(0, freeBytes == INT64_MAX ? 0 : freeBytes) + std::max<int64_t>(0, heldBytes);
+    return std::max<int64_t>(0, minimumFreeBytes - available);
+}
+
 HeadPins parseHeadPins(ReadAt const& read, int64_t fileSize, int64_t headLimit, int64_t fallback) {
     if (fileSize < 16) return done(std::max<int64_t>(1, fileSize), -1, "unknown");
     uint8_t magic[8];
