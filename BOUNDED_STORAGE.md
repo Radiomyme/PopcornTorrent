@@ -13,7 +13,20 @@ At metadata time (`metadataReceivedAlert`), `planBudget` (`Sources/Bounded/PTBou
 | selected file (minus what is already allocated on disk) + `storageReserve` + `appWorkingSetSeconds` of the bitrate ≤ free space | **Full**: legacy behaviour, the whole file is downloaded and kept |
 | otherwise, free space ≥ minimum working set | **Bounded** |
 | otherwise | **Refused**: error `PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage` (-5), localized message with the space to clear |
-| `allowsBoundedStorage == NO` (the default; always for `PTTorrentDownload`), or a volume without holes (not APFS: `pathconf(_PC_MIN_HOLE_SIZE)`) | legacy check, unchanged: refused with -4 when the file does not fit |
+| `allowsBoundedStorage == NO` (the default; always for `PTTorrentDownload`), or a volume without holes (not APFS: `pathconf(_PC_MIN_HOLE_SIZE)`), or one where the hole self-test fails (below) | legacy check, unchanged: refused with -4 when the file does not fit |
+
+**Hole self-test.** The first time a stream could go bounded on a volume (per process),
+`volumeSupportsHolesAtPath:` checks the primitives bounded storage relies on, on a scratch
+file in the stream's folder: a 2 MiB file created as a hole with its first MiB written
+(`SEEK_HOLE` from 0 must find 1 MiB, `SEEK_DATA` from 1 MiB must fail with ENXIO), then
+`F_PUNCHHOLE` of its first 512 KiB (it must succeed, the range must read as zeros, the rest
+must be intact and `SEEK_DATA` from 0 must find 512 KiB). No fsync, as the controller does.
+One console line: `PopcornTorrent: hole self-test in <folder> (<fs>, _PC_MIN_HOLE_SIZE …,
+block …, free … MiB): PASS (SEEK_HOLE …, SEEK_DATA … after the punch, allocated … -> … KiB)`,
+or `FAIL, <reason>`: bounded storage is then refused there (-4, as a film that does not fit
+always was) instead of serving zeros or never giving space back. A stream alone could not
+tell a `SEEK_HOLE` that never reports holes from a correct one (verify-storage F3a).
+`+holeSupportReportForDirectory:passed:` runs the same test (the app's debug pre-flight).
 
 Bounded storage is **opt-in**: it only works when the consumer releases what it
 read (`setConsumedBefore:`) and, if it does not read through the HTTP server,
@@ -59,6 +72,7 @@ the sparse download and the HLS copy fill the volume together late in the film
 @property (atomic, readonly, getter=isFileComplete) BOOL fileComplete;
 @property (atomic, readonly) int64_t bytesOnDisk;    // st_blocks of the file, fresh
 @property (atomic, readonly) NSDictionary<NSString *, NSNumber *> *storageStatistics;
++ (NSString *)holeSupportReportForDirectory:(NSString *)directory passed:(BOOL *)passed; // see When it switches on
 ```
 
 Error codes (`PTTorrentStreamerErrorDomain`): -4 not enough space (legacy
@@ -289,7 +303,8 @@ on disk (`onDiskToTheEnd`): nothing more is downloaded then, and the consumer ma
 the rest of the file as final (the app's remux marks its input complete there, cuts
 its last segment, and reads zeros as data from then on).
 
-**No write ever extends the file in bounded mode.** The controller creates the file (and
+**No write ever extends the file** (bounded mode, and full mode on a volume with holes).
+The controller creates the file (and
 its directory) at its final size, as a hole (`presizeFile`: `open(O_CREAT)` + `ftruncate`),
 on the network thread as soon as the files are checked, before its first plan wants any
 piece; libtorrent then opens the existing file as is (its size is the expected one: no
@@ -320,6 +335,13 @@ found in part 3):
 `PT_BOUNDED_NO_PRESIZE=1` in the environment turns the presize off (diagnostics only: it
 brings the runaway back).
 
+Full mode does the same since the part-3 final round, on volumes with holes only (on HFS+
+or exFAT, extending a file can write its zeros at once). There the zeros cost no space (the
+file fits), but APFS still wrote them at the first tail write, up to 13 GB at ~1 GB/s with
+libtorrent's disk thread blocked behind the call (e2e imf1: 61 -> 4628 MiB allocated in 4 s),
+where the CocoaPods PopcornTorrent the tvOS app shipped created its files at their size
+(`storage_mode_allocate`). Console: `PopcornTorrent full mode: file created at … up front`.
+
 Backstop, allocation runaway (`reclaimAllocatedHoles`), should the file ever hold far more
 blocks than its data anyway: while free space is below the reserve and the file holds more
 than its data, its pieces' partial downloads, the pending holes and the in-flight
@@ -347,13 +369,32 @@ reader waits for the space to come back, as before.
 In bounded mode a `file_error_alert` with ENOSPC/EDQUOT does not end the stream:
 the controller shrinks the ahead budget by 25 % (down to 50 %), drops on-disk
 pieces farthest ahead of the reader (they are punched, then wanted again; never
-pinned, never in the window) until the reserve is back, and calls
+pinned, never in the window; only pieces confirmed on disk that libtorrent has, see below)
+until the reserve is back, and calls
 `set_upload_mode(false)` (libtorrent's reaction to ENOSPC is upload mode) once
 free ≥ reserve / 2. The same drop runs whenever free < reserve / 2, once the
 holes already queued have landed (and, while the reader does not wait, whenever
 free < reserve: see Pace). The ahead budget never exceeds the free space above the
 reserve, so dropped data is not fetched again until there is room. Any other file
 error ends the stream as before, now with code -6.
+
+**Drops take only pieces fully written** (`piecesToDrop`: `PieceOnDisk`; `releasePieces`:
+`PieceOnDisk` and `torrent.have_piece`). A piece that passed its hash check while blocks of
+it were still in libtorrent's write cache (`Verifying` here, "passed, not have" there) lost
+its download entry in `we_dont_have`; the `async_clear_piece` fence then flushed those
+blocks, and each write completion (`torrent::on_disk_write_complete` → `mark_as_finished`)
+re-created the entry with the block "finished"; the punch zeroed them. With every block
+pending, libtorrent held the piece as "finished = all, passed 0, requested 0" for good: a
+hash check only starts when a block arrives (`peer_connection::incoming_piece`) or a piece
+is added (`torrent::add_piece`), so it was never requested nor checked again, and the reader
+waited for it forever (verify-storage F1: 3 of 3 harness runs with 256 KiB pieces and a
+ballast; integrate run h1; part 2's fix-enospc). With some blocks pending, the rest was
+downloaded again and the hash failed on the punched zeros, putting the seed on parole.
+Backstop (`restoreStuckPieces`, every tick, bounded mode): a wanted piece the controller
+has as missing whose picker entry is "every block finished, none requested or being written,
+not passed, not locked" for 10 s (longer than any hash job) goes through
+`piece_picker::restore_piece` and is downloaded again; console `piece N was held as written
+but never verified: downloaded again`, statistics key `stuckPiecesRestored`.
 
 ### HTTP server (`PTGatedFileResponse`)
 
@@ -449,6 +490,17 @@ dropped peers, and peers lost while the app was suspended, come back at once.
 - No torrent is auto-managed (see Torrents in the session).
 - The loopback testing hook is no longer in the public header: it is declared in
   `Sources/Client/PTTorrentsSession+Testing.h`, which the harness imports.
+- The alerts loop drains its autorelease pool every round: it had one pool around its
+  endless loop, and every streamer an alert handler touched
+  (`streamersForTorrentHandle:` returns an autoreleased array) stayed alive for the life of
+  the process (verify-playback: 15 streams closed, 15 `PTTorrentStreamer` left).
+- A download of the CocoaPods version, in progress when the app was updated: its plist
+  (`<PersistentID>/Metadata.plist`) has no file index and its folder is not named after
+  the torrent. `resume` now starts it into its own folder (`directoryName`: the plist's
+  folder) on its own file (the stored index, else the torrent file named like the one in
+  its folder, else the largest), so libtorrent finds and checks what it had; the old plist
+  is removed once the new one is written (before: a new download from zero into another
+  folder, maybe of file #0 of a multi-file torrent, listed twice).
 
 ## Statistics and tracing
 
@@ -457,7 +509,7 @@ aheadBudget, aheadBytes, behindBytes, pinnedBytes, dataBytes, bytesOnDisk,
 freeBytes, reserveBytes, readPosition, consumedBefore, lowestAvailableOffset,
 servedOffset, headPinEnd, tailPinStart, everDownloaded, freedPieces,
 droppedPieces, punchedBytes, punchErrors, diskFullEvents, fileErrors,
-dontHaveSent, partialPiecesPunched, reclaimedBytes, presized, diskStarvedSeconds,
+dontHaveSent, partialPiecesPunched, reclaimedBytes, presized, stuckPiecesRestored, diskStarvedSeconds,
 waitingReads, downloadLimit, paceState (0 open, 1 proportional, 2 floor, 3 trickle,
 4 emergency), consumeRate`.
 
@@ -496,6 +548,7 @@ SessionHarness zombie <work>      # cancelled streams stop downloading; replay; 
 SessionHarness starve <work>      # 3 cancelled streams then a 4th; 3 active downloads then a stream; pause/resume
 SessionHarness guest <work>       # a stream joins a download's torrent (5 scenarios)
 SessionHarness background <work>  # the tvOS network reopen during a stream
+SessionHarness legacy <work>      # a CocoaPods-era download (Metadata.plist, no file index) resumed
 ```
 
 Offline end-to-end harness (`Tools/BoundedStorageHarness`): generates a file of
@@ -614,6 +667,26 @@ then the app's disk-full flow (caches wiped, one retry refused at metadata with 
 | bounded + ballast keeping the volume full for 30 s | 19/21: 149 ENOSPC handled, one 28.1 s stall while the volume was full, same hash, no failure (the stream was ready); the 2 probe-peer checks fail, as before |
 | builds macOS, tvOS, tvOS Simulator, iOS | 0 errors (the 2 existing iOS deprecation warnings) |
 
+### Results (Mac, 2026-11-11, part 3 final round: drop guard, hole self-test, full-mode presize)
+
+Harness and app runs on d7d04e85, all offline (localhost-only sandbox, private torrents, APFS
+sparse images):
+
+| Run | Result |
+|---|---|
+| unit tests (`PopcornTorrentLogicTests`) | 37/37 (1 new: pieces being verified are never dropped) |
+| bounded + 900 MiB ballast, budget 2 GiB, **256 KiB pieces** (verify-storage's F1 repro, `PT_BOUNDED_DEBUG=1`) | 3 runs: 21/21 each, 0 stall, 0 `stuckPiecesRestored` (before the fix: 3 of 3 failed, a 120 s wait on a dropped piece) |
+| forced ENOSPC with 256 KiB pieces | 21/21 (before: 12/15, a 132 s stuck piece then a 120 s stall) |
+| bounded, 6 GiB, 3 GiB image, budget 2 GiB, 60 s pause | 21/21 |
+| full, 6 GiB, 8 GiB image | 14/14 (the file is created at its size up front) |
+| bounded, 2 forward seeks | 23/23 |
+| bounded + 900 MiB ballast, automatic budget | 21/21 |
+| bounded + 900 MiB ballast, budget 2 GiB | 2 runs: 21/21 both (19/21 in every earlier run: the 2 probe-peer checks now pass) |
+| forced ENOSPC (900 MiB ballast held 30 s) | 3 runs: whole file read with the right hash in all 3; 21/21 once, 19/21 twice (the 2 probe-peer checks) |
+| SessionHarness zombie / starve / guest / background / legacy | 8/8, 8/8, 16/16, 5/5, 6/6 (legacy is new: a CocoaPods-era download resumes in its folder, on file #1 of 2, the seed sends 24 of 48 MiB, one plist left) |
+| hole self-test | PASS on the Mac (APFS sparse image) and in the tvOS 26.5 simulator's sandbox |
+| app, Mac, full mode (10 GiB image, a 4.5 GiB film) | `full mode: file created at … up front`; no allocation jump > 200 MiB in 4 s (before: 61 → 4628 MiB in 4 s at the first tail write); the same player events as before |
+
 ## Limits and open points
 
 - tvOS on device is untested: `F_PUNCHHOLE` and `SEEK_HOLE` in the app sandbox,
@@ -644,19 +717,19 @@ then the app's disk-full flow (caches wiped, one retry refused at metadata with 
   hash failure, no pre-existing file offline), and a pause long enough for the
   floor band to fill (the over-budget drop is unit-tested; the harness pause is
   60 s).
-- Full mode does not size the file up front (unchanged on purpose): its first tail write can
-  still make APFS write zeros up to the tail (a 13 GB film: about 13 GB written at ~1 GB/s,
-  libtorrent's disk thread blocked meanwhile). The file fits by definition, so no space is lost,
-  but the start is slower and the flash is written twice. Sizing the file in full mode too is a
-  one-line change in `presizeFile` (not done: full mode stays as it was).
+- Full mode now sizes the file up front too (volumes with holes). A full-mode stream restarted
+  on a file a previous stream kept, without resume data, makes libtorrent hash every piece of
+  it (holes read as zeros): what the CocoaPods version's allocate mode did as well.
 - The APFS behaviour was measured on macOS 27.2 (and the tvOS 26.5 simulator, which writes
   through the host's kernel). tvOS on device is expected to behave the same, untested; the
   presize does not depend on it.
-- With a ballast keeping the volume below the reserve (budget 2 GiB), 1 harness run in 4
-  waited 120 s for a piece at 4.0 GiB that was never fetched again after the drops (0 in the
-  2 runs of the previous commit: too few to tell; the code paths of part 3 are not involved:
-  no starvation, no reclaim in that run). Same family as the late piece and the seeds dropped
-  by a "finished" torrent above.
+- The 120 s waits for a piece "never fetched again after the drops" (part 2 fix-enospc,
+  part 3 runs s2-ballast2 and h1) were the dropped-while-verifying piece above (fixed in the
+  part-3 final round). The 2 probe-peer checks (a raw BitTorrent peer gets no block of a kept
+  tail piece, and no explicit reject for a freed one: it gets no data either, and the piece
+  is withdrawn by lt_donthave) still fail in 2 of 3 forced-ENOSPC runs; they now pass in the
+  ballast run with a 2 GiB budget (2 of 2), where they failed in every earlier run. Not
+  investigated: no player uses that path.
 - The time-critical (deadline) path of libtorrent misbehaved with one very fast
   local seed (a window starved, cancels left requests outstanding until the
   request timeout); bounded mode avoids it, full mode keeps it as before.
