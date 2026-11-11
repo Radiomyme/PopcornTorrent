@@ -5,6 +5,9 @@
 #import <string>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <fcntl.h>
+#import <sys/mount.h>
+#import <vector>
 #import <mutex>
 #import <libtorrent/bencode.hpp>
 #import "../Security/CocoaSecurity.h"
@@ -456,9 +459,95 @@ using namespace libtorrent;
     return availableSpace ? availableSpace.longLongValue : LLONG_MAX;
 }
 
-/// Bounded storage gives space back by punching holes in the file (APFS).
+/// Bounded storage gives space back by punching holes in the file (APFS), and tells written
+/// blocks from unwritten ones with SEEK_HOLE: both are checked on a scratch file once per volume
+/// and process (`holeSupportReportForDirectory:passed:`, logged). Where they misbehave, bounded
+/// storage would serve zeros or never give space back: the stream is refused instead, as a film
+/// that does not fit always was (verify-storage F3a: a stream alone cannot tell).
 - (BOOL)volumeSupportsHolesAtPath:(NSString *)path {
-    return pathconf(path.fileSystemRepresentation, _PC_MIN_HOLE_SIZE) > 0;
+    if (pathconf(path.fileSystemRepresentation, _PC_MIN_HOLE_SIZE) <= 0) return NO;
+    struct ::statfs volume;
+    if (::statfs(path.fileSystemRepresentation, &volume) != 0) return NO;
+    NSString *key = [NSString stringWithFormat:@"%d:%d", volume.f_fsid.val[0], volume.f_fsid.val[1]];
+    static NSMutableDictionary<NSString *, NSNumber *> *checked;
+    static std::mutex checkedLock;
+    {
+        std::lock_guard<std::mutex> lock(checkedLock);
+        if (!checked) checked = [NSMutableDictionary dictionary];
+        NSNumber *known = checked[key];
+        if (known) return known.boolValue;
+    }
+    BOOL passed = NO;
+    NSString *report = [PTTorrentStreamer holeSupportReportForDirectory:path passed:&passed];
+    NSLog(@"PopcornTorrent: %@", report);
+    std::lock_guard<std::mutex> lock(checkedLock);
+    checked[key] = @(passed);
+    return passed;
+}
+
++ (NSString *)holeSupportReportForDirectory:(NSString *)directory passed:(BOOL *)passed {
+    if (passed) *passed = NO;
+    [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+    char const *dir = directory.fileSystemRepresentation;
+    long const minHole = pathconf(dir, _PC_MIN_HOLE_SIZE);
+    struct ::statfs volume = {};
+    bool const haveVolume = ::statfs(dir, &volume) == 0;
+    NSString *where = [NSString stringWithFormat:@"hole self-test in %@ (%s, _PC_MIN_HOLE_SIZE %ld, block %u, free %.1f MiB)",
+                       directory, haveVolume ? volume.f_fstypename : "?", minHole, haveVolume ? volume.f_bsize : 0,
+                       haveVolume ? double(volume.f_bavail) * double(volume.f_bsize) / 1048576.0 : -1.0];
+    if (minHole <= 0) return [where stringByAppendingString:@": FAIL, no holes on this volume"];
+
+    constexpr off_t kMiBytes = 1 << 20;
+    NSString *file = [directory stringByAppendingPathComponent:[NSString stringWithFormat:@".pt-hole-selftest-%d-%u", getpid(), arc4random()]];
+    int const fd = open(file.fileSystemRepresentation, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return [where stringByAppendingFormat:@": FAIL, cannot create a file (errno %d)", errno];
+    NSString *failure = nil;
+    off_t hole = -2, dataAfterHole = -2, dataAfterPunch = -2;
+    long long blocksWritten = -1, blocksPunched = -1;
+    struct ::stat info;
+    std::vector<uint8_t> buffer(size_t(kMiBytes), 0xA5);
+    if (ftruncate(fd, 2 * kMiBytes) != 0) {
+        failure = [NSString stringWithFormat:@"ftruncate (errno %d)", errno];
+    } else if (pwrite(fd, buffer.data(), buffer.size(), 0) != ssize_t(buffer.size())) {
+        failure = [NSString stringWithFormat:@"write (errno %d)", errno];
+    } else {
+        // What the stream controller does after libtorrent writes a piece: no fsync.
+        hole = lseek(fd, 0, SEEK_HOLE);
+        dataAfterHole = lseek(fd, kMiBytes, SEEK_DATA);
+        int const dataError = dataAfterHole < 0 ? errno : 0;
+        if (::fstat(fd, &info) == 0) blocksWritten = (long long)info.st_blocks * 512;
+        if (hole != kMiBytes) {
+            failure = [NSString stringWithFormat:@"SEEK_HOLE found %lld, not the hole at 1 MiB", (long long)hole];
+        } else if (!(dataAfterHole < 0 && dataError == ENXIO)) {
+            failure = [NSString stringWithFormat:@"SEEK_DATA after the data found %lld (errno %d), not ENXIO", (long long)dataAfterHole, dataError];
+        } else {
+            fpunchhole_t punch = {0, 0, 0, kMiBytes / 2};
+            if (fcntl(fd, F_PUNCHHOLE, &punch) != 0) {
+                failure = [NSString stringWithFormat:@"F_PUNCHHOLE (errno %d)", errno];
+            } else {
+                dataAfterPunch = lseek(fd, 0, SEEK_DATA);
+                if (::fstat(fd, &info) == 0) blocksPunched = (long long)info.st_blocks * 512;
+                std::vector<uint8_t> back(size_t(kMiBytes), 0xFF);
+                ssize_t const count = pread(fd, back.data(), back.size(), 0);
+                bool zeros = count == ssize_t(back.size());
+                for (size_t i = 0; zeros && i < size_t(kMiBytes / 2); ++i) zeros = back[i] == 0;
+                bool kept = count == ssize_t(back.size());
+                for (size_t i = size_t(kMiBytes / 2); kept && i < back.size(); ++i) kept = back[i] == 0xA5;
+                if (!zeros || !kept) {
+                    failure = [NSString stringWithFormat:@"the punched range does not read as zeros (%d) or the rest changed (%d)", int(zeros), int(kept)];
+                } else if (dataAfterPunch != kMiBytes / 2) {
+                    failure = [NSString stringWithFormat:@"SEEK_DATA after the punch found %lld, not 512 KiB", (long long)dataAfterPunch];
+                }
+            }
+        }
+    }
+    close(fd);
+    unlink(file.fileSystemRepresentation);
+    NSString *figures = [NSString stringWithFormat:@"SEEK_HOLE %lld, SEEK_DATA %lld after the punch, allocated %lld -> %lld KiB",
+                         (long long)hole, (long long)dataAfterPunch, blocksWritten / 1024, blocksPunched / 1024];
+    if (failure) return [where stringByAppendingFormat:@": FAIL, %@ (%@); bounded storage disabled there", failure, figures];
+    if (passed) *passed = YES;
+    return [where stringByAppendingFormat:@": PASS (%@)", figures];
 }
 
 #pragma mark - Alerts
@@ -1038,6 +1127,7 @@ using namespace libtorrent;
         @"partialPiecesPunched": @(s.partialPunched),
         @"reclaimedBytes": @(s.reclaimedBytes),
         @"presized": @(s.presized),
+        @"stuckPiecesRestored": @(s.stuckPiecesRestored),
         @"diskStarvedSeconds": @(s.diskStarvedSeconds),
         @"waitingReads": @(s.waiters),
         @"downloadLimit": @(s.downloadLimit),

@@ -216,7 +216,8 @@ int64_t contiguousAvailableStart(FileGeometry const& geometry, std::vector<uint8
 PlanOutput planWindow(PlanInput const& input);
 
 /// Pieces with data to drop when the disk is full: farthest from the reader
-/// first, never pinned, never inside the deadline window. None once every piece
+/// first, never pinned, never inside the deadline window, only pieces confirmed
+/// on disk (PieceOnDisk: a piece being verified may still have blocks to write). None once every piece
 /// from the read piece to the end of the file is on disk: nothing more is downloaded
 /// then, and the consumer may take the rest of the file as final (the app's remux
 /// marks its input complete and reads zeros as data from then on).

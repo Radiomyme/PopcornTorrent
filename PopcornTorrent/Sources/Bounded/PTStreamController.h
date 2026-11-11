@@ -95,7 +95,9 @@ struct StreamStatistics {
     int64_t dontHaveSent = 0;
     int64_t partialPunched = 0;
     int64_t reclaimedBytes = 0;     // allocation runaway: blocks punched out of regions with no data
-    bool presized = false;          // bounded: the file was created at its final size (a hole)
+    bool presized = false;          // the file was created at its final size (a hole) before any write
+    int64_t stuckPiecesRestored = 0; // bounded: pieces libtorrent held as written but never verified,
+                                     // handed back to its picker (restoreStuckPieces)
     double diskStarvedSeconds = 0;  // bounded: how long the volume has been too full to download (0 = not)
     int64_t waiters = 0;
     int downloadLimit = 0;
@@ -197,6 +199,7 @@ private:
     /// Bounded: creates the file at its final size, as a hole, before libtorrent writes any of
     /// it, so that no write ever extends the file (network thread; see the .mm for why).
     void presizeFile();
+    void restoreStuckPieces(libtorrent::torrent& torrent);
     std::vector<uint8_t> snapshotStates() const;
     bool isPinnedOffset(int64_t offset) const;
     void sweepWaiters(PlanOutput const& plan);
@@ -253,7 +256,7 @@ private:
     std::atomic<int64_t> m_aheadBudget{0}, m_lastFreeBytes{0};
     std::atomic<int64_t> m_freedPieces{0}, m_droppedPieces{0}, m_punchedBytes{0}, m_punchErrors{0};
     std::atomic<int64_t> m_diskFullEvents{0}, m_fileErrors{0}, m_dontHaveSent{0}, m_partialPunched{0};
-    std::atomic<int64_t> m_reclaimedBytes{0};
+    std::atomic<int64_t> m_reclaimedBytes{0}, m_stuckRestored{0};
     std::atomic<bool> m_presized{false};
     std::atomic<int64_t> m_starvedSinceNanos{0}; // steady clock, 0 = not starved
     double m_lastReclaimTime = 0; // network thread
@@ -280,6 +283,7 @@ private:
     std::vector<uint8_t> m_lastPlanPriorities;
     int32_t m_capSentinel = -1;
     std::set<int32_t> m_partialPunchedPieces;
+    std::map<int32_t, int64_t> m_stuckSince; // restoreStuckPieces: piece -> steady nanos first seen stuck
 
     // HTTP readers waiting for a piece (guarded by m_mutex).
     struct Waiter {

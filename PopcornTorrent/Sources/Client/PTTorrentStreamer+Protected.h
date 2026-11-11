@@ -56,6 +56,13 @@ using namespace libtorrent;
 
 - (void)startWebServerAndPlay;
 - (std::shared_ptr<ptbounded::StreamController>)controller;
+/// Starts into `<download directory>/<directoryName>` (nil: a folder named after the torrent).
+/// The file to stream is chosen by `selectionBlock`, set before.
+- (void)startStreamingFromFileOrMagnetLink:(nonnull NSString *)filePathOrMagnetLink
+                             directoryName:(nullable NSString *)directoryName
+                                  progress:(nullable PTTorrentStreamerProgress)progress
+                               readyToPlay:(nullable PTTorrentStreamerReadyToPlay)readyToPlay
+                                   failure:(nullable PTTorrentStreamerFailure)failure;
 
 @end
 

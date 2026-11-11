@@ -349,6 +349,7 @@ StreamStatistics StreamController::statistics() const {
     s.partialPunched = m_partialPunched.load();
     s.reclaimedBytes = m_reclaimedBytes.load();
     s.presized = m_presized.load() && !presizeDisabled();
+    s.stuckPiecesRestored = m_stuckRestored.load();
     s.diskStarvedSeconds = diskStarvedSeconds();
     s.downloadLimit = m_downloadLimit.load();
     s.paceState = m_paceState.load();
@@ -686,7 +687,7 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     std::vector<uint8_t> states = snapshotStates();
 
     bool const bounded = m_bounded.load();
-    if (bounded && !checking && !m_presized.load()) presizeFile();
+    if (!checking && !m_presized.load()) presizeFile();
     PlanInput input;
     input.geometry = m_config.geometry;
     input.bounded = bounded;
@@ -831,6 +832,7 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
         releasePieces(torrent, drop, PieceDropping);
         if (!drop.empty()) m_droppedPieces.fetch_add(int64_t(drop.size()));
     }
+    if (fromTick) restoreStuckPieces(torrent);
     if (torrent.upload_mode() && free >= m_config.reserveBytes / 2) {
         torrent.set_upload_mode(false); // libtorrent's own reaction to ENOSPC
         m_diskFullPending.store(false);
@@ -911,12 +913,20 @@ void StreamController::releasePieces(lt::torrent& torrent, std::vector<int32_t> 
     for (int32_t piece : pieces) {
         std::atomic<uint8_t>& state = slot(piece);
         uint8_t previous = state.load();
-        // Freed: only pieces confirmed on disk (nothing of theirs left in the cache to write).
-        bool const releasable = newState == PieceFreed ? previous == PieceOnDisk : pieceHasData(previous);
+        lt::piece_index_t const index(piece);
+        // Only pieces confirmed on disk (nothing of theirs left in the cache to write).
+        // Dropped ones must also be libtorrent's "have" pieces: a piece that passed its hash
+        // check with blocks still in the write cache (Verifying) loses its download entry in
+        // we_dont_have below, each of those writes then re-creates it with the block
+        // "finished" (torrent::on_disk_write_complete -> mark_as_finished), and the punch
+        // zeroes them. With every block pending, the piece stayed "finished, not passed" for
+        // good: never requested again, never hashed again, the reader waited forever
+        // (verify-storage F1, 3 of 3 runs with 256 KiB pieces; part-3 run h1).
+        bool const releasable = previous == PieceOnDisk
+            && (newState == PieceFreed || torrent.have_piece(index));
         if (!releasable || !state.compare_exchange_strong(previous, newState)) continue;
         released.push_back(piece);
 
-        lt::piece_index_t const index(piece);
         // 1. never pick it again (Dropping: until the hole is punched).
         torrent.set_piece_priority(index, lt::dont_download);
         if (m_appliedPriorities.size() == size_t(m_count)) m_appliedPriorities[size_t(piece - m_first)] = 0;
@@ -1000,6 +1010,47 @@ void StreamController::punchPartialPieces(lt::torrent& torrent) {
     }
 }
 
+void StreamController::restoreStuckPieces(lt::torrent& torrent) {
+    // Backstop of the drop guard (releasePieces): a wanted piece libtorrent holds as written
+    // ("finished" blocks, nothing requested or being written) but never verified. Hash checks
+    // only start when a block arrives (peer_connection::incoming_piece) or a piece is added
+    // (torrent::add_piece), so nothing ever fetches it again; restore_piece forgets its blocks
+    // and it is downloaded from scratch. A piece whose last write just completed while its hash
+    // job runs looks the same for a moment: it must stay so for kStuckPieceSeconds.
+    constexpr int64_t kStuckPieceNanos = int64_t(10) * 1000 * 1000 * 1000;
+    if (!torrent.has_picker()) {
+        m_stuckSince.clear();
+        return;
+    }
+    lt::piece_picker& picker = torrent.picker();
+    int64_t const now = int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::map<int32_t, int64_t> stuck;
+    std::vector<int32_t> restore;
+    for (auto const& downloading : picker.get_download_queue()) {
+        int32_t const piece = int32_t(static_cast<int>(downloading.index));
+        if (!inFile(piece) || stateOf(piece) != PieceMissing) continue;
+        if (downloading.passed_hash_check || downloading.locked || downloading.requested > 0 || downloading.writing > 0) continue;
+        if (int(downloading.finished) < picker.blocks_in_piece(downloading.index)) continue;
+        if (torrent.piece_priority(downloading.index) == lt::dont_download) continue; // not wanted (a gap, consumed)
+        auto const seen = m_stuckSince.find(piece);
+        int64_t const since = seen == m_stuckSince.end() ? now : seen->second;
+        stuck[piece] = since;
+        if (now - since >= kStuckPieceNanos) restore.push_back(piece);
+    }
+    m_stuckSince.swap(stuck);
+    for (int32_t piece : restore) {
+        picker.restore_piece(lt::piece_index_t(piece));
+        m_stuckSince.erase(piece);
+        m_stuckRestored.fetch_add(1);
+        NSLog(@"PopcornTorrent bounded: piece %d was held as written but never verified: downloaded again", piece);
+    }
+    if (!restore.empty()) {
+        torrent.update_gauge();
+        torrent.state_updated();
+    }
+}
+
 void StreamController::presizeFile() {
     // Root cause of the allocation runaway (e2e B1). On APFS, a write that starts beyond the
     // end of the file while the file's last appends are still dirty in the buffer cache makes
@@ -1015,7 +1066,16 @@ void StreamController::presizeFile() {
     // (a hole), once the files are checked and before the first plan wants any piece (apply()
     // calls this first, on the network thread). libtorrent opens the existing file as is (its size
     // is the expected one: no truncation, no allocation in sparse mode).
-    if (m_presized.load() || m_cancelled.load() || !m_bounded.load() || m_config.filePath.empty()) return;
+    // Full mode too (the film fits, nothing is ever deleted): there the zeros cost no space, but
+    // APFS still wrote them, up to 13 GB at ~1 GB/s with libtorrent's disk thread blocked behind
+    // the call (e2e imf1: 61 -> 4628 MiB allocated in 4 s), where the CocoaPods PopcornTorrent the
+    // tvOS app shipped created its files at their size (allocate mode). Only on a volume with
+    // holes: elsewhere (HFS+, exFAT) extending a file can write its zeros at once.
+    if (m_presized.load() || m_cancelled.load() || m_config.filePath.empty()) return;
+    if (!m_bounded.load() && !m_holesSupported) {
+        m_presized.store(true);
+        return;
+    }
     if (presizeDisabled()) {
         m_presized.store(true);
         NSLog(@"PopcornTorrent bounded: PT_BOUNDED_NO_PRESIZE set, the file is NOT sized up front");
@@ -1054,8 +1114,8 @@ void StreamController::presizeFile() {
     }
     if (ftruncate(m_fd, off_t(size)) == 0) {
         m_presized.store(true);
-        NSLog(@"PopcornTorrent bounded: file %s at %lld bytes up front (a hole; it held %lld)",
-              created ? "created" : "sized", size, int64_t(info.st_size));
+        NSLog(@"PopcornTorrent %s: file %s at %lld bytes up front (a hole; it held %lld)",
+              m_bounded.load() ? "bounded" : "full mode", created ? "created" : "sized", size, int64_t(info.st_size));
     } else {
         int const error = errno;
         if (++m_presizeFailures >= 5) m_presized.store(true);

@@ -178,12 +178,16 @@ static int PTLoopbackTestingPort = -1;
 }
 
 - (void)alertsLoop {
-    @autoreleasepool {
-        
-        std::vector<alert *> deque;
-        time_duration max_wait = milliseconds(ALERTS_LOOP_WAIT_MILLIS);
-        
-        while ([self isAlertsLoopActive]) {
+    std::vector<alert *> deque;
+    time_duration max_wait = milliseconds(ALERTS_LOOP_WAIT_MILLIS);
+
+    while ([self isAlertsLoopActive]) {
+        // One pool per round: the loop never returns, so a pool around it never drained, and
+        // every streamer an alert handler touched (streamersForTorrentHandle: returns an
+        // autoreleased array holding them) stayed alive for the life of the process
+        // (verify-playback: 15 streams closed, 15 PTTorrentStreamer and BoundedStorageSession
+        // objects left, each session with its timer).
+        @autoreleasepool {
             const alert *ptr = _session->wait_for_alert(max_wait);
             if (![self isAlertsLoopActive]) {
                 break;

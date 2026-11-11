@@ -459,6 +459,38 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertEqual(all.back(), plan.windowEndPiece);
 }
 
+- (void)testPiecesBeingVerifiedAreNeverDropped {
+    // A piece that passed its hash check with blocks still in libtorrent's write cache
+    // (Verifying) must not be dropped: libtorrent re-creates its download entry with those
+    // blocks "finished" as they are written, the punch zeroes them, and the piece is never
+    // fetched again (verify-storage F1). It goes on a later plan, once confirmed on disk.
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceOnDisk);
+    states[12] = PieceMissing;    // the window is still being downloaded
+    states[97] = PieceVerifying;  // the farthest piece ahead: just passed
+    states[96] = PieceVerifying;
+    PlanInput input;
+    input.geometry = geo;
+    input.bounded = true;
+    input.readPosition = 10 * kMiB;
+    input.pins.headEnd = 4 * kMiB;
+    input.pins.tailStart = 98 * kMiB;
+    input.deadlinePieces = 8;
+    input.states = &states;
+    PlanOutput const plan = planWindow(input);
+    std::vector<int32_t> const drop = piecesToDrop(input, plan, 3 * kMiB);
+    XCTAssertEqual(drop.size(), size_t(3));
+    XCTAssertEqual(drop[0], 95);
+    XCTAssertEqual(drop[1], 94);
+    XCTAssertEqual(drop[2], 93);
+    for (int32_t piece : piecesToDrop(input, plan, 1000 * kMiB)) {
+        XCTAssertEqual(states[size_t(piece)], PieceOnDisk);
+    }
+    // Confirmed written: it can go.
+    states[97] = PieceOnDisk;
+    XCTAssertEqual(piecesToDrop(input, plan, kMiB).front(), 97);
+}
+
 - (void)testNothingIsDroppedOnceTheRestOfTheFileIsOnDisk {
     FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
     std::vector<uint8_t> states(100, PieceFreed);

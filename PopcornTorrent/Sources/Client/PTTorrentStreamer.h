@@ -244,6 +244,11 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
  */
 @property (atomic, readonly) NSDictionary<NSString *, NSNumber *> *storageStatistics;
 
+/**
+ Checks, in `directory` (created if missing), the volume primitives bounded storage relies on: `_PC_MIN_HOLE_SIZE`, a 2 MiB file created as a hole with its first MiB written (`SEEK_HOLE` must find the hole at 1 MiB, `SEEK_DATA` the data at 0), `F_PUNCHHOLE` of its first 512 KiB (the call must succeed, the range must read as zeros and `SEEK_DATA` find the data at 512 KiB; the allocated size before and after is reported). The file is deleted. Returns one line (PASS or FAIL with the reason, the block size and the free space). `passed`: whether bounded storage can run there. A stream runs it once per volume before bounded storage is first allowed (and logs that line); the app's debug pre-flight calls it directly.
+ */
++ (NSString *)holeSupportReportForDirectory:(NSString *)directory passed:(BOOL * _Nullable)passed;
+
 @end
 
 NS_ASSUME_NONNULL_END

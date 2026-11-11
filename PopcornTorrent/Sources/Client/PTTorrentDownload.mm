@@ -131,14 +131,34 @@ using namespace libtorrent;
 
 
 - (void)startDownloadingFromFileOrMagnetLink:(NSString *)filePathOrMagnetLink selectFileTDownload:(PTTorrentStreamerSelection)callback {
+    [self startDownloadingFromFileOrMagnetLink:filePathOrMagnetLink directoryName:nil selectFileTDownload:callback];
+}
+
+/// `directoryName`: the folder of the download directory to download into (nil: named after
+/// the torrent, as for every new download).
+- (void)startDownloadingFromFileOrMagnetLink:(NSString *)filePathOrMagnetLink
+                               directoryName:(nullable NSString *)directoryName
+                         selectFileTDownload:(PTTorrentStreamerSelection)callback {
     __weak __typeof__(self) weakSelf = self;
     
     NSMutableDictionary *copy = _mediaMetadata.mutableCopy;
     copy[MPMediaItemPropertyPathOrLink] = filePathOrMagnetLink;
     _mediaMetadata = copy;
     
-    [self startStreamingFromMultiTorrentFileOrMagnetLink:filePathOrMagnetLink
-                                                progress:^(PTTorrentStatus status) {
+    self.selectionBlock = ^int(NSArray<NSString *> * _Nonnull torrentsAvailable, NSArray<NSNumber *> * _Nonnull fileSizes) {
+        int index = callback(torrentsAvailable, fileSizes);
+        
+        NSMutableDictionary *copy = weakSelf.mediaMetadata.mutableCopy;
+        copy[MPMediaItemPropertySelectedFileIndex] = @(index);
+        weakSelf.mediaMetadata = copy;
+
+        [weakSelf save];
+        
+        return index;
+    };
+    [self startStreamingFromFileOrMagnetLink:filePathOrMagnetLink
+                               directoryName:directoryName
+                                    progress:^(PTTorrentStatus status) {
         if (weakSelf.downloadStatus == PTTorrentDownloadStatusPaused) return;
         PTTorrentDownloadStatus downloadStatus = status.totalProgress < 1 ? PTTorrentDownloadStatusDownloading : PTTorrentDownloadStatusFinished;
         
@@ -158,17 +178,26 @@ using namespace libtorrent;
         if (delegate && [delegate respondsToSelector:@selector(downloadDidFail:withError:)]) {
             [delegate downloadDidFail:weakSelf withError:error];
         }
-    } selectFileToStream:^int(NSArray<NSString *> * _Nonnull torrentsAvailable, NSArray<NSNumber *> * _Nonnull fileSizes) {
-        int index = callback(torrentsAvailable, fileSizes);
-        
-        NSMutableDictionary *copy = weakSelf.mediaMetadata.mutableCopy;
-        copy[MPMediaItemPropertySelectedFileIndex] = @(index);
-        weakSelf.mediaMetadata = copy;
-
-        [weakSelf save];
-        
-        return index;
     }];
+}
+
+/// The file a download loaded from its plist was downloading, among the torrent's
+/// (`names`: file names, `sizes`): its stored index, else the file named like the one in its
+/// folder (`fileName`, a path relative to it), else the largest file.
++ (int)indexOfDownloadedFile:(nullable NSString *)fileName storedIndex:(nullable NSNumber *)storedIndex
+                       names:(NSArray<NSString *> *)names sizes:(NSArray<NSNumber *> *)sizes {
+    if (storedIndex != nil && storedIndex.intValue >= 0 && storedIndex.intValue < (int)names.count) return storedIndex.intValue;
+    NSString *wanted = fileName.lastPathComponent;
+    if (wanted.length > 0) {
+        for (NSUInteger i = 0; i < names.count; ++i) {
+            if ([names[i].lastPathComponent isEqualToString:wanted]) return (int)i;
+        }
+    }
+    int largest = 0;
+    for (NSUInteger i = 1; i < sizes.count; ++i) {
+        if (sizes[i].longLongValue > sizes[(NSUInteger)largest].longLongValue) largest = (int)i;
+    }
+    return largest;
 }
 
 
@@ -218,8 +247,16 @@ using namespace libtorrent;
         self.torrentHandle.resume();
     } else {
         /// Torrent was in the middle of downloading and app was exited. Download has been loaded from disk and is now being resumed. Fetch torrent metadata instead of just resuming.
-        [self startDownloadingFromFileOrMagnetLink:_mediaMetadata[MPMediaItemPropertyPathOrLink] selectFileTDownload:^int(NSArray<NSString *> * _Nonnull torrentsAvailable, NSArray<NSNumber *> * _Nonnull fileSizes) {
-            return [_mediaMetadata[MPMediaItemPropertySelectedFileIndex] intValue];
+        // Into the folder its file is in, on that file: a download of the CocoaPods
+        // PopcornTorrent sits in <PersistentID>/ (not in the folder named after the torrent that
+        // this fork gives new downloads) and its plist has no file index. Started elsewhere, it
+        // would download again from zero next to its partial file, maybe another file of the
+        // torrent, and be listed twice (verify-regressions 3).
+        NSString *directory = _savePath.lastPathComponent.length > 0 ? _savePath.lastPathComponent : nil;
+        NSNumber *storedIndex = _mediaMetadata[MPMediaItemPropertySelectedFileIndex];
+        NSString *fileName = _fileName;
+        [self startDownloadingFromFileOrMagnetLink:_mediaMetadata[MPMediaItemPropertyPathOrLink] directoryName:directory selectFileTDownload:^int(NSArray<NSString *> * _Nonnull torrentsAvailable, NSArray<NSNumber *> * _Nonnull fileSizes) {
+            return [PTTorrentDownload indexOfDownloadedFile:fileName storedIndex:storedIndex names:torrentsAvailable sizes:fileSizes];
         }];
         return [self setDownloadStatus:PTTorrentDownloadStatusProcessing];
     }
@@ -258,7 +295,15 @@ using namespace libtorrent;
     NSMutableDictionary *copy = _mediaMetadata.mutableCopy;
     [copy setObject:@(_downloadStatus) forKey:PTTorrentItemPropertyDownloadStatus];
     [copy setObject:@(_torrentStatus.totalProgress) forKey:PTTorrentItemPropertyTorrentProgress];
-    return [copy writeToFile:filePath atomically:YES];
+    BOOL const saved = [copy writeToFile:filePath atomically:YES];
+    // A CocoaPods PopcornTorrent download resumed here (see resume): its own plist goes once
+    // this one is written, or the download manager would load it as a second download of
+    // the same media at the next launch. This fork never writes that name.
+    NSString *legacyPlist = [_savePath stringByAppendingPathComponent:@"Metadata.plist"];
+    if (saved && ![legacyPlist isEqualToString:filePath] && [[NSFileManager defaultManager] fileExistsAtPath:legacyPlist]) {
+        [[NSFileManager defaultManager] removeItemAtPath:legacyPlist error:nil];
+    }
+    return saved;
 }
 
 - (void)playWithHandler:(PTTorrentStreamerReadyToPlay)handler {

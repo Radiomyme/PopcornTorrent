@@ -326,7 +326,9 @@ std::vector<int32_t> piecesToDrop(PlanInput const& in, PlanOutput const& plan, i
     int64_t freed = 0;
     for (int32_t piece = geo.lastPiece(); piece >= std::max(plan.windowEndPiece, first) && freed < needBytes; --piece) {
         uint8_t const state = (*in.states)[size_t(piece - first)];
-        if (!pieceHasData(state) || isPinned(geo, in.pins, piece)) continue;
+        // Only pieces confirmed written: a piece still being verified may have blocks in
+        // libtorrent's write cache (dropped on a later plan, see releasePieces).
+        if (state != PieceOnDisk || isPinned(geo, in.pins, piece)) continue;
         result.push_back(piece);
         freed += geo.pieceBytes(piece);
     }

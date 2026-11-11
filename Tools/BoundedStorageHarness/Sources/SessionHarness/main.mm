@@ -661,9 +661,103 @@ static int runBackground(NSString *work) {
     return 0;
 }
 
+#pragma mark - legacy
+
+/// A download of the CocoaPods PopcornTorrent, in progress when the app was updated to this
+/// fork: its folder is named after the media (<PersistentID>/), its Metadata.plist has no file
+/// index, its file is partial. Resumed, it must go on in that folder, on that file (not file #0
+/// of a multi-file torrent), from what it had, and leave one plist (verify-regressions 3).
+static int runLegacy(NSString *work) {
+    NSString *offline = [work stringByAppendingPathComponent:@"offline"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    Seeder seeder;
+    int const seederPort = seeder.port;
+
+    // Two files: a sample listed first, the movie (48 MiB, 256 KiB pieces).
+    NSString *seedRoot = [work stringByAppendingPathComponent:@"seed-legacy"];
+    NSString *content = [seedRoot stringByAppendingPathComponent:@"Film"];
+    [fm createDirectoryAtPath:content withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *sample = [content stringByAppendingPathComponent:@"0-sample.mkv"];
+    NSString *movie = [content stringByAppendingPathComponent:@"Film.mkv"];
+    int64_t const movieSize = 48LL << 20;
+    for (NSString *file in @[sample, movie]) {
+        int64_t const size = file == movie ? movieSize : (4LL << 20);
+        std::ofstream out(file.fileSystemRepresentation, std::ios::binary);
+        std::vector<char> buf(1 << 20);
+        for (int64_t done = 0; done < size; done += (int64_t)buf.size()) {
+            arc4random_buf(buf.data(), buf.size());
+            out.write(buf.data(), (std::streamsize)std::min<int64_t>((int64_t)buf.size(), size - done));
+        }
+    }
+    lt::file_storage fs;
+    lt::add_files(fs, content.fileSystemRepresentation);
+    lt::create_torrent ct(fs, 256 << 10);
+    ct.set_priv(true);
+    lt::set_piece_hashes(ct, seedRoot.fileSystemRepresentation);
+    std::vector<char> bytes;
+    lt::bencode(std::back_inserter(bytes), ct.generate());
+    NSString *torrent = [work stringByAppendingPathComponent:@"legacy.torrent"];
+    {
+        std::ofstream t(torrent.fileSystemRepresentation, std::ios::binary);
+        t.write(bytes.data(), (std::streamsize)bytes.size());
+    }
+    Payload p;
+    p.dir = seedRoot;
+    p.path = movie;
+    p.size = movieSize;
+    p.torrent = torrent;
+    p.ti = std::make_shared<lt::torrent_info>(std::string(torrent.fileSystemRepresentation));
+    int movieIndex = -1;
+    for (int i = 0; i < p.ti->num_files(); ++i) {
+        if (p.ti->files().file_name(lt::file_index_t(i)).to_string() == "Film.mkv") movieIndex = i;
+    }
+    logf(@"torrent: %d files, the movie is #%d", p.ti->num_files(), movieIndex);
+    lt::torrent_handle seed = seeder.seed(p, 0);
+
+    // The pod's layout: <download dir>/<PersistentID>/<torrent path>, Metadata.plist, half the movie.
+    NSString *legacyFolder = [offline stringByAppendingPathComponent:@"tt0000001"];
+    NSString *legacyMovie = [legacyFolder stringByAppendingPathComponent:@"Film/Film.mkv"];
+    [fm createDirectoryAtPath:[legacyMovie stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+    {
+        NSData *half = payloadRange(p, 0, movieSize / 2);
+        [half writeToFile:legacyMovie atomically:NO];
+    }
+    NSString *legacyPlist = [legacyFolder stringByAppendingPathComponent:@"Metadata.plist"];
+    NSDictionary *metadata = @{MPMediaItemPropertyPersistentID: @"tt0000001",
+                               @"filePathOrLink": torrent,
+                               @"downloadStatus": @(PTTorrentDownloadStatusPaused),
+                               @"progress": @(0.5f)};
+    [metadata writeToFile:legacyPlist atomically:YES];
+
+    PTTorrentDownload *d = [[PTTorrentDownload alloc] initFromPlist:legacyPlist];
+    check(d != nil && d.downloadStatus == PTTorrentDownloadStatusPaused, @"legacy plist loads", [NSString stringWithFormat:@"status %ld", (long)d.downloadStatus]);
+    d.downloadDirectoryOverride = offline;
+    [d resume];
+    spin(120, ^BOOL { nudge(d, seederPort); return d.downloadStatus == PTTorrentDownloadStatusFinished || d.downloadStatus == PTTorrentDownloadStatusFailed; });
+    spin(2, nil);
+    NSNumber *index = d.mediaMetadata[@"selectedFileIndex"];
+    NSString *finishedFile = [d.savePath stringByAppendingPathComponent:d.fileName ?: @""];
+    BOOL const sameFolder = [d.savePath isEqualToString:legacyFolder];
+    check(sameFolder, @"resumes in its own folder", [NSString stringWithFormat:@"savePath %@ (expected %@)", d.savePath, legacyFolder]);
+    check(index != nil && index.intValue == movieIndex, @"resumes on its file", [NSString stringWithFormat:@"index %@ (the movie is #%d)", index, movieIndex]);
+    BOOL const complete = d.downloadStatus == PTTorrentDownloadStatusFinished
+        && [sha256OfFile(legacyMovie) isEqualToString:sha256OfFile(movie)];
+    check(complete, @"completes the partial file", [NSString stringWithFormat:@"status %ld, %@ == source %d", (long)d.downloadStatus, finishedFile,
+                                                    [sha256OfFile(legacyMovie) isEqualToString:sha256OfFile(movie)]]);
+    long long const sent = uploaded(seed);
+    check(sent > 0 && sent < movieSize * 3 / 4, @"keeps what it had",
+          [NSString stringWithFormat:@"seeder sent %lld MiB of %lld", sent >> 20, movieSize >> 20]);
+    NSArray *folders = [fm contentsOfDirectoryAtPath:offline error:nil];
+    NSArray *plists = [[fm contentsOfDirectoryAtPath:legacyFolder error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.plist'"]];
+    check(folders.count == 1 && plists.count == 1 && ![fm fileExistsAtPath:legacyPlist], @"one folder, one plist",
+          [NSString stringWithFormat:@"folders %@, plists %@", folders, plists]);
+    [d stop];
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background <workdir>\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy <workdir>\n"); return 2; }
         NSString *mode = [NSString stringWithUTF8String:argv[1]];
         NSString *work = [NSString stringWithUTF8String:argv[2]];
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
@@ -674,6 +768,7 @@ int main(int argc, const char *argv[]) {
         else if ([mode isEqualToString:@"starve"]) rc = runStarve(work);
         else if ([mode isEqualToString:@"guest"]) rc = runGuest(work);
         else if ([mode isEqualToString:@"background"]) rc = runBackground(work);
+        else if ([mode isEqualToString:@"legacy"]) rc = runLegacy(work);
         logf(@"RESULT %@: %d passed, %d failed (rc %d)", mode, gPasses, gFailures, rc);
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
         return gFailures > 0 ? 1 : rc;
