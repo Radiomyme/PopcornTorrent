@@ -12,6 +12,8 @@
 //     pauses, and probes the server and the BitTorrent side (a raw peer that
 //     requests freed pieces);
 //  4. cancels and checks the space is given back.
+//  Optionally the consumer seeks forward (--seek-at/--seek-to/--seeks), like a
+//  player handing off far ahead: the skipped data is never downloaded.
 //  The streamer writes into <volume>/tmp/Downloads (downloadDirectoryOverride);
 //  run_harness.sh mounts a fresh APFS sparse image there.
 //
@@ -21,6 +23,7 @@
 
 #import "PTTorrentStreamer.h"
 #import "PTTorrentsSession.h"
+#import "PTTorrentsSession+Testing.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -109,6 +112,10 @@ struct Options {
     int64_t ballast = 0;            // bytes written on the volume between 35 % and 55 % (stress)
     double ballastHold = 0;         // > 0: the ballast is removed after this many seconds instead
     bool ballastGreedy = false;     // the ballast takes every byte freed while it is held (forces ENOSPC)
+    double seekAt = 0;              // forward seek when the consumer reaches this fraction (0 = none)
+    double seekTo = 0;              // its target fraction; each further seek jumps as far again
+    int seeks = 1;                  // number of forward seeks
+    double seedRate = 0;            // seeder upload limit, bytes/s (0 = none): pieces stay in flight longer
 };
 
 static Options parseOptions(int argc, const char *argv[]) {
@@ -128,6 +135,10 @@ static Options parseOptions(int argc, const char *argv[]) {
         else if (key == "--ballast-mib") o.ballast = std::stoll(value) * MiB;
         else if (key == "--ballast-hold-seconds") o.ballastHold = std::stod(value);
         else if (key == "--ballast-greedy") o.ballastGreedy = value == "1";
+        else if (key == "--seek-at") o.seekAt = std::stod(value);
+        else if (key == "--seek-to") o.seekTo = std::stod(value);
+        else if (key == "--seeks") o.seeks = std::stoi(value);
+        else if (key == "--seed-rate-mbs") o.seedRate = std::stod(value) * 1e6;
     }
     return o;
 }
@@ -528,6 +539,7 @@ static int runTest(Options o) {
     seed.flags &= ~lt::torrent_flags::auto_managed;
     seed.flags &= ~lt::torrent_flags::paused;
     lt::torrent_handle seedHandle = seeder.add_torrent(seed);
+    if (o.seedRate > 0) seedHandle.set_upload_limit(int(o.seedRate)); // a torrent limit also applies on loopback
     // A full check (not seed_mode): every piece is verified before the stream starts.
     Clock::time_point const checkStart = Clock::now();
     while (!seedHandle.status().is_seeding && since(checkStart) < 300) std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -538,6 +550,9 @@ static int runTest(Options o) {
     [PTTorrentsSession prepareSharedSessionForLoopbackTestingOnPort:0];
     PTTorrentsSession *session = [PTTorrentsSession sharedSession];
     PTTorrentStreamer *streamer = [[PTTorrentStreamer alloc] init];
+    // Opt-in (this consumer releases what it read). Full mode: the file fits, so it must
+    // stay unbounded even when allowed.
+    streamer.allowsBoundedStorage = YES;
     streamer.storageBudget = o.budget;
     streamer.downloadDirectoryOverride = downloads; // the volume under test
     static std::atomic<bool> ready{false};
@@ -623,9 +638,15 @@ static int runTest(Options o) {
     bool const opened = http.open(gServerPort, 0, -1, int(1 * MiB), 120);
     check(opened && (http.status == 206 || http.status == 200), "main request", "status %d, content-length %lld", http.status, http.contentLength);
     std::vector<uint8_t> chunk(static_cast<size_t>(MiB)), expected(static_cast<size_t>(MiB));
-    CC_SHA256_CTX ctx;
+    CC_SHA256_CTX ctx, expectedCtx; // what was read, and the source over the same ranges
     CC_SHA256_Init(&ctx);
+    CC_SHA256_Init(&expectedCtx);
     int64_t offset = 0;
+    int seeksDone = 0;
+    int64_t skippedBytes = 0;
+    std::vector<double> seekTimes;
+    int64_t gapStart = -1, gapEnd = -1; // the last range skipped by a seek
+    RangeResult gapRead;
     int64_t mismatches = 0, zeroChunks = 0;
     double stall = 0, pausedTime = 0;
     bool paused = false, checksDone = false, probeDone = false, ballastWritten = false, ballastRemoved = false;
@@ -641,6 +662,38 @@ static int runTest(Options o) {
     int64_t freedOffset = -1;
 
     while (opened && offset < size) {
+        // Forward seek: a new request further on (a player seeking, a hand-off far ahead).
+        if (o.seekAt > 0 && seeksDone < o.seeks
+            && offset >= int64_t(double(size) * (o.seekAt + seeksDone * 2 * (o.seekTo - o.seekAt)))) {
+            int64_t const target = std::min<int64_t>(size - 64 * MiB,
+                int64_t(double(size) * (o.seekTo + seeksDone * 2 * (o.seekTo - o.seekAt))) / MiB * MiB);
+            NSDictionary *before = streamer.storageStatistics;
+            logLine("seek %d: %lld -> %lld (on disk %lld MiB, data %lld MiB, limit %d, pace %d, consume rate %.0f)", seeksDone + 1,
+                    offset, target, streamer.bytesOnDisk / MiB, [before[@"dataBytes"] longLongValue] / MiB,
+                    [before[@"downloadLimit"] intValue], [before[@"paceState"] intValue], [before[@"consumeRate"] doubleValue]);
+            http.close();
+            streamer.readPosition = target;
+            bool const reopened = http.open(gServerPort, target, -1, int(1 * MiB), 120);
+            if (!reopened) { logLine("seek: reopen failed"); break; }
+            gapStart = [streamer firstMissingOffsetFrom:offset];
+            gapEnd = target;
+            skippedBytes += target - offset;
+            offset = target;
+            consumerOffset = offset;
+            streamer.consumedBefore = std::max<int64_t>(0, offset - o.keepBehind);
+            seekTimes.push_back(since(startTime));
+            ++seeksDone;
+        }
+        // Data skipped by the seek and consumed since: never downloaded, it fails at once.
+        if (gapRead.status == 0 && gapEnd > gapStart && gapStart >= 0 && since(startTime) > seekTimes.back() + 5) {
+            int64_t const probe = (gapStart + gapEnd) / 2 / ti->piece_length() * ti->piece_length() + 4096;
+            if (probe + ti->piece_length() < streamer.consumedBefore && ![streamer isRangeAvailable:probe length:1]) {
+                gapRead = fetchRange(sourceFd, probe, 64 * 1024, 10);
+                check(gapRead.status == 410 && gapRead.seconds < 0.5, "skipped and consumed range fails fast",
+                      "offset %lld (gap %lld..%lld): status %d in %.3f s", probe, gapStart, gapEnd, gapRead.status, gapRead.seconds);
+            }
+        }
+
         // Pause: the consumer stops; disk use must stay flat.
         if (!paused && offset >= int64_t(double(size) * o.pauseAt) && o.pauseSeconds > 0) {
             paused = true;
@@ -837,6 +890,7 @@ static int runTest(Options o) {
             break;
         }
         pread(sourceFd, expected.data(), size_t(want), offset);
+        CC_SHA256_Update(&expectedCtx, expected.data(), CC_LONG(want));
         if (memcmp(chunk.data(), expected.data(), size_t(want)) != 0) {
             ++mismatches;
             bool zero = true;
@@ -865,20 +919,31 @@ static int runTest(Options o) {
     if (concurrent.joinable()) concurrent.join();
     double const consumeSeconds = since(consumeStart);
 
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH], expectedDigest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256_Final(digest, &ctx);
-    char hex[65];
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+    CC_SHA256_Final(expectedDigest, &expectedCtx);
+    char hex[65], expectedHex[65];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) {
+        snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+        snprintf(expectedHex + 2 * i, 3, "%02x", expectedDigest[i]);
+    }
     NSDictionary *endStats = streamer.storageStatistics;
     logLine("end: %s", [[endStats description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String);
 
-    check(offset == size, "whole file read", "%lld of %lld bytes in %.1f s (%.1f s paused, %.1f s stalled)", offset, size, consumeSeconds, pausedTime, stall);
-    check(sourceSha == hex, "content hash", "sha256 read %s, source %s", hex, sourceSha.c_str());
+    check(offset == size, "whole file read", "%lld of %lld bytes in %.1f s (%.1f s paused, %.1f s stalled, %lld bytes skipped by %d seeks)",
+          offset, size, consumeSeconds, pausedTime, stall, skippedBytes, seeksDone);
+    if (seeksDone == 0) {
+        check(sourceSha == hex, "content hash", "sha256 read %s, source %s", hex, sourceSha.c_str());
+    } else {
+        check(std::string(expectedHex) == hex, "content hash of the ranges read", "sha256 read %s, source over the same ranges %s", hex, expectedHex);
+        check(gapRead.status != 0, "skipped range probed", "status %d", gapRead.status);
+    }
     check(mismatches == 0 && zeroChunks == 0, "no wrong bytes", "%lld mismatching MiB, %lld all-zero MiB", mismatches, zeroChunks);
-    // With a ballast that fills the volume, ENOSPC is expected: it must not end the stream.
+    // With a ballast that fills the volume, ENOSPC is expected: it must not end the stream,
+    // and no other file error may happen.
     int const fileErrors = [endStats[@"fileErrors"] intValue];
     int const diskFullEvents = [endStats[@"diskFullEvents"] intValue];
-    check(!failed && (o.ballastHold > 0 ? fileErrors == diskFullEvents : fileErrors == 0), "no file error",
+    check(!failed && (o.ballast > 0 ? fileErrors == diskFullEvents : fileErrors == 0), "no file error",
           "fileErrors %d, diskFull %d, failure block %d", fileErrors, diskFullEvents, int(failed.load()));
     check(concurrentBad == 0 && concurrentOk > 0, "concurrent requests", "%d ok, %d bad", concurrentOk.load(), concurrentBad.load());
 
@@ -898,7 +963,9 @@ static int runTest(Options o) {
         paceHistogram[s.pace]++;
         bool const inBallast = o.ballast > 0 && s.consumer >= int64_t(double(size) * 0.33) && s.consumer <= int64_t(double(size) * 0.57);
         if (!inBallast) minFreeOutsideBallast = std::min(minFreeOutsideBallast, s.free);
-        if (s.consumer >= size / 4 && s.consumer <= plateauEnd && !inBallast) plateau.push_back(s);
+        // After a seek the old window is freed and the new one fills: not a plateau.
+        bool const afterSeek = std::any_of(seekTimes.begin(), seekTimes.end(), [&](double t) { return s.t >= t && s.t < t + 15; });
+        if (s.consumer >= size / 4 && s.consumer <= plateauEnd && !inBallast && !afterSeek) plateau.push_back(s);
         if (pauseStartT >= 0 && s.t >= pauseStartT && s.t <= pauseEndT) pause.push_back(s);
     }
     auto mean = [](std::vector<Sample>::const_iterator b, std::vector<Sample>::const_iterator e) {
@@ -927,8 +994,16 @@ static int runTest(Options o) {
               "disk use flat once the window is full", "%lld..%lld MiB while %lld MiB went through, mean %.0f then %.0f MiB",
               plateauMin / MiB, plateauMax / MiB, (plateauEnd - size / 4) / MiB, firstHalf / MiB, secondHalf / MiB);
         if (!pause.empty()) {
+            std::string curve;
+            for (size_t i = 0; i < pause.size(); i += 8) {
+                curve += std::to_string(int(pause[i].t - pause.front().t)) + "s:" + std::to_string(pause[i].onDisk / MiB) + "MiB/p"
+                    + std::to_string(pause[i].pace) + " ";
+            }
+            logLine("pause samples (time: on disk / pace state): %s", curve.c_str());
+            // Flat once settled: the window full (floor) and the last consumed batch freed,
+            // whose share of the budget the window may take first (a few seconds).
             size_t full = 0;
-            while (full < pause.size() && pause[full].pace < 2) ++full;
+            while (full < pause.size() && (pause[full].pace < 2 || pause[full].t < pause.front().t + 10)) ++full;
             if (full == pause.size()) full = pause.size() - 1;
             double const flatSeconds = pause.back().t - pause[full].t;
             int64_t const growth = pause.back().onDisk - pause[full].onDisk;
@@ -941,6 +1016,32 @@ static int runTest(Options o) {
               "%d pieces freed, %lld bytes punched, %d punch errors, %d lt_donthave sent",
               [endStats[@"freedPieces"] intValue], [endStats[@"punchedBytes"] longLongValue], [endStats[@"punchErrors"] intValue],
               [endStats[@"dontHaveSent"] intValue]);
+        // Nothing stays allocated below the lowest available offset apart from the head
+        // pin: freed pieces and partial pieces a seek left behind are punched.
+        std::this_thread::sleep_for(std::chrono::seconds(3)); // the last batch
+        NSString *filePath = [streamer.savePath stringByAppendingPathComponent:streamer.fileName];
+        NSDictionary *stats = streamer.storageStatistics;
+        int64_t const lowest = streamer.lowestAvailableOffset;
+        int64_t const piece = ti->piece_length();
+        int64_t const headPinPieceEnd = ([stats[@"headPinEnd"] longLongValue] + piece - 1) / piece * piece;
+        int64_t allocatedBelow = 0, extents = 0;
+        int fd = open(filePath.fileSystemRepresentation, O_RDONLY);
+        if (fd >= 0) {
+            off_t position = off_t(headPinPieceEnd);
+            while (position < lowest) {
+                off_t const data = lseek(fd, position, SEEK_DATA);
+                if (data < 0 || data >= lowest) break;
+                off_t const hole = lseek(fd, data, SEEK_HOLE);
+                if (hole < 0) break;
+                allocatedBelow += std::min<int64_t>(hole, lowest) - data;
+                ++extents;
+                position = hole;
+            }
+            close(fd);
+        }
+        check(fd >= 0 && allocatedBelow <= piece, "nothing kept below the lowest available offset",
+              "%lld KiB allocated in %lld extents between the head pin and %lld; %d partial pieces punched",
+              allocatedBelow / 1024, extents, lowest, [stats[@"partialPiecesPunched"] intValue]);
     } else {
         check(streamer.bytesOnDisk >= size, "full mode keeps the whole file", "on disk %lld of %lld", streamer.bytesOnDisk, size);
         check([endStats[@"freedPieces"] intValue] == 0, "full mode frees nothing", "%d freed", [endStats[@"freedPieces"] intValue]);
