@@ -13,7 +13,13 @@ At metadata time (`metadataReceivedAlert`), `planBudget` (`Sources/Bounded/PTBou
 | selected file (minus what is already allocated on disk) + `storageReserve` ≤ free space | **Full**: legacy behaviour, the whole file is downloaded and kept |
 | otherwise, free space ≥ minimum working set | **Bounded** |
 | otherwise | **Refused**: error `PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage` (-5), localized message with the space to clear |
-| `allowsBoundedStorage == NO` (always for `PTTorrentDownload`) | legacy check, unchanged: refused with -4 when the file does not fit |
+| `allowsBoundedStorage == NO` (the default; always for `PTTorrentDownload`), or a volume without holes (not APFS: `pathconf(_PC_MIN_HOLE_SIZE)`) | legacy check, unchanged: refused with -4 when the file does not fit |
+
+Bounded storage is **opt-in**: it only works when the consumer releases what it
+read (`setConsumedBefore:`) and, if it does not read through the HTTP server,
+reports its position (`setReadPosition:`). A client that does neither would get
+a window stuck at the start of the file that fills its budget and stalls, instead
+of today's clear refusal.
 
 Free space is `NSURLVolumeAvailableCapacityKey` read on a fresh URL (a reused
 `NSURL` caches its values). The minimum working set is
@@ -26,7 +32,7 @@ About 1.25 GiB for a 13 GB 2 h film, 2.6 GiB for a 60 GB 4K film at 7 MB/s.
 
 ```objc
 @property (atomic, copy, nullable) NSString *downloadDirectoryOverride; // set before starting
-@property (atomic) BOOL allowsBoundedStorage;        // default YES (NO for PTTorrentDownload)
+@property (atomic) BOOL allowsBoundedStorage;        // default NO: opt-in (always NO for PTTorrentDownload)
 @property (atomic) int64_t storageReserve;           // default 512 MiB, never used
 @property (atomic) int64_t storageBudget;            // torrent's share; 0 = automatic; any time
 @property (atomic) NSTimeInterval mediaDurationHint; // seconds, 0 = unknown
@@ -42,6 +48,10 @@ About 1.25 GiB for a 13 GB 2 h film, 2.6 GiB for a 60 GB 4K film at 7 MB/s.
 @property (atomic, readonly) int64_t bytesOnDisk;    // st_blocks of the file, fresh
 @property (atomic, readonly) NSDictionary<NSString *, NSNumber *> *storageStatistics;
 ```
+
+Error codes (`PTTorrentStreamerErrorDomain`): -4 not enough space (legacy
+refusal, or disk full in full mode), -5 below the minimum working set of bounded
+storage, -6 any other file error (I/O, permissions; before, it was reported as -4).
 
 Everything else is unchanged and source-compatible (Mac app). Semantics that
 changed on purpose:
@@ -59,6 +69,7 @@ Swift:
 
 ```swift
 let streamer = PTTorrentStreamer()
+streamer.allowsBoundedStorage = true              // only where the pump below runs
 streamer.storageBudget = Int64(torrentShare)      // what the HLS copy leaves
 streamer.mediaDurationHint = runtimeSeconds
 streamer.startStreaming(fromMultiTorrentFileOrMagnetLink: link, progress: { _ in }, readyToPlay: { url, path in
@@ -90,8 +101,14 @@ session's `io_context`).
 ### Reading the file directly
 
 A piece counts as available once it passed its hash check **and** its bytes are
-verified as written to the file (`lseek(SEEK_HOLE)` finds no hole in it after
-libtorrent flushed its cache). The remux, which reads the file with a
+verified as written to the file: `lseek(SEEK_HOLE)` finds no hole in it (its
+region was a hole before it was downloaded). Where that proof does not hold, the
+piece is read back after libtorrent's flush and its SHA-1 compared with the
+torrent's hash: a piece that failed a hash check earlier in the stream (its bad
+blocks may be in the file), any piece downloaded into a file that already held
+data, and every piece on a volume without holes (full mode only). A piece that
+is not wholly inside the selected file (multi-file torrents) cannot be hashed
+from it: libtorrent's flush is trusted then. The remux, which reads the file with a
 `FileHandle`, must only read ranges for which `isRangeAvailable` is `YES`, and
 must only release (`consumedBefore`) what it will never read again.
 
@@ -113,7 +130,8 @@ Only pieces of the selected file are ever wanted (fixes the old
 | ahead of the reader | 1 (paced) |
 | behind the reader, on disk | 1 |
 | behind the reader, missing (skipped by a seek), bounded | 0 |
-| consumed (below `consumedBefore` minus one guard piece), bounded | 0, then freed |
+| consumed (below `consumedBefore` minus one guard piece), bounded | 0, then freed (once confirmed on disk) |
+| consumed while missing (a gap skipped by a seek), bounded | 0, forever: "gone", like freed data |
 | freed | 0, forever |
 
 Full mode keeps today's window: the next MIN_PIECES missing pieces at or after
@@ -128,10 +146,28 @@ libtorrent keeps a single normal request per peer and only asks time-critical
 pieces due within about a second; in the offline tests a deadline window starved
 for tens of seconds while pieces far ahead kept arriving. Priority 7 with
 sequential download fetches the window first. While a piece the reader needs is
-missing, pieces beyond the ahead budget are temporarily not wanted (priority 0,
-back to 1 once it arrives), so a late piece cannot let the rest of the file fill
-the disk. Since the late piece is still wanted, the torrent never "finishes"
-early (libtorrent disconnects seeds when it finishes).
+missing, pieces beyond the ahead budget (minus freed data whose hole is not
+punched yet, e.g. the old window right after a seek) are temporarily not wanted
+(priority 0, back to 1 once it arrives), so a late piece cannot let the rest of
+the file fill the disk. One missing piece beyond that cap stays wanted (the
+sentinel, kept for the whole late episode, so at most one extra piece comes in):
+otherwise the late piece could be the last wanted one, and libtorrent marks the
+torrent finished the moment it arrives.
+
+A torrent can still be "finished" for a while: the window reached the end of the
+file, or the sentinel arrived before the late piece. libtorrent then disconnects
+its seeds (`close_redundant_connections`, kept at its default). Turning that
+setting off was tried and rejected: the connection then survives libtorrent's
+upload mode after an ENOSPC (choked, hundreds of cancelled requests outstanding),
+was dropped a few seconds after recovery, and in 2 of 4 forced-ENOSPC runs left a
+piece that libtorrent never requested again (the stream stopped for good). With
+the default, the seed is disconnected in upload mode and reconnected at once when
+it ends (`set_upload_mode(false)` resets `last_connected`).
+
+In bounded mode the pieces needed before `readyToPlay` are at most the window
+(plus the tail pins), so they are all fetched at top priority and unthrottled:
+beyond the window they would be paced like any data ahead, down to the floor
+rate when the minimum working set is tight.
 
 ### Pace (`pace`)
 
@@ -139,6 +175,12 @@ early (libtorrent disconnects seeds when it finishes).
 `minAhead`), and never more than the free space above the reserve allows. The
 ahead bytes are measured on the real allocation (`st_blocks`), so partially
 downloaded pieces and holes not punched yet count.
+
+The consumption rate is a moving average of the read position, sampled once a
+second (`consumedBetween`): a move over data that was never on disk is a seek
+and counts as nothing, and a sample is capped at max(2× the current rate,
+4× the bitrate, 16 MiB), so a forward seek does not open the pace controller
+wide.
 
 | Fill of the ahead budget | Download limit (`torrent::set_download_limit`) |
 |---|---|
@@ -149,12 +191,19 @@ downloaded pieces and holes not punched yet count.
 | free < reserve | 8 KiB/s |
 | reader waits for a piece | unlimited (64 KiB/s if free < reserve / 2) |
 
-The session is never paused: peers stay connected.
+The session is never paused: peers stay connected. Since the floor and trickle
+rates keep bringing data in, disk use is kept flat over a pause of any length:
+while the reader does not wait, data ahead beyond the budget plus the floor band
+(12.5 %, at least one piece) is dropped back down to the budget, and so is
+whatever eats into the reserve (`excessAheadBytes`; dropped pieces are fetched
+again later, at the trickle rate).
 
 ### Freeing (`releasePieces`, `punch`)
 
-For every consumed piece, on the network thread, in batches (32 MiB, a tick, or
-the disk below the reserve):
+For every consumed piece confirmed on disk (a piece still being verified may have
+blocks in libtorrent's cache, written after the punch: it is freed on a later
+plan), on the network thread, in batches (32 MiB, a tick, or the disk below the
+reserve):
 1. state `Freed` in the controller's map (HTTP reads re-check it after `pread`);
 2. `set_piece_priority(0)`;
 3. `picker().we_dont_have()` + `update_gauge()` — what libtorrent does itself for
@@ -168,7 +217,15 @@ the disk below the reserve):
 5. `async_clear_piece` on the last piece of the batch: a disk fence (every read
    or write already queued completes) that also evicts it from the cache;
 6. in its handler, on a GCD queue, `fcntl(F_PUNCHHOLE)` on the piece's range of
-   the file, rounded inward to 4 KiB (to the end of the file for the last piece).
+   the file, rounded inward to 4 KiB (to the end of the file for the last piece);
+   a 4 KiB block shared with a neighbour piece that is freed too is punched as
+   well (files of multi-file torrents do not start on a block boundary).
+
+A forward seek leaves partially downloaded pieces behind: their priority drops
+to 0 but blocks already requested still arrive and are written. Once consumed,
+and once no block of theirs is requested any more (libtorrent's download queue),
+they get an `async_clear_piece` fence and are punched too
+(`punchPartialPieces`, statistics key `partialPiecesPunched`).
 
 Freed pieces are never downloaded again in this stream (the user's choice:
 rewinding further back than what is on disk is blocked).
@@ -181,8 +238,10 @@ pieces farthest ahead of the reader (they are punched, then wanted again; never
 pinned, never in the window) until the reserve is back, and calls
 `set_upload_mode(false)` (libtorrent's reaction to ENOSPC is upload mode) once
 free ≥ reserve / 2. The same drop runs whenever free < reserve / 2, once the
-holes already queued have landed. The ahead budget never exceeds the free space
-above the reserve, so dropped data is not fetched again until there is room.
+holes already queued have landed (and, while the reader does not wait, whenever
+free < reserve: see Pace). The ahead budget never exceeds the free space above the
+reserve, so dropped data is not fetched again until there is room. Any other file
+error ends the stream as before, now with code -6.
 
 ### HTTP server (`PTGatedFileResponse`)
 
@@ -190,7 +249,12 @@ above the reserve, so dropped data is not fetched again until there is room.
 time) is replaced by a streamed response:
 - each chunk (≤ 512 KiB) is read only from pieces on disk; a missing piece is
   waited for (no thread blocked), a freed one fails the response;
-- a request that starts in freed data gets **410** at once; outside the file **416**;
+- a request that starts in data that is gone (freed, or consumed before it was
+  ever downloaded, i.e. skipped by a seek) gets **410** at once; outside the
+  file **416**; a waiting read whose piece becomes gone fails at once;
+- reads of the streaming request wait as long as needed; in bounded mode a waiting
+  read of another request (a prefetch, an abandoned request) gives up after 120 s
+  so it does not keep its piece urgent; in full mode reads always wait;
 - any number of concurrent requests;
 - the streaming request (the "primary reader") drives `readPosition`; requests
   in the pinned head and tail (headers, indexes) never do; a new request becomes
@@ -214,6 +278,10 @@ session shares the files), then removes the directory as before.
   background seeding), and removed at cancel.
 - The resume data path is taken from the alert (the torrent may be removed).
 - `localizedString` falls back to the package's own `.lproj` (fr added).
+- `PTTorrentDownload pause` unsets `auto_managed` (libtorrent's auto-manager
+  resumed paused downloads).
+- The loopback testing hook is no longer in the public header: it is declared in
+  `Sources/Client/PTTorrentsSession+Testing.h`, which the harness imports.
 
 ## Statistics and tracing
 
@@ -222,12 +290,14 @@ aheadBudget, aheadBytes, behindBytes, pinnedBytes, dataBytes, bytesOnDisk,
 freeBytes, reserveBytes, readPosition, consumedBefore, lowestAvailableOffset,
 servedOffset, headPinEnd, tailPinStart, everDownloaded, freedPieces,
 droppedPieces, punchedBytes, punchErrors, diskFullEvents, fileErrors,
-dontHaveSent, waitingReads, downloadLimit, paceState (0 open, 1 proportional,
-2 floor, 3 trickle, 4 emergency), consumeRate`.
+dontHaveSent, partialPiecesPunched, waitingReads, downloadLimit, paceState
+(0 open, 1 proportional, 2 floor, 3 trickle, 4 emergency), consumeRate`.
 
 `PT_BOUNDED_DEBUG=1` in the environment (Xcode scheme) logs the controller's
 state once a second: read position, piece states, ahead/budget, allocation,
-pending holes, limit, peers (choked, snubbed, queues), waiting reads.
+pending holes, limit, peers (choked, snubbed, queues), waiting reads,
+libtorrent's view of the first missing piece, drops, and passes of pieces that
+were not missing.
 
 ## Tests
 
@@ -243,8 +313,9 @@ Offline end-to-end harness (`Tools/BoundedStorageHarness`): generates a file of
 patterned pseudo-random data with an MKV head, a private torrent for it (no
 trackers), seeds it from a libtorrent session on 127.0.0.1 and streams it with
 `PTTorrentStreamer`, whose shared session is made loopback-only with
-`+[PTTorrentsSession prepareSharedSessionForLoopbackTestingOnPort:]` (no DHT,
-LSD, UPnP, NAT-PMP), into a fresh APFS sparse disk image:
+`+[PTTorrentsSession prepareSharedSessionForLoopbackTestingOnPort:]`
+(`PTTorrentsSession+Testing.h`; no DHT, LSD, UPnP, NAT-PMP), into a fresh APFS
+sparse disk image:
 
 ```
 cd Tools/BoundedStorageHarness && swift build -c release --scratch-path <build>
@@ -258,34 +329,58 @@ compares every byte with the source and its SHA-256, advances
 `consumedBefore` (32 MiB behind), pauses, reads ahead of the download, reads the
 pinned head and tail and freed data, runs concurrent requests, and a raw
 BitTorrent peer (fast extension + lt_donthave) requests a freed piece and a kept
-one. Then it cancels and checks the space comes back. Options: `--ballast-mib N`
-fills the volume with another file between 35 % and 55 % of the file.
+one. Then it cancels and checks the space comes back, and that nothing is left
+allocated below `lowestAvailableOffset` apart from the head pin. Options:
+`--ballast-mib N` fills the volume with another file between 35 % and 55 % of
+the file (`--ballast-hold-seconds S --ballast-greedy 1`: keeps it full for S
+seconds, forcing ENOSPC); `--seek-at F --seek-to G --seeks N` makes the consumer
+seek forward (from F to G of the file, then as far again), checks the bytes of
+the ranges read and that a skipped, consumed range gets 410;
+`--seed-rate-mbs R` caps the seeder (pieces stay in flight longer, so a seek
+leaves partial pieces behind); `--piece-kib N`, `--budget-mib N`.
 
-### Results (Mac, 2026-11-10, 6 GiB file, 4 MiB pieces, 1536 pieces)
+### Results (Mac, 2026-11-11, after the review fixes)
+
+6 GiB file with 4 MiB pieces (1536 pieces) unless stated; 40 MB/s consumer.
 
 | Run | Volume | Result |
 |---|---|---|
-| bounded, 40 MB/s, 60 s pause, budget 2 GiB | 3 GiB image (2.79 GiB free) | 24/24: ready in 3.0 s; 6 GiB read, SHA-256 equal, 0 wrong bytes, 0 stall; on disk at most 2065 MiB, 1929–2065 MiB while 2.4 GiB went through; free never below 795 MiB (reserve 512); pause: +2 MiB in 64 s once the window was full; 1523 pieces freed, 5.95 GiB punched, 0 punch error, 2235 lt_donthave; freed range: 410 in 1 ms; freed piece rejected to the probe peer and withdrawn, kept piece served with real data; cancel: free back to 2860 MiB |
-| full, same consumer | 8 GiB image | 13/13: ready in 3.5 s, whole file kept (6144 MiB), nothing freed, same hash, cancel gives the 6 GiB back |
-| bounded + 900 MiB ballast (35–55 %) | 3 GiB image | 23/24: free fell to 205 MiB because of the ballast; far-ahead data dropped and fetched again (seed uploaded 1.09× the file); no ENOSPC, no stall, same hash. The pause check failed only because the pause fell inside the ballast window (+19 MiB in 23 s while refilling) |
-| bounded + ballast keeping the volume full for 30 s | 3 GiB image | 22/24: 31 ENOSPC write errors handled as disk full, no failure, same hash, 27 s stall (the volume had no free byte for 30 s), cancel gives everything back. The probe peer was disconnected by libtorrent during upload mode, so its 2 checks could not run |
+| bounded, 60 s pause, budget 2 GiB | 3 GiB image (2.79 GiB free) | 21/21: ready in 3.0 s; 6 GiB read, SHA-256 equal, 0 wrong bytes, 0 stall; on disk at most 2058 MiB, 1911–2058 MiB while 2.4 GiB went through; free never below 801 MiB (reserve 512); pause: 1986 → 2057 MiB in the first 2 s (the budget share released by the last consumed batch), then 2057 → 2058 MiB over 55 s; 1522 pieces freed, 0 punch error, 2218 lt_donthave; freed range: 410 in 1 ms; freed piece rejected to the probe peer and withdrawn, kept piece served with real data; nothing allocated below `lowestAvailableOffset` apart from the head pin; cancel: free back to 2860 MiB |
+| full (file fits, bounded allowed) | 8 GiB image | 14/14: full mode, whole file kept (6144 MiB), nothing freed, same hash, cancel gives the 6 GiB back |
+| bounded + 900 MiB ballast (35–55 %), 60 MB/s | 3 GiB image | 21/21: the ballast filled the volume to 33 MiB free; 45 ENOSPC writes handled as disk full (no failure, 0 stall, same hash); far-ahead data dropped and fetched again (seed uploaded 1.15× the file) |
+| bounded + ballast keeping the volume full for 30 s (3 runs) | 3 GiB image | 19/21 each: 31–48 ENOSPC handled, one 26.5–26.9 s stall while the volume had no free byte, then the whole file read with the same hash. The 2 probe-peer checks fail: the probe gets no answer after libtorrent's upload-mode episode (as before the fixes) |
+| 3 GiB file, 2 forward seeks of 768 MiB, automatic budget | 2 GiB image | 22/22: torrent at most 407 MiB on disk against a 436 MiB budget (before the fixes: 695 MiB); bytes of the ranges read equal to the source; a skipped and consumed range gets 410 in 2 ms (before: 206, then an abort) |
+| same with 16 MiB pieces and the seeder capped at 60 MB/s | 2 GiB image | 22/22: 2 partial pieces left behind by the seeks punched, 0 KiB allocated below `lowestAvailableOffset` apart from the head pin; at most 439 MiB on disk against 492 MiB |
+
+Previous results (2026-11-10, before the review fixes): bounded 24/24 by the
+older check list, full 13/13, ballast 23/24 (pause check), forced ENOSPC 22/24
+(probe checks).
 
 ## Limits and open points
 
 - tvOS on device is untested: `F_PUNCHHOLE` and `SEEK_HOLE` in the app sandbox,
   free-space keys, purging near a full disk, flash timings. `F_PUNCHHOLE` needs
-  APFS; on another file system the punch fails (`punchErrors`) and the space is
-  not given back.
+  APFS: on a volume without holes bounded storage is not used (legacy refusal).
 - Real swarms are untested: many peers, slow peers, peers dropping us under the
   64 KiB/s floor.
 - A rewind into a gap left by a forward seek (not freed, never downloaded) is
-  downloaded on demand, but after the window reached the end of the file the
-  torrent is "finished" and libtorrent has dropped its seeds: it waits for a
-  reconnection. Use `isRangeAvailable` before allowing such a rewind.
+  downloaded on demand while the gap is not consumed (once consumed it is gone:
+  410), but after the window reached the end of the file the torrent is
+  "finished" and libtorrent has dropped its seeds: it waits for a reconnection
+  (up to `min_reconnect_time`, 60 s). Use `isRangeAvailable` before allowing such
+  a rewind.
 - Fast resume is never saved in bounded mode, and the files are deleted at cancel.
-- After a real ENOSPC, requests libtorrent cancelled when it entered upload mode
-  stayed outstanding on the (libtorrent) seed until its request timeout: the
-  reader waited about 35 s after space came back in the harness.
+- After a real ENOSPC the reader waits as long as the volume stays full; in the
+  harness it resumed 1–2 s after space came back (one earlier run waited about
+  35 s: requests libtorrent cancelled when it entered upload mode stayed
+  outstanding on the seed until their timeout).
+- If the sentinel piece arrives before the late piece, the torrent can still be
+  "finished" for a moment and libtorrent drops its seeds (default
+  `close_redundant_connections`, see Window).
+- Not exercised by the harness: the content verification of suspect pieces (no
+  hash failure, no pre-existing file offline), and a pause long enough for the
+  floor band to fill (the over-budget drop is unit-tested; the harness pause is
+  60 s).
 - The time-critical (deadline) path of libtorrent misbehaved with one very fast
   local seed (a window starved, cancels left requests outstanding until the
   request timeout); bounded mode avoids it, full mode keeps it as before.
