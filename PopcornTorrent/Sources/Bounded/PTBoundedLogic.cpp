@@ -65,10 +65,16 @@ BudgetPlan planBudget(BudgetInput const& in) {
         return plan;
     }
 
+    // Space other writers of the volume (offline downloads in progress) will still take.
+    int64_t const free = std::max<int64_t>(0, in.freeBytes - std::max<int64_t>(0, in.pendingExternalBytes));
     int64_t const remaining = std::max<int64_t>(0, in.fileSize - in.heldBytes);
-    if (remaining + in.reserveBytes <= in.freeBytes) {
+    // Full mode keeps the whole file: it must leave room for the app's own copy next to it
+    // (the HLS segments a remux keeps around the playhead), or the two fill the volume and
+    // the download fails with ENOSPC late in the film.
+    int64_t const appWorkingSet = int64_t(std::max(0.0, in.appWorkingSetSeconds) * plan.bytesPerSecond);
+    if (remaining + in.reserveBytes + appWorkingSet <= free) {
         plan.decision = StorageDecision::Full;
-        plan.minimumFreeBytes = remaining;
+        plan.minimumFreeBytes = remaining + appWorkingSet;
         return plan;
     }
 
@@ -80,12 +86,13 @@ BudgetPlan planBudget(BudgetInput const& in) {
     plan.pinBudget = kHeadPinLimit + tailPinPieces(whole, kTailPinPieces) * pieceLength;
     plan.minAhead = roundUp(std::max<int64_t>(256 * kMiB, int64_t(60 * bps)), pieceLength);
     plan.inflightAllowance = std::max<int64_t>(32 * kMiB, 4 * pieceLength);
-    // The app's own copy (HLS segments): 180 s of lookahead plus 60 s of rewind at least.
-    int64_t const appMinimum = int64_t(240 * bps);
+    // The app's own copy (HLS segments): 180 s of lookahead plus 60 s of rewind at least,
+    // and its headroom (the segment being written).
+    int64_t const appMinimum = int64_t(240 * bps) + std::max<int64_t>(kAppHeadroomBytes, int64_t(kAppHeadroomSeconds * bps));
     int64_t const torrentMinimum = plan.pinBudget + plan.minAhead + plan.inflightAllowance;
     plan.minimumFreeBytes = in.reserveBytes + torrentMinimum + appMinimum;
 
-    int64_t const usable = in.freeBytes + in.heldBytes;
+    int64_t const usable = free + in.heldBytes;
     if (usable < plan.minimumFreeBytes) {
         plan.decision = StorageDecision::Refuse;
         return plan;
@@ -120,6 +127,15 @@ bool isPinned(FileGeometry const& geometry, PinSet const& pins, int32_t piece) {
     if (pins.headEnd > 0 && geometry.pieceBegin(piece) < pins.headEnd) return true;
     if (pins.tailStart >= 0 && geometry.pieceEnd(piece) > pins.tailStart) return true;
     return false;
+}
+
+bool onDiskToTheEnd(FileGeometry const& geometry, std::vector<uint8_t> const& states, int32_t fromPiece) {
+    if (!geometry.valid() || int32_t(states.size()) < geometry.pieceCount()) return false;
+    int32_t const first = geometry.firstPiece();
+    for (int32_t piece = std::max(fromPiece, first); piece <= geometry.lastPiece(); ++piece) {
+        if (states[size_t(piece - first)] != PieceOnDisk) return false;
+    }
+    return true;
 }
 
 bool isConsumed(FileGeometry const& geometry, int32_t piece, int64_t consumedBefore) {
@@ -297,6 +313,8 @@ std::vector<int32_t> piecesToDrop(PlanInput const& in, PlanOutput const& plan, i
     std::vector<int32_t> result;
     FileGeometry const& geo = in.geometry;
     if (needBytes <= 0 || in.states == nullptr || geo.pieceCount() <= 0) return result;
+    // The rest of the file is all here: the reader may take it as final, never drop it.
+    if (onDiskToTheEnd(geo, *in.states, plan.readPiece)) return result;
     int32_t const first = geo.firstPiece();
     int64_t freed = 0;
     for (int32_t piece = geo.lastPiece(); piece >= std::max(plan.windowEndPiece, first) && freed < needBytes; --piece) {
@@ -473,7 +491,12 @@ HeadPins parseMatroska(ReadAt const& read, int64_t fileSize, int64_t headLimit, 
         status = element(position, header);
         if (status == 0) return needMore(position);
         if (status < 0) return unknown;
-        if (header.id == 0x1F43B675) return done(position, -1, "mkv"); // first Cluster
+        if (header.id == 0x1F43B675) {
+            // First Cluster. A player opening the file again (VLC after a hand-off) also
+            // reads the first clusters and prefetches before its first seek takes effect.
+            int64_t const opening = std::min(headLimit, kMatroskaHeadPinBytes);
+            return done(std::min(fileSize, std::max(position, opening)), -1, "mkv");
+        }
         if (header.unknownSize) return unknown;
         position += header.headerLength + header.size;
     }

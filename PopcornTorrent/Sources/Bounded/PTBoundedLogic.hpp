@@ -28,6 +28,16 @@ constexpr int64_t kDefaultReserveBytes = 512 * kMiB;
 constexpr int64_t kHeadPinLimit = 64 * kMiB;
 /// Head pin used when the container cannot be parsed (AVI, unknown, damaged).
 constexpr int64_t kHeadPinFallback = 32 * kMiB;
+/// Least head pin of a Matroska file, past its first Cluster: what a player that opens the
+/// file again reads before its first seek can take effect (VLCKit 4 over HTTP: its prefetch
+/// and the first clusters it demuxes, 20-30 MB measured at 1.67 MB/s), so a hand-off to VLC
+/// does not run into freed data right after the header (HTTP 410). Capped by the head limit.
+constexpr int64_t kMatroskaHeadPinBytes = 64 * kMiB;
+/// What the app keeps next to the file in bounded mode besides its share of the HLS copy
+/// (the segment being written, rounding): added to the minimum working set, at least this,
+/// at least 20 s of the bitrate.
+constexpr int64_t kAppHeadroomBytes = 32 * kMiB;
+constexpr double kAppHeadroomSeconds = 20;
 /// Fewest pieces pinned at the end of the file in bounded mode (MKV Cues, MP4 moov at the end).
 constexpr int kTailPinPieces = 2;
 /// Bytes the tail pin covers at least (MKV Cues, an MP4 moov stored at the end: a few MiB
@@ -89,6 +99,11 @@ struct BudgetInput {
     int64_t requestedBudget = 0;    // the app's share for the torrent, 0 = automatic
     double durationSeconds = 0;     // media duration, 0 = unknown
     bool allowBounded = true;
+    double appWorkingSetSeconds = 0; // media the app keeps next to the whole file in full mode
+                                     // (its HLS copy), at the file's bitrate: full mode only when
+                                     // the file, the reserve and this fit (0 = the file alone)
+    int64_t pendingExternalBytes = 0; // bytes other writers (offline downloads) will still add to
+                                      // the volume: not counted as free
 };
 
 struct BudgetPlan {
@@ -158,6 +173,9 @@ struct PlanOutput {
 
 bool isPinned(FileGeometry const& geometry, PinSet const& pins, int32_t piece);
 
+/// Every piece from `fromPiece` to the end of the file is on disk (PieceOnDisk).
+bool onDiskToTheEnd(FileGeometry const& geometry, std::vector<uint8_t> const& states, int32_t fromPiece);
+
 /// Bounded: the piece lies entirely below `consumedBefore` minus one guard piece.
 bool isConsumed(FileGeometry const& geometry, int32_t piece, int64_t consumedBefore);
 
@@ -184,7 +202,10 @@ int64_t contiguousAvailableStart(FileGeometry const& geometry, std::vector<uint8
 PlanOutput planWindow(PlanInput const& input);
 
 /// Pieces with data to drop when the disk is full: farthest from the reader
-/// first, never pinned, never inside the deadline window.
+/// first, never pinned, never inside the deadline window. None once every piece
+/// from the read piece to the end of the file is on disk: nothing more is downloaded
+/// then, and the consumer may take the rest of the file as final (the app's remux
+/// marks its input complete and reads zeros as data from then on).
 std::vector<int32_t> piecesToDrop(PlanInput const& input, PlanOutput const& plan, int64_t needBytes);
 
 /// Bytes the reader consumed between two samples of its position (`from` -> `to`), for
@@ -242,8 +263,9 @@ struct HeadPins {
 };
 
 /// Finds how much of the head (and, for MP4 with moov at the end, of the tail)
-/// a player needs to open the file again: MKV up to the first Cluster, MP4 up
-/// to the end of moov. Unknown or damaged containers get kHeadPinFallback.
+/// a player needs to open the file again: MKV up to the first Cluster and at least
+/// kMatroskaHeadPinBytes (a player's opening reads), MP4 up to the end of moov.
+/// Unknown or damaged containers get kHeadPinFallback. Never past `headLimit`.
 HeadPins parseHeadPins(ReadAt const& read, int64_t fileSize,
                        int64_t headLimit = kHeadPinLimit, int64_t fallback = kHeadPinFallback);
 

@@ -123,12 +123,66 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     BudgetPlan const hdPlan = planBudget(hd);
     BudgetPlan const uhdPlan = planBudget(uhd);
     XCTAssertGreaterThan(uhdPlan.minimumFreeBytes, hdPlan.minimumFreeBytes);
-    // A 60 GB 4K film still streams through 2.8 GiB.
-    XCTAssertTrue(uhdPlan.decision == StorageDecision::Bounded);
+    // A 60 GB 4K film (7 MB/s) needs a little more than 2.8 GiB once the app's headroom
+    // (20 s of the bitrate) is counted: refused there, bounded with 2.9 GiB.
+    XCTAssertTrue(uhdPlan.decision == StorageDecision::Refuse);
+    XCTAssertLessThan(uhdPlan.minimumFreeBytes, 2900 * kMiB);
+    uhd.freeBytes = 2900 * kMiB;
+    XCTAssertTrue(planBudget(uhd).decision == StorageDecision::Bounded);
     // Unknown duration: estimated from the size over two hours.
     BudgetInput unknown = hd;
     unknown.durationSeconds = 0;
     XCTAssertEqualWithAccuracy(planBudget(unknown).bytesPerSecond, 13 * kGB / 7200.0, 1.0);
+}
+
+- (void)testMinimumWorkingSetCountsTheAppHeadroom {
+    BudgetInput hd;
+    hd.fileSize = 13 * kGB;
+    hd.pieceLength = 8 * kMiB;
+    hd.freeBytes = 2800 * kMiB;
+    hd.durationSeconds = 130 * 60;
+    BudgetPlan const plan = planBudget(hd);
+    double const bps = 13 * kGB / (130 * 60.0);
+    int64_t const app = int64_t(240 * bps) + std::max<int64_t>(kAppHeadroomBytes, int64_t(kAppHeadroomSeconds * bps));
+    XCTAssertEqual(plan.minimumFreeBytes, hd.reserveBytes + plan.pinBudget + plan.minAhead + plan.inflightAllowance + app);
+}
+
+- (void)testFullModeLeavesRoomForTheAppCopy {
+    BudgetInput input;
+    input.fileSize = 13 * kGB;
+    input.pieceLength = 8 * kMiB;
+    input.durationSeconds = 130 * 60;
+    input.freeBytes = 13 * kGB + kDefaultReserveBytes;
+    XCTAssertTrue(planBudget(input).decision == StorageDecision::Full);
+    // The app keeps 400 s of HLS next to the whole file: that no longer fits.
+    input.appWorkingSetSeconds = 400;
+    BudgetPlan const tight = planBudget(input);
+    XCTAssertTrue(tight.decision == StorageDecision::Bounded);
+    int64_t const appBytes = int64_t(400 * tight.bytesPerSecond);
+    input.freeBytes = 13 * kGB + kDefaultReserveBytes + appBytes;
+    BudgetPlan const roomy = planBudget(input);
+    XCTAssertTrue(roomy.decision == StorageDecision::Full);
+    XCTAssertEqual(roomy.minimumFreeBytes, 13 * kGB + appBytes);
+    // Not allowed to be bounded: the legacy check, unchanged.
+    input.allowBounded = false;
+    input.freeBytes = 13 * kGB;
+    XCTAssertTrue(planBudget(input).decision == StorageDecision::Full);
+}
+
+- (void)testPendingExternalBytesAreNotFree {
+    BudgetInput input;
+    input.fileSize = 4 * kGiB;
+    input.pieceLength = 4 * kMiB;
+    input.freeBytes = 4 * kGiB + kDefaultReserveBytes;
+    XCTAssertTrue(planBudget(input).decision == StorageDecision::Full);
+    // An offline download will still write 1.5 GiB: bounded, with less room.
+    input.pendingExternalBytes = 3 * kGiB / 2;
+    BudgetPlan const plan = planBudget(input);
+    XCTAssertTrue(plan.decision == StorageDecision::Bounded);
+    XCTAssertLessThanOrEqual(plan.torrentBudget, input.freeBytes - input.pendingExternalBytes - input.reserveBytes);
+    // So much pending that even the minimum does not fit.
+    input.pendingExternalBytes = 4 * kGiB;
+    XCTAssertTrue(planBudget(input).decision == StorageDecision::Refuse);
 }
 
 - (void)testRequestedBudgetIsClamped {
@@ -356,6 +410,7 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
 - (void)testPiecesToDropAreFarAheadAndNeverPinned {
     FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
     std::vector<uint8_t> states(100, PieceOnDisk);
+    states[12] = PieceMissing; // the window is still being downloaded
     PlanInput input;
     input.geometry = geo;
     input.bounded = true;
@@ -371,6 +426,33 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertEqual(drop[2], 95);
     std::vector<int32_t> const all = piecesToDrop(input, plan, 1000 * kMiB);
     XCTAssertEqual(all.back(), plan.windowEndPiece);
+}
+
+- (void)testNothingIsDroppedOnceTheRestOfTheFileIsOnDisk {
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceFreed);
+    for (int i = 0; i < 4; ++i) states[size_t(i)] = PieceOnDisk;   // head pin
+    for (int i = 60; i < 100; ++i) states[size_t(i)] = PieceOnDisk; // reader to the end
+    PlanInput input;
+    input.geometry = geo;
+    input.bounded = true;
+    input.readPosition = 61 * kMiB;
+    input.consumedBefore = 59 * kMiB;
+    input.pins.headEnd = 4 * kMiB;
+    input.pins.tailStart = 98 * kMiB;
+    input.deadlinePieces = 8;
+    input.states = &states;
+    PlanOutput const plan = planWindow(input);
+    XCTAssertTrue(onDiskToTheEnd(geo, states, plan.readPiece));
+    // Disk full, or over the budget: the rest of the file is final, nothing goes.
+    XCTAssertTrue(piecesToDrop(input, plan, 20 * kMiB).empty());
+    // One piece ahead still missing: the farthest data ahead can go again.
+    states[80] = PieceMissing;
+    PlanOutput const missing = planWindow(input);
+    XCTAssertFalse(onDiskToTheEnd(geo, states, missing.readPiece));
+    std::vector<int32_t> const drop = piecesToDrop(input, missing, 2 * kMiB);
+    XCTAssertEqual(drop.size(), size_t(2));
+    XCTAssertEqual(drop[0], 97);
 }
 
 - (void)testConsumedPiecesStillBeingVerifiedAreFreedLater {
@@ -594,7 +676,7 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
 
 #pragma mark - Container head parser
 
-- (void)testMatroskaHeadPinEndsAtTheFirstCluster {
+- (void)testMatroskaHeadPinCoversTheFirstClustersAPlayerReads {
     std::vector<uint8_t> mkv;
     appendBytes(mkv, {0x1A, 0x45, 0xDF, 0xA3, 0x80 | 0x10}); // EBML header, 16 bytes
     appendFill(mkv, 0x10);
@@ -612,9 +694,12 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     appendFill(mkv, 1000);
     int64_t const fileSize = 1 * kGiB;
 
+    // Past the first Cluster: what a player reads at open before its first seek (VLC's
+    // prefetch and first clusters), kMatroskaHeadPinBytes.
     HeadPins result = parseHeadPins(memoryReader(mkv, int64_t(mkv.size())), fileSize);
     XCTAssertEqual(result.status, HeadPins::Done);
-    XCTAssertEqual(result.headPinEnd, cluster);
+    XCTAssertEqual(result.headPinEnd, kMatroskaHeadPinBytes);
+    XCTAssertGreaterThan(result.headPinEnd, cluster);
     XCTAssertEqual(result.tailPinStart, -1);
     XCTAssertEqual(std::string(result.format), std::string("mkv"));
 
@@ -627,6 +712,13 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     result = parseHeadPins(memoryReader(mkv, int64_t(mkv.size())), fileSize, 2048, kHeadPinFallback);
     XCTAssertEqual(result.status, HeadPins::Done);
     XCTAssertEqual(result.headPinEnd, 2048);
+
+    // A first Cluster past the opening reads but within the limit: up to it.
+    result = parseHeadPins(memoryReader(mkv, int64_t(mkv.size())), fileSize, 1 * kGiB, kHeadPinFallback);
+    XCTAssertEqual(result.headPinEnd, kMatroskaHeadPinBytes);
+    // A file smaller than the opening reads: all of it.
+    result = parseHeadPins(memoryReader(mkv, int64_t(mkv.size())), 10 * kMiB);
+    XCTAssertEqual(result.headPinEnd, 10 * kMiB);
 }
 
 - (void)testMP4HeadAndTailPins {
