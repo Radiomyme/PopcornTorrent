@@ -208,6 +208,11 @@ void StreamController::setTorrentBudget(int64_t bytes) {
     requestUpdate();
 }
 
+void StreamController::setPendingExternalBytes(int64_t bytes) {
+    int64_t const value = std::max<int64_t>(0, bytes);
+    if (m_pendingExternal.exchange(value) != value) requestUpdate();
+}
+
 void StreamController::moveReadPosition(int64_t offset) {
     m_readPosition.store(std::max<int64_t>(0, offset));
     if (m_config.geometry.pieceAt(offset) != m_plannedReadPiece.load()) requestUpdate();
@@ -286,7 +291,8 @@ int64_t StreamController::bytesOnDisk() const {
 int64_t StreamController::freeBytes() const {
     struct statfs info;
     if (m_config.directoryPath.empty() || statfs(m_config.directoryPath.c_str(), &info) != 0) return INT64_MAX;
-    return int64_t(info.f_bavail) * int64_t(info.f_bsize);
+    // Space offline downloads in progress will still take is not this stream's.
+    return std::max<int64_t>(0, int64_t(info.f_bavail) * int64_t(info.f_bsize) - m_pendingExternal.load());
 }
 
 std::pair<int, int> StreamController::requiredProgress() const {
@@ -334,6 +340,7 @@ StreamStatistics StreamController::statistics() const {
     s.fileErrors = m_fileErrors.load();
     s.dontHaveSent = m_dontHaveSent.load();
     s.partialPunched = m_partialPunched.load();
+    s.reclaimedBytes = m_reclaimedBytes.load();
     s.downloadLimit = m_downloadLimit.load();
     s.paceState = m_paceState.load();
     s.consumeRate = m_consumeRate.load();
@@ -747,7 +754,7 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     }
 
     // Pace the download so the window ahead of the reader stays within its budget.
-    int64_t const free = freeBytes();
+    int64_t free = freeBytes();
     m_lastFreeBytes.store(free);
     BudgetPlan budget = m_config.budget;
     int64_t const requested = m_requestedBudget.load();
@@ -757,7 +764,18 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
 
     // The real allocation also counts partially downloaded pieces and freed pieces
     // whose holes are not punched yet.
-    int64_t const allocated = bytesOnDisk();
+    int64_t allocated = bytesOnDisk();
+    // Backstop: blocks allocated where the file has no data (seen offline, cause unknown:
+    // the allocation grew to the whole file within a second of the first write of the tail
+    // pins, the volume filled up and libtorrent went into upload mode for good).
+    if (free != INT64_MAX && free < m_config.reserveBytes) {
+        int64_t const reclaimed = reclaimAllocatedHoles(torrent, allocated, plan.dataBytes);
+        if (reclaimed > 0) {
+            allocated = bytesOnDisk();
+            free = freeBytes();
+            m_lastFreeBytes.store(free);
+        }
+    }
     int64_t const aheadOnDisk = std::max(plan.aheadBytes, allocated - plan.pinnedBytes - plan.behindBytes);
     // Never plan to hold more than the free space above the reserve allows (the app's own
     // copy, or anything else, may be using the volume too).
@@ -948,6 +966,58 @@ void StreamController::punchPartialPieces(lt::torrent& torrent) {
             }
         });
     }
+}
+
+int64_t StreamController::reclaimAllocatedHoles(lt::torrent& torrent, int64_t allocated, int64_t dataBytes) {
+    FileGeometry const& geo = m_config.geometry;
+    int64_t const pieceLength = geo.pieceLength;
+    if (!torrent.has_picker() || m_pendingPunches.load() > 0) return 0;
+    // Pieces libtorrent holds blocks of (requested, being written, finished): never touched,
+    // and counted as allocated.
+    std::set<int32_t> busy;
+    for (auto const& downloading : torrent.picker().get_download_queue()) {
+        busy.insert(int32_t(static_cast<int>(downloading.index)));
+    }
+    int64_t const expected = dataBytes + m_pendingPunchBytes.load() + int64_t(busy.size()) * pieceLength
+        + m_config.budget.inflightAllowance;
+    int64_t const slack = std::max<int64_t>(64 * kMiB, 4 * pieceLength);
+    if (allocated <= expected + slack) return 0;
+    double const now = [NSProcessInfo processInfo].systemUptime;
+    if (now - m_lastReclaimTime < 2) return 0;
+    m_lastReclaimTime = now;
+    int const fd = fileDescriptor();
+    if (fd < 0) return 0;
+    // On the network thread, where libtorrent requests blocks: none of these pieces can get
+    // one before the holes are punched, and none has a write queued (not in the queue).
+    int64_t punched = 0;
+    int ranges = 0;
+    auto eligible = [&](int32_t piece) { return stateOf(piece) == PieceMissing && busy.count(piece) == 0; };
+    for (int32_t piece = geo.firstPiece(); piece <= geo.lastPiece(); ++piece) {
+        if (!eligible(piece)) continue;
+        int32_t last = piece;
+        while (last < geo.lastPiece() && eligible(last + 1)) ++last;
+        int64_t const begin = alignUp(geo.pieceBegin(piece));
+        int64_t const end = geo.pieceEnd(last) == geo.fileSize ? geo.fileSize : alignDown(geo.pieceEnd(last));
+        if (end > begin) {
+            std::shared_lock<std::shared_mutex> lock(m_fdLock);
+            if (fd == m_fd && !m_cancelled.load()) {
+                fpunchhole_t hole = {0, 0, off_t(begin), off_t(end - begin)};
+                if (fcntl(fd, F_PUNCHHOLE, &hole) == 0) {
+                    punched += end - begin;
+                    ++ranges;
+                } else {
+                    m_punchErrors.fetch_add(1);
+                }
+            }
+        }
+        piece = last;
+    }
+    int64_t const after = bytesOnDisk();
+    int64_t const freed = std::max<int64_t>(0, allocated - after);
+    m_reclaimedBytes.fetch_add(freed);
+    NSLog(@"PopcornTorrent bounded: allocation runaway, %lld MiB allocated for %lld MiB of data: "
+          "%d ranges without data punched, %lld MiB given back", allocated / kMiB, dataBytes / kMiB, ranges, freed / kMiB);
+    return freed;
 }
 
 void StreamController::sweepWaiters(PlanOutput const& plan) {

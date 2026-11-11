@@ -30,6 +30,8 @@ using namespace libtorrent;
     int64_t _storageReserve;
     int64_t _storageBudget;
     NSTimeInterval _mediaDurationHint;
+    NSTimeInterval _appWorkingSetSeconds;
+    int64_t _pendingExternalBytes;
     PTStorageMode _storageMode;
     // _status holds strings: it is written from the alerts queue and the main queue.
     std::mutex _statusMutex;
@@ -496,6 +498,8 @@ using namespace libtorrent;
     input.requestedBudget = self.storageBudget;
     input.durationSeconds = self.mediaDurationHint;
     input.allowBounded = self.allowsBoundedStorage;
+    input.appWorkingSetSeconds = self.appWorkingSetSeconds;
+    input.pendingExternalBytes = self.pendingExternalBytes;
     if (input.allowBounded && ![self volumeSupportsHolesAtPath:self.savePath]) {
         NSLog(@"PopcornTorrent: no hole punching on the volume of %@, bounded storage disabled", self.savePath);
         input.allowBounded = false;
@@ -509,7 +513,8 @@ using namespace libtorrent;
             NSString *description = [NSString localizedStringWithFormat:@"There is not enough space to download the torrent. Please clear at least %@ and try again.".localizedString, fileSize.stringValue];
             error = [[NSError alloc] initWithDomain:PTTorrentStreamerErrorDomain code:PTTorrentStreamerErrorNotEnoughSpace userInfo:@{NSLocalizedDescriptionKey: description}];
         } else {
-            PTSize *needed = [PTSize sizeWithLongLong:MAX(0, plan.minimumFreeBytes - input.freeBytes)];
+            int64_t const usableFree = MAX(0, input.freeBytes - input.pendingExternalBytes);
+            PTSize *needed = [PTSize sizeWithLongLong:MAX(0, plan.minimumFreeBytes - usableFree - input.heldBytes)];
             NSString *description = [NSString localizedStringWithFormat:@"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again.".localizedString, needed.stringValue];
             error = [[NSError alloc] initWithDomain:PTTorrentStreamerErrorDomain code:PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage userInfo:@{NSLocalizedDescriptionKey: description}];
         }
@@ -528,6 +533,7 @@ using namespace libtorrent;
     [self configureController:controller torrent:th fileIndex:file_index filePath:filePath bounded:bounded
                          plan:plan reserveBytes:input.reserveBytes fileExisted:input.heldBytes > 0 sharedTorrent:NO];
     if (controller && input.requestedBudget > 0) controller->setTorrentBudget(input.requestedBudget);
+    if (controller && input.pendingExternalBytes > 0) controller->setPendingExternalBytes(input.pendingExternalBytes);
 
     [self updateAndMonitorTorrentProgress];
 
@@ -881,6 +887,24 @@ using namespace libtorrent;
     @synchronized (self) { _mediaDurationHint = MAX(0, mediaDurationHint); }
 }
 
+- (NSTimeInterval)appWorkingSetSeconds {
+    @synchronized (self) { return _appWorkingSetSeconds; }
+}
+
+- (void)setAppWorkingSetSeconds:(NSTimeInterval)appWorkingSetSeconds {
+    @synchronized (self) { _appWorkingSetSeconds = MAX(0, appWorkingSetSeconds); }
+}
+
+- (int64_t)pendingExternalBytes {
+    @synchronized (self) { return _pendingExternalBytes; }
+}
+
+- (void)setPendingExternalBytes:(int64_t)pendingExternalBytes {
+    @synchronized (self) { _pendingExternalBytes = MAX(0, pendingExternalBytes); }
+    auto controller = [self controller];
+    if (controller) controller->setPendingExternalBytes(MAX(0, pendingExternalBytes));
+}
+
 - (PTStorageMode)storageMode {
     @synchronized (self) { return _storageMode; }
 }
@@ -976,6 +1000,7 @@ using namespace libtorrent;
         @"fileErrors": @(s.fileErrors),
         @"dontHaveSent": @(s.dontHaveSent),
         @"partialPiecesPunched": @(s.partialPunched),
+        @"reclaimedBytes": @(s.reclaimedBytes),
         @"waitingReads": @(s.waiters),
         @"downloadLimit": @(s.downloadLimit),
         @"paceState": @(s.paceState),

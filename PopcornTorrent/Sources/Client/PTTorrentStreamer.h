@@ -175,6 +175,16 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
 @property (atomic) NSTimeInterval mediaDurationHint;
 
 /**
+ Optional: seconds of media (at the file's bitrate) the app keeps on the same volume next to the whole file when it is downloaded in full (its own copy, such as HLS segments around the playhead). When `allowsBoundedStorage` is `YES`, full mode is chosen only if the file, `storageReserve` and this fit in the free space; otherwise the stream is bounded. 0 (default) = the file and the reserve alone, as before. Read when the metadata is received.
+ */
+@property (atomic) NSTimeInterval appWorkingSetSeconds;
+
+/**
+ Optional: bytes other writers of the same volume will still add while this stream runs (offline downloads in progress). Bounded storage does not count them as free space, both when it decides the mode and while it runs. Set it any time; 0 by default.
+ */
+@property (atomic) int64_t pendingExternalBytes;
+
+/**
  How the selected file is kept on disk. `PTStorageModeUndetermined` until the metadata is received.
  */
 @property (atomic, readonly) PTStorageMode storageMode;

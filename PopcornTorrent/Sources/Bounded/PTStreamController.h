@@ -94,6 +94,7 @@ struct StreamStatistics {
     int64_t fileErrors = 0;
     int64_t dontHaveSent = 0;
     int64_t partialPunched = 0;
+    int64_t reclaimedBytes = 0;     // allocation runaway: blocks punched out of regions with no data
     int64_t waiters = 0;
     int downloadLimit = 0;
     int paceState = 0;
@@ -117,6 +118,9 @@ public:
     void setReadPosition(int64_t offset);
     void setConsumedBefore(int64_t offset);
     void setTorrentBudget(int64_t bytes);
+    /// Bytes other writers of the volume (offline downloads in progress) will still add:
+    /// `freeBytes()` leaves them out.
+    void setPendingExternalBytes(int64_t bytes);
     int64_t readPosition() const { return m_readPosition.load(); }
     int64_t consumedBefore() const { return m_consumedBefore.load(); }
     /// Bounded: below it (apart from the pinned head) data is deleted or about to be. Exact at
@@ -137,6 +141,7 @@ public:
     /// Every piece of the file passed its hash check (on disk, or its write being confirmed).
     bool allPiecesHaveData() const;
     int64_t bytesOnDisk() const;
+    /// Free space of the volume as this stream may use it: minus the pending external bytes.
     int64_t freeBytes() const;
     std::pair<int, int> requiredProgress() const;
     float windowProgress() const;
@@ -180,6 +185,10 @@ private:
     void resetDeadlines(libtorrent::torrent& torrent);
     void releasePieces(libtorrent::torrent& torrent, std::vector<int32_t> const& pieces, uint8_t newState);
     void punchPartialPieces(libtorrent::torrent& torrent);
+    /// Allocation runaway backstop (network thread): the file holds far more blocks than
+    /// its data while the disk is short; punches every missing piece libtorrent has no
+    /// block of back to a hole. Returns the bytes punched.
+    int64_t reclaimAllocatedHoles(libtorrent::torrent& torrent, int64_t allocated, int64_t dataBytes);
     std::vector<uint8_t> snapshotStates() const;
     bool isPinnedOffset(int64_t offset) const;
     void sweepWaiters(PlanOutput const& plan);
@@ -220,6 +229,7 @@ private:
     std::atomic<int64_t> m_servedOffset{0};
     std::atomic<int64_t> m_everDownloaded{0};
     std::atomic<int64_t> m_requestedBudget{0};
+    std::atomic<int64_t> m_pendingExternal{0};
     std::atomic<int32_t> m_plannedReadPiece{-1};
     std::atomic<int32_t> m_plannedConsumedPiece{-1};
 
@@ -235,6 +245,8 @@ private:
     std::atomic<int64_t> m_aheadBudget{0}, m_lastFreeBytes{0};
     std::atomic<int64_t> m_freedPieces{0}, m_droppedPieces{0}, m_punchedBytes{0}, m_punchErrors{0};
     std::atomic<int64_t> m_diskFullEvents{0}, m_fileErrors{0}, m_dontHaveSent{0}, m_partialPunched{0};
+    std::atomic<int64_t> m_reclaimedBytes{0};
+    double m_lastReclaimTime = 0; // network thread
     std::atomic<int64_t> m_pendingPunches{0}, m_pendingPunchBytes{0}, m_allocatedBytes{0};
     std::atomic<int> m_downloadLimit{0}, m_paceState{0};
     std::atomic<int> m_windowTotal{0}, m_windowOnDisk{0};
