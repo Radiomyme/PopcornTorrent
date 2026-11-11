@@ -111,6 +111,18 @@ bool isPinned(FileGeometry const& geometry, PinSet const& pins, int32_t piece) {
     return false;
 }
 
+bool isConsumed(FileGeometry const& geometry, int32_t piece, int64_t consumedBefore) {
+    // One whole piece is kept below the consumed offset as a guard.
+    return geometry.pieceEnd(piece) + geometry.pieceLength <= consumedBefore;
+}
+
+bool isGone(FileGeometry const& geometry, PinSet const& pins, uint8_t state, int32_t piece,
+            int64_t consumedBefore) {
+    if (state == PieceFreed) return true;
+    if (state != PieceMissing && state != PieceDropping) return false; // on disk, or soon
+    return !isPinned(geometry, pins, piece) && isConsumed(geometry, piece, consumedBefore);
+}
+
 PlanOutput planWindow(PlanInput const& in) {
     PlanOutput out;
     FileGeometry const& geo = in.geometry;
@@ -121,8 +133,6 @@ PlanOutput planWindow(PlanInput const& in) {
     int32_t const last = geo.lastPiece();
     int const windowPieces = std::max(1, in.deadlinePieces);
     int64_t const consumed = in.bounded ? in.consumedBefore : 0;
-    // One whole piece is kept below the consumed offset as a guard.
-    int64_t const guardBytes = geo.pieceLength;
 
     out.priorities.assign(size_t(count), 0);
     out.readPiece = geo.pieceAt(in.readPosition);
@@ -153,8 +163,10 @@ PlanOutput planWindow(PlanInput const& in) {
             continue;
         }
 
-        if (in.bounded && geo.pieceEnd(piece) + guardBytes <= consumed) {
-            if (data) out.toFree.push_back(piece);
+        if (in.bounded && isConsumed(geo, piece, consumed)) {
+            // Only pieces confirmed on disk are freed: a piece still being verified may
+            // have blocks in libtorrent's cache, written after the hole is punched.
+            if (state == PieceOnDisk) out.toFree.push_back(piece);
             lowest = std::max(lowest, geo.pieceEnd(piece));
             continue; // priority 0
         }
@@ -194,8 +206,7 @@ PlanOutput planWindow(PlanInput const& in) {
         if (piece < first || piece > last) continue;
         size_t const i = size_t(piece - first);
         if ((*in.states)[i] != PieceMissing) continue;
-        bool const consumedPiece = in.bounded && !isPinned(geo, in.pins, piece)
-            && geo.pieceEnd(piece) + guardBytes <= consumed;
+        bool const consumedPiece = in.bounded && !isPinned(geo, in.pins, piece) && isConsumed(geo, piece, consumed);
         if (consumedPiece) continue;
         bool const scheduled = out.priorities[i] == 7 && std::any_of(out.deadlines.begin(), out.deadlines.end(),
             [piece](std::pair<int32_t, int> const& d) { return d.first == piece; });
@@ -210,14 +221,28 @@ PlanOutput planWindow(PlanInput const& in) {
     out.urgent = !out.deadlines.empty();
 
     // A piece the reader needs is late: until it is here, nothing beyond the ahead
-    // budget is wanted. Back to priority 1 afterwards (the torrent never "finishes"
-    // early, since the late piece is still wanted meanwhile).
+    // budget is wanted. Back to priority 1 afterwards.
+    // One missing piece beyond the cap stays wanted (the sentinel): otherwise the late
+    // piece can be the last wanted one, and libtorrent marks the torrent finished the
+    // moment it arrives, before the next plan wants the rest again. The sentinel is the
+    // next piece the window needs anyway, and it is kept for the whole late episode:
+    // once it is downloaded no other one is chosen, so at most one extra piece comes in.
     if (in.bounded && out.urgent && in.aheadLimitPieces > 0) {
         int32_t const capPiece = out.readPiece + std::max(in.aheadLimitPieces, windowPieces);
+        int32_t sentinel = -1;
+        bool spent = false;
+        if (in.capSentinel >= first && in.capSentinel <= last) {
+            size_t const i = size_t(in.capSentinel - first);
+            if ((*in.states)[i] != PieceMissing) spent = true;
+            else if (out.priorities[i] > 0) sentinel = in.capSentinel; // still wanted (a seek may have left it behind)
+        }
         for (int32_t piece = std::max(capPiece, first); piece <= last; ++piece) {
             size_t const i = size_t(piece - first);
-            if ((*in.states)[i] == PieceMissing && out.priorities[i] == 1) out.priorities[i] = 0;
+            if ((*in.states)[i] != PieceMissing || out.priorities[i] != 1) continue;
+            if (sentinel < 0 && !spent) sentinel = piece;
+            if (piece != sentinel) out.priorities[i] = 0;
         }
+        out.capSentinel = spent ? in.capSentinel : sentinel;
     }
 
     out.lowestAvailableOffset = in.bounded ? std::min(lowest, geo.fileSize) : 0;
@@ -237,6 +262,19 @@ std::vector<int32_t> piecesToDrop(PlanInput const& in, PlanOutput const& plan, i
         freed += geo.pieceBytes(piece);
     }
     return result;
+}
+
+int64_t consumedBetween(FileGeometry const& geo, std::vector<uint8_t> const& states,
+                        int64_t from, int64_t to, int64_t cap) {
+    if (!geo.valid() || to <= from || from < 0) return 0;
+    int32_t const first = geo.firstPiece();
+    if (int32_t(states.size()) < geo.pieceCount()) return 0;
+    for (int32_t piece = geo.pieceAt(from); piece <= geo.pieceAt(to - 1); ++piece) {
+        uint8_t const state = states[size_t(piece - first)];
+        // Freed and dropped pieces were on disk when the reader went through them.
+        if (state == PieceMissing || state == PieceVerifying) return 0;
+    }
+    return std::min(to - from, std::max<int64_t>(0, cap));
 }
 
 #pragma mark - Pace controller
@@ -278,6 +316,17 @@ PaceOutput pace(PaceInput const& in) {
         out.state = PaceState::Trickle;
     }
     return out;
+}
+
+int64_t excessAheadBytes(PaceInput const& in, int64_t pieceLength) {
+    if (in.urgent) return 0;
+    int64_t excess = 0;
+    int64_t const band = std::max(std::max<int64_t>(pieceLength, 16 * kKiB), in.aheadBudget / 8);
+    if (in.aheadBudget > 0 && in.aheadBytes > in.aheadBudget + band) excess = in.aheadBytes - in.aheadBudget;
+    if (in.freeBytes != INT64_MAX && in.freeBytes < in.reserveBytes) {
+        excess = std::max(excess, in.reserveBytes - in.freeBytes);
+    }
+    return excess;
 }
 
 #pragma mark - Container head parser

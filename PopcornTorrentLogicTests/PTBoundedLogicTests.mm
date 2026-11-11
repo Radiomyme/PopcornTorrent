@@ -8,6 +8,7 @@
 
 #import <XCTest/XCTest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -294,12 +295,30 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertEqual(plan.priorities[30], 1);  // on disk: unchanged
     XCTAssertEqual(plan.priorities[45], 0);  // beyond it: not wanted while the window is late
     XCTAssertEqual(plan.priorities[99], 7);  // pinned tail
+    // One missing piece beyond the cap stays wanted, so the late piece is never the last
+    // wanted one (libtorrent would mark the torrent finished and drop its seeds).
+    XCTAssertEqual(plan.capSentinel, 40);
+    XCTAssertEqual(plan.priorities[40], 1);
+    XCTAssertEqual(plan.priorities[41], 0);
+    // The same sentinel for the whole late episode...
+    input.capSentinel = plan.capSentinel;
+    plan = planWindow(input);
+    XCTAssertEqual(plan.capSentinel, 40);
+    XCTAssertEqual(plan.priorities[40], 1);
+    // ... and once it arrived, no other one: at most one extra piece per episode.
+    states[40] = PieceOnDisk;
+    input.capSentinel = plan.capSentinel;
+    plan = planWindow(input);
+    XCTAssertEqual(plan.capSentinel, 40);
+    XCTAssertEqual(plan.priorities[41], 0);
     // Window on disk: everything ahead is wanted again (paced instead).
     for (int i = 0; i < 4; ++i) states[size_t(i)] = PieceOnDisk;
     states[99] = PieceOnDisk;
+    input.capSentinel = plan.capSentinel;
     plan = planWindow(input);
     XCTAssertFalse(plan.urgent);
     XCTAssertEqual(plan.priorities[45], 1);
+    XCTAssertEqual(plan.capSentinel, -1);
     // Full mode is never capped.
     input.bounded = false;
     states[2] = PieceMissing;
@@ -352,6 +371,78 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertEqual(drop[2], 95);
     std::vector<int32_t> const all = piecesToDrop(input, plan, 1000 * kMiB);
     XCTAssertEqual(all.back(), plan.windowEndPiece);
+}
+
+- (void)testConsumedPiecesStillBeingVerifiedAreFreedLater {
+    FileGeometry const geo = geometry(0, 20 * kMiB, kMiB);
+    std::vector<uint8_t> states(20, PieceOnDisk);
+    states[5] = PieceVerifying; // passed the hash check, write not confirmed yet
+    PlanInput input;
+    input.geometry = geo;
+    input.bounded = true;
+    input.readPosition = 12 * kMiB;
+    input.consumedBefore = 10 * kMiB;
+    input.pins.headEnd = 1 * kMiB;
+    input.states = &states;
+    PlanOutput const plan = planWindow(input);
+    XCTAssertEqual(plan.toFree.size(), size_t(7)); // 1..8 without 5
+    XCTAssertTrue(std::find(plan.toFree.begin(), plan.toFree.end(), 5) == plan.toFree.end());
+    XCTAssertEqual(plan.priorities[5], 0);
+    XCTAssertEqual(plan.lowestAvailableOffset, 9 * kMiB);
+}
+
+- (void)testConsumedGapsAreGone {
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    PinSet pins;
+    pins.headEnd = 4 * kMiB;
+    pins.tailStart = 98 * kMiB;
+    int64_t const consumed = 50 * kMiB; // pieces 0..48 are consumed (one guard piece)
+    XCTAssertTrue(isGone(geo, pins, PieceFreed, 20, consumed));
+    XCTAssertTrue(isGone(geo, pins, PieceMissing, 20, consumed));   // skipped by a seek
+    XCTAssertTrue(isGone(geo, pins, PieceDropping, 20, consumed));
+    XCTAssertFalse(isGone(geo, pins, PieceOnDisk, 20, consumed));   // readable until freed
+    XCTAssertFalse(isGone(geo, pins, PieceVerifying, 20, consumed));
+    XCTAssertFalse(isGone(geo, pins, PieceMissing, 2, consumed));   // pinned head
+    XCTAssertFalse(isGone(geo, pins, PieceMissing, 49, consumed));  // guard piece
+    XCTAssertFalse(isGone(geo, pins, PieceMissing, 60, consumed));  // ahead
+}
+
+- (void)testSeeksAreNotConsumption {
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceMissing);
+    for (int i = 0; i <= 10; ++i) states[size_t(i)] = PieceOnDisk;
+    for (int i = 20; i <= 30; ++i) states[size_t(i)] = PieceOnDisk;
+    states[3] = PieceFreed;   // read, then released
+    states[4] = PieceDropping;
+    int64_t const noCap = 1 * kGiB;
+    XCTAssertEqual(consumedBetween(geo, states, 0, 8 * kMiB, noCap), 8 * kMiB);
+    XCTAssertEqual(consumedBetween(geo, states, 2 * kMiB, 11 * kMiB, noCap), 9 * kMiB);
+    // A forward seek over pieces that were never on disk.
+    XCTAssertEqual(consumedBetween(geo, states, 8 * kMiB, 25 * kMiB, noCap), 0);
+    XCTAssertEqual(consumedBetween(geo, states, 8 * kMiB, 8 * kMiB, noCap), 0);
+    XCTAssertEqual(consumedBetween(geo, states, 25 * kMiB, 8 * kMiB, noCap), 0); // rewind
+    // A jump inside data that is on disk only counts up to the cap.
+    XCTAssertEqual(consumedBetween(geo, states, 20 * kMiB, 30 * kMiB, 4 * kMiB), 4 * kMiB);
+}
+
+- (void)testExcessAheadKeepsDiskFlatDuringALongPause {
+    PaceInput input;
+    input.aheadBudget = 100 * kMiB;
+    input.freeBytes = 2 * kGiB;
+    input.reserveBytes = 512 * kMiB;
+    input.aheadBytes = 110 * kMiB; // within the floor band (12.5 %)
+    XCTAssertEqual(excessAheadBytes(input, 4 * kMiB), 0);
+    input.aheadBytes = 120 * kMiB; // past it: back down to the budget
+    XCTAssertEqual(excessAheadBytes(input, 4 * kMiB), 20 * kMiB);
+    input.aheadBytes = 104 * kMiB; // small budgets: the band is at least one piece
+    input.aheadBudget = 8 * kMiB;
+    XCTAssertEqual(excessAheadBytes(input, 16 * kMiB), 96 * kMiB);
+    input.aheadBudget = 100 * kMiB;
+    input.aheadBytes = 50 * kMiB;
+    input.freeBytes = 400 * kMiB; // below the reserve
+    XCTAssertEqual(excessAheadBytes(input, 4 * kMiB), 112 * kMiB);
+    input.urgent = true;          // the reader waits: never
+    XCTAssertEqual(excessAheadBytes(input, 4 * kMiB), 0);
 }
 
 #pragma mark - Pace controller

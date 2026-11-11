@@ -32,6 +32,8 @@ constexpr int64_t kHeadPinFallback = 32 * kMiB;
 constexpr int kTailPinPieces = 2;
 /// Runtime assumed when the app gives no duration (to estimate the bitrate from the size).
 constexpr double kAssumedDurationSeconds = 2 * 3600;
+/// Most bytes the head parser reads at one offset (an EBML element header, an MP4 box header).
+constexpr int64_t kHeadParserLookahead = 16;
 
 /// Piece states as seen by the streamer. This is not libtorrent's view: a piece
 /// is only `OnDisk` once its bytes are verified as written to the file.
@@ -122,6 +124,7 @@ struct PlanInput {
                                     // further than this from the read piece are not wanted, so a
                                     // late piece does not let the rest of the file fill the disk
                                     // (0 = no cap)
+    int32_t capSentinel = -1;       // `capSentinel` of the previous plan (-1 = none)
 };
 
 struct PlanOutput {
@@ -136,9 +139,19 @@ struct PlanOutput {
     int64_t pinnedBytes = 0;        // data in pinned pieces
     int64_t dataBytes = 0;          // all data of the file on disk (or being verified)
     int64_t lowestAvailableOffset = 0; // bounded: below this (apart from the head pin) data is gone
+    int32_t capSentinel = -1;       // bounded, late window: the one missing piece beyond the cap
+                                    // that stays wanted (see planWindow), -1 = cap not applied
 };
 
 bool isPinned(FileGeometry const& geometry, PinSet const& pins, int32_t piece);
+
+/// Bounded: the piece lies entirely below `consumedBefore` minus one guard piece.
+bool isConsumed(FileGeometry const& geometry, int32_t piece, int64_t consumedBefore);
+
+/// Bounded: the piece will never be readable again in this stream: freed, or consumed
+/// while it was not on disk (a gap skipped by a forward seek). Pins are never gone.
+bool isGone(FileGeometry const& geometry, PinSet const& pins, uint8_t state, int32_t piece,
+            int64_t consumedBefore);
 
 /// Plans priorities, deadlines and the pieces to free. Unbounded mode keeps
 /// today's behaviour: every piece of the file stays wanted and the deadline
@@ -148,6 +161,14 @@ PlanOutput planWindow(PlanInput const& input);
 /// Pieces with data to drop when the disk is full: farthest from the reader
 /// first, never pinned, never inside the deadline window.
 std::vector<int32_t> piecesToDrop(PlanInput const& input, PlanOutput const& plan, int64_t needBytes);
+
+/// Bytes the reader consumed between two samples of its position (`from` -> `to`), for
+/// the consumption rate. A move over data that was never on disk is a seek, not
+/// consumption (0): a reader only goes through pieces it could read. A sample is also
+/// capped at `cap`, so a jump inside the window cannot inflate the rate.
+/// `states` holds pieceCount() entries.
+int64_t consumedBetween(FileGeometry const& geometry, std::vector<uint8_t> const& states,
+                        int64_t from, int64_t to, int64_t cap);
 
 #pragma mark - Pace controller
 
@@ -174,6 +195,13 @@ struct PaceOutput {
 /// While libtorrent has time-critical pieces it keeps one normal request per peer, so
 /// the overshoot of an unthrottled urgent phase stays within the deadline window.
 PaceOutput pace(PaceInput const& input);
+
+/// Bytes ahead of the reader to drop so disk use stays flat while the reader does not
+/// move (a pause of any length): the floor and trickle rates keep bringing data in.
+/// Non-zero once the ahead data exceeds its budget by the floor band (12.5 %, at least
+/// one piece; then down to the budget), or the volume is below the reserve. Never while
+/// the reader waits for a piece.
+int64_t excessAheadBytes(PaceInput const& input, int64_t pieceLength);
 
 #pragma mark - Container head parser
 
