@@ -28,8 +28,13 @@ constexpr int64_t kDefaultReserveBytes = 512 * kMiB;
 constexpr int64_t kHeadPinLimit = 64 * kMiB;
 /// Head pin used when the container cannot be parsed (AVI, unknown, damaged).
 constexpr int64_t kHeadPinFallback = 32 * kMiB;
-/// Number of pieces pinned at the end of the file (MKV Cues, MP4 moov at the end).
+/// Fewest pieces pinned at the end of the file in bounded mode (MKV Cues, MP4 moov at the end).
 constexpr int kTailPinPieces = 2;
+/// Bytes the tail pin covers at least (MKV Cues, an MP4 moov stored at the end: a few MiB
+/// for a 2 h film), in whole pieces: see tailPinPieces.
+constexpr int64_t kTailPinBytes = 8 * kMiB;
+/// Most pieces of a tail pin made of small pieces (what the CocoaPods PopcornTorrent fetched).
+constexpr int kTailPinMaxPieces = 10;
 /// Runtime assumed when the app gives no duration (to estimate the bitrate from the size).
 constexpr double kAssumedDurationSeconds = 2 * 3600;
 /// Most bytes the head parser reads at one offset (an EBML element header, an MP4 box header).
@@ -64,6 +69,11 @@ struct FileGeometry {
     int64_t pieceEnd(int32_t piece) const;
     int64_t pieceBytes(int32_t piece) const { return pieceEnd(piece) - pieceBegin(piece); }
 };
+
+/// Pieces pinned at the end of the file (kept, fetched at top priority): enough
+/// whole pieces for kTailPinBytes, at least `minimumPieces`, at most kTailPinMaxPieces
+/// (unless `minimumPieces` is larger) and at most the file's pieces.
+int tailPinPieces(FileGeometry const& geometry, int minimumPieces);
 
 #pragma mark - Budget split
 
@@ -125,6 +135,9 @@ struct PlanInput {
                                     // late piece does not let the rest of the file fill the disk
                                     // (0 = no cap)
     int32_t capSentinel = -1;       // `capSentinel` of the previous plan (-1 = none)
+    int64_t urgentTailStart = -1;   // missing tail pins entirely below this offset get priority 7
+                                    // without a deadline (full mode: the byte-sized extension of
+                                    // the tail the stream does not wait for); -1 = every pin urgent
 };
 
 struct PlanOutput {
@@ -152,6 +165,18 @@ bool isConsumed(FileGeometry const& geometry, int32_t piece, int64_t consumedBef
 /// while it was not on disk (a gap skipped by a forward seek). Pins are never gone.
 bool isGone(FileGeometry const& geometry, PinSet const& pins, uint8_t state, int32_t piece,
             int64_t consumedBefore);
+
+/// Bounded: end of the highest piece that is consumed and not pinned (0 if none): data
+/// below it, apart from the pinned head, is deleted or about to be. Exact at call time
+/// (PlanOutput::lowestAvailableOffset lags until the next plan).
+int64_t consumedFloor(FileGeometry const& geometry, PinSet const& pins, int64_t consumedBefore);
+
+/// Lowest offset `start` <= `offset` such that every piece overlapping [start, offset) is
+/// readable and stays so: on disk and, in bounded mode, pinned or not consumed (consumed
+/// pieces are deleted within a second). `offset` itself when the byte before it is not.
+/// `states` holds pieceCount() entries.
+int64_t contiguousAvailableStart(FileGeometry const& geometry, std::vector<uint8_t> const& states,
+                                 PinSet const& pins, bool bounded, int64_t consumedBefore, int64_t offset);
 
 /// Plans priorities, deadlines and the pieces to free. Unbounded mode keeps
 /// today's behaviour: every piece of the file stays wanted and the deadline

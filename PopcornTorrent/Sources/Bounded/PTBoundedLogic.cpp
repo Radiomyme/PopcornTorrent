@@ -42,6 +42,14 @@ int64_t FileGeometry::pieceEnd(int32_t piece) const {
     return clampValue(end, 0, fileSize);
 }
 
+int tailPinPieces(FileGeometry const& geo, int minimumPieces) {
+    if (!geo.valid()) return std::max(1, minimumPieces);
+    int const minimum = std::max(1, minimumPieces);
+    int64_t const forBytes = (kTailPinBytes + geo.pieceLength - 1) / geo.pieceLength;
+    int64_t pieces = std::max<int64_t>(minimum, std::min<int64_t>(forBytes, kTailPinMaxPieces));
+    return int(std::min<int64_t>(pieces, geo.pieceCount()));
+}
+
 #pragma mark - Budget split
 
 BudgetPlan planBudget(BudgetInput const& in) {
@@ -66,7 +74,10 @@ BudgetPlan planBudget(BudgetInput const& in) {
 
     int64_t const pieceLength = std::max<int64_t>(in.pieceLength, 16 * kKiB);
     double const bps = plan.bytesPerSecond;
-    plan.pinBudget = kHeadPinLimit + kTailPinPieces * pieceLength;
+    FileGeometry whole;
+    whole.fileSize = in.fileSize;
+    whole.pieceLength = pieceLength;
+    plan.pinBudget = kHeadPinLimit + tailPinPieces(whole, kTailPinPieces) * pieceLength;
     plan.minAhead = roundUp(std::max<int64_t>(256 * kMiB, int64_t(60 * bps)), pieceLength);
     plan.inflightAllowance = std::max<int64_t>(32 * kMiB, 4 * pieceLength);
     // The app's own copy (HLS segments): 180 s of lookahead plus 60 s of rewind at least.
@@ -123,6 +134,36 @@ bool isGone(FileGeometry const& geometry, PinSet const& pins, uint8_t state, int
     return !isPinned(geometry, pins, piece) && isConsumed(geometry, piece, consumedBefore);
 }
 
+int64_t consumedFloor(FileGeometry const& geo, PinSet const& pins, int64_t consumedBefore) {
+    if (!geo.valid() || consumedBefore <= 0) return 0;
+    // The highest consumed piece is the one just below pieceAt(consumedBefore) minus the guard;
+    // pinned pieces (tail, MP4 moov) are skipped.
+    for (int32_t piece = geo.pieceAt(consumedBefore); piece >= geo.firstPiece(); --piece) {
+        if (!isConsumed(geo, piece, consumedBefore)) continue;
+        if (isPinned(geo, pins, piece)) {
+            if (pins.headEnd > 0 && geo.pieceBegin(piece) < pins.headEnd) return 0; // down to the head pin
+            continue;
+        }
+        return geo.pieceEnd(piece);
+    }
+    return 0;
+}
+
+int64_t contiguousAvailableStart(FileGeometry const& geo, std::vector<uint8_t> const& states,
+                                 PinSet const& pins, bool bounded, int64_t consumedBefore, int64_t offset) {
+    if (!geo.valid() || int32_t(states.size()) < geo.pieceCount()) return std::max<int64_t>(0, offset);
+    offset = clampValue(offset, 0, geo.fileSize);
+    if (offset == 0) return 0;
+    int32_t const first = geo.firstPiece();
+    auto available = [&](int32_t piece) {
+        if (states[size_t(piece - first)] != PieceOnDisk) return false;
+        return !bounded || isPinned(geo, pins, piece) || !isConsumed(geo, piece, consumedBefore);
+    };
+    int32_t piece = geo.pieceAt(offset - 1);
+    while (piece >= first && available(piece)) --piece;
+    return piece < first ? 0 : std::min(offset, geo.pieceEnd(piece));
+}
+
 PlanOutput planWindow(PlanInput const& in) {
     PlanOutput out;
     FileGeometry const& geo = in.geometry;
@@ -158,8 +199,11 @@ PlanOutput planWindow(PlanInput const& in) {
 
         if (pinned) {
             out.priorities[size_t(i)] = 7;
+            bool const headPinned = in.pins.headEnd > 0 && geo.pieceBegin(piece) < in.pins.headEnd;
+            bool const lazyTail = in.urgentTailStart >= 0 && !headPinned && piece != in.pins.extraPiece
+                && geo.pieceEnd(piece) <= in.urgentTailStart;
             if (data) out.pinnedBytes += bytes;
-            else missingPins.push_back(piece);
+            else if (!lazyTail) missingPins.push_back(piece);
             continue;
         }
 

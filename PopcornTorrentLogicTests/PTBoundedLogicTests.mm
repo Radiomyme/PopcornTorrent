@@ -407,6 +407,104 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertFalse(isGone(geo, pins, PieceMissing, 60, consumed));  // ahead
 }
 
+- (void)testTailPinIsByteSized {
+    // Pieces of 4 MiB and more: the 1 or 2 pieces of before cover the 8 MiB already.
+    XCTAssertEqual(tailPinPieces(geometry(0, 13 * kGB, 16 * kMiB), 2), 2);
+    XCTAssertEqual(tailPinPieces(geometry(0, 13 * kGB, 4 * kMiB), 2), 2);
+    XCTAssertEqual(tailPinPieces(geometry(0, 13 * kGB, 8 * kMiB), 1), 1);
+    // Small pieces: enough whole pieces for 8 MiB (MKV Cues, an MP4 moov at the end)...
+    XCTAssertEqual(tailPinPieces(geometry(0, 2 * kGB, 2 * kMiB), 2), 4);
+    XCTAssertEqual(tailPinPieces(geometry(0, 2 * kGB, 1 * kMiB), 1), 8);
+    // ... at most 10 of them, and never more than the file has.
+    XCTAssertEqual(tailPinPieces(geometry(0, 2 * kGB, 256 * kKiB), 2), kTailPinMaxPieces);
+    XCTAssertEqual(tailPinPieces(geometry(0, 3 * kMiB, 1 * kMiB), 2), 3);
+    // A file inside a multi-file torrent counts its own pieces.
+    XCTAssertEqual(tailPinPieces(geometry(5 * kMiB + 7, 3 * kMiB, 1 * kMiB), 1), 4);
+    // The bounded budget pins what the streamer pins.
+    BudgetInput input;
+    input.fileSize = 13 * kGB;
+    input.pieceLength = 1 * kMiB;
+    input.freeBytes = 3 * kGB;
+    BudgetPlan const plan = planBudget(input);
+    XCTAssertEqual(plan.decision, StorageDecision::Bounded);
+    XCTAssertEqual(plan.pinBudget, kHeadPinLimit + 8 * kMiB);
+}
+
+- (void)testFullModeWaitsOnlyForTheLastTailPieces {
+    // 1 MiB pieces: 8 tail pieces pinned, the stream waits for the last 2 (as before).
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceMissing);
+    for (int i = 0; i < 5; ++i) states[size_t(i)] = PieceOnDisk;
+    PlanInput input;
+    input.geometry = geo;
+    input.readPosition = 0;
+    input.pins.tailStart = 92 * kMiB;
+    input.urgentTailStart = 98 * kMiB;
+    input.deadlinePieces = 4;
+    input.deadlineFirstMs = 100;
+    input.states = &states;
+    PlanOutput const plan = planWindow(input);
+    for (int i = 92; i < 100; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 7);
+    std::vector<int32_t> deadlinePieces;
+    for (auto const& d : plan.deadlines) deadlinePieces.push_back(d.first);
+    XCTAssertEqual(deadlinePieces, (std::vector<int32_t>{5, 6, 7, 8, 98, 99}));
+    // Without the split every missing pin is time-critical.
+    input.urgentTailStart = -1;
+    XCTAssertEqual(planWindow(input).deadlines.size(), size_t(4 + 8));
+}
+
+- (void)testLowestAvailableOffsetFollowsTheConsumerAtOnce {
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    PinSet pins;
+    pins.headEnd = 4 * kMiB;
+    pins.tailStart = 98 * kMiB;
+    XCTAssertEqual(consumedFloor(geo, pins, 0), 0);
+    XCTAssertEqual(consumedFloor(geo, pins, 5 * kMiB), 0);          // only the head pin and the guard
+    XCTAssertEqual(consumedFloor(geo, pins, 6 * kMiB), 5 * kMiB);   // piece 4 is consumed
+    XCTAssertEqual(consumedFloor(geo, pins, 40 * kMiB), 39 * kMiB); // what planWindow reports
+    XCTAssertEqual(consumedFloor(geo, pins, 40 * kMiB + 1), 39 * kMiB);
+    // The pinned tail is never consumed.
+    XCTAssertEqual(consumedFloor(geo, pins, 100 * kMiB), 98 * kMiB);
+    std::vector<uint8_t> states(100, PieceOnDisk);
+    PlanInput input;
+    input.geometry = geo;
+    input.bounded = true;
+    input.readPosition = 50 * kMiB;
+    input.consumedBefore = 40 * kMiB;
+    input.pins = pins;
+    input.states = &states;
+    XCTAssertEqual(planWindow(input).lowestAvailableOffset, consumedFloor(geo, pins, 40 * kMiB));
+}
+
+- (void)testContiguousAvailableStartForRewinds {
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    PinSet pins;
+    pins.headEnd = 4 * kMiB;
+    pins.tailStart = 98 * kMiB;
+    std::vector<uint8_t> states(100, PieceMissing);
+    for (int i = 0; i < 4; ++i) states[size_t(i)] = PieceOnDisk;    // head pin
+    for (int i = 4; i < 20; ++i) states[size_t(i)] = PieceFreed;
+    for (int i = 20; i <= 60; ++i) states[size_t(i)] = PieceOnDisk;
+    states[45] = PieceMissing;                                      // gap left by a forward seek
+    states[30] = PieceVerifying;                                    // passed, not confirmed written
+    int64_t const consumed = 25 * kMiB;                             // pieces 20..23 consumed, not freed yet
+    // From the reader at 58.5 MiB back to the gap: 46..58 are on disk.
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, true, consumed, 58 * kMiB + kMiB / 2), 46 * kMiB);
+    // Below the gap: back to the piece being verified.
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, true, consumed, 44 * kMiB), 31 * kMiB);
+    // Consumed pieces still on disk do not count (they are deleted within a second)...
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, true, consumed, 30 * kMiB), 24 * kMiB);
+    // ... in full mode they do.
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, false, consumed, 30 * kMiB), 20 * kMiB);
+    // The pinned head is always readable.
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, true, consumed, 3 * kMiB + 5), 0);
+    // A byte whose predecessor is missing: nothing before it.
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, true, consumed, 46 * kMiB), 46 * kMiB);
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, true, consumed, 0), 0);
+    // Clamped to the file.
+    XCTAssertEqual(contiguousAvailableStart(geo, states, pins, true, consumed, 200 * kMiB), 100 * kMiB);
+}
+
 - (void)testSeeksAreNotConsumption {
     FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
     std::vector<uint8_t> states(100, PieceMissing);
