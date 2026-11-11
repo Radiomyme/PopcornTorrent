@@ -189,6 +189,8 @@ private:
     /// its data while the disk is short; punches every missing piece libtorrent has no
     /// block of back to a hole. Returns the bytes punched.
     int64_t reclaimAllocatedHoles(libtorrent::torrent& torrent, int64_t allocated, int64_t dataBytes);
+    /// Bounded: gives the file its final size as a hole once libtorrent created it (any thread).
+    void presizeFile();
     std::vector<uint8_t> snapshotStates() const;
     bool isPinnedOffset(int64_t offset) const;
     void sweepWaiters(PlanOutput const& plan);
@@ -246,6 +248,7 @@ private:
     std::atomic<int64_t> m_freedPieces{0}, m_droppedPieces{0}, m_punchedBytes{0}, m_punchErrors{0};
     std::atomic<int64_t> m_diskFullEvents{0}, m_fileErrors{0}, m_dontHaveSent{0}, m_partialPunched{0};
     std::atomic<int64_t> m_reclaimedBytes{0};
+    std::atomic<bool> m_presized{false};
     double m_lastReclaimTime = 0; // network thread
     std::atomic<int64_t> m_pendingPunches{0}, m_pendingPunchBytes{0}, m_allocatedBytes{0};
     std::atomic<int> m_downloadLimit{0}, m_paceState{0};

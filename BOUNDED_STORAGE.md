@@ -282,6 +282,14 @@ on disk (`onDiskToTheEnd`): nothing more is downloaded then, and the consumer ma
 the rest of the file as final (the app's remux marks its input complete there, cuts
 its last segment, and reads zeros as data from then on).
 
+The file gets its final size at once in bounded mode (`presizeFile`: `ftruncate`, a hole
+on APFS), as soon as libtorrent has created it and before the tail pins are written: in
+the app's offline end-to-end runs, the first write of a tail pin, which extended the file
+by gigabytes, was followed in 2 of 7 starts (and once more in this round) by the
+allocation of the whole gap within a second. With the file already at its size, later
+writes far into it no longer extend it (an `ftruncate`-extended file stayed sparse in
+every probe, and a 4 MiB write at its end allocated 4 MiB).
+
 Backstop, allocation runaway (`reclaimAllocatedHoles`): in the offline end-to-end runs
 of the app the file's allocation twice grew to nearly the whole file within a second of
 the first write of the tail pins, while its data was a few pieces (cause not found:
@@ -291,7 +299,8 @@ stayed in upload mode. While free space is below the reserve and the file holds 
 than its data, its pieces' partial downloads, the pending holes and the in-flight
 allowance plus max(64 MiB, 4 pieces), every missing piece libtorrent has no block of
 (not in its download queue) is punched back to a hole, on the network thread (no block
-can be requested meanwhile), at most every 2 s. Statistics key `reclaimedBytes`; the
+can be requested meanwhile), in 64 MiB steps, at most every 2 s (a failed step is logged
+with its errno). Statistics key `reclaimedBytes`; the
 `PT_BOUNDED_DEBUG` trace and the console log `allocation runaway`.
 
 In bounded mode a `file_error_alert` with ENOSPC/EDQUOT does not end the stream:

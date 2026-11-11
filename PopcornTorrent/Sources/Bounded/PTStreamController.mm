@@ -677,6 +677,7 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     std::vector<uint8_t> states = snapshotStates();
 
     bool const bounded = m_bounded.load();
+    if (bounded && !checking && !m_presized.load()) presizeFile();
     PlanInput input;
     input.geometry = m_config.geometry;
     input.bounded = bounded;
@@ -968,6 +969,29 @@ void StreamController::punchPartialPieces(lt::torrent& torrent) {
     }
 }
 
+void StreamController::presizeFile() {
+    // The first write of a tail pin used to extend the file by gigabytes at once. In the app's
+    // offline runs APFS then sometimes allocated the whole gap within a second (2 of 7 starts:
+    // the volume filled up, libtorrent stayed in upload mode); the kernel path that does it was
+    // not found, and no probe reproduced it. A file extended with ftruncate stays a hole on
+    // APFS (checked), and later writes far into it no longer extend it. libtorrent creates the
+    // file on its first write; this runs once it exists, before the tail pins are written.
+    if (m_presized.load() || m_cancelled.load() || !m_bounded.load()) return;
+    int const fd = fileDescriptor();
+    if (fd < 0) return; // not created yet: on the next plan
+    std::shared_lock<std::shared_mutex> lock(m_fdLock);
+    if (fd != m_fd || m_cancelled.load()) return;
+    struct stat info;
+    if (fstat(fd, &info) != 0 || m_presized.exchange(true)) return;
+    int64_t const size = m_config.geometry.fileSize;
+    if (info.st_size >= size) return;
+    if (ftruncate(fd, off_t(size)) == 0) {
+        NSLog(@"PopcornTorrent bounded: file sized to %lld bytes up front (a hole; it held %lld)", size, int64_t(info.st_size));
+    } else {
+        NSLog(@"PopcornTorrent bounded: could not size the file up front (errno %d)", errno);
+    }
+}
+
 int64_t StreamController::reclaimAllocatedHoles(lt::torrent& torrent, int64_t allocated, int64_t dataBytes) {
     FileGeometry const& geo = m_config.geometry;
     int64_t const pieceLength = geo.pieceLength;
@@ -1001,13 +1025,19 @@ int64_t StreamController::reclaimAllocatedHoles(lt::torrent& torrent, int64_t al
         if (end > begin) {
             std::shared_lock<std::shared_mutex> lock(m_fdLock);
             if (fd == m_fd && !m_cancelled.load()) {
-                fpunchhole_t hole = {0, 0, off_t(begin), off_t(end - begin)};
-                if (fcntl(fd, F_PUNCHHOLE, &hole) == 0) {
-                    punched += end - begin;
-                    ++ranges;
-                } else {
-                    m_punchErrors.fetch_add(1);
+                // In 64 MiB steps: each one gives its space back before the next.
+                for (int64_t from = begin; from < end; from += 64 * kMiB) {
+                    int64_t const to = std::min(end, from + 64 * kMiB);
+                    fpunchhole_t hole = {0, 0, off_t(from), off_t(to - from)};
+                    if (fcntl(fd, F_PUNCHHOLE, &hole) == 0) {
+                        punched += to - from;
+                    } else {
+                        m_punchErrors.fetch_add(1);
+                        NSLog(@"PopcornTorrent bounded: F_PUNCHHOLE failed for [%lld, %lld) (errno %d)", from, to, errno);
+                        break;
+                    }
                 }
+                ++ranges;
             }
         }
         piece = last;
