@@ -3,6 +3,7 @@
 #import "PTTorrentDownload.h"
 #import "PTSize.h"
 #import "PTTorrentStreamer+Protected.h"
+#import "PTTorrentsSession+Protected.h"
 #import "PTTorrentDownloadManagerListener.h"
 #import <MediaPlayer/MPMediaItem.h>
 #if TARGET_OS_IOS || TARGET_OS_TV
@@ -197,10 +198,17 @@ using namespace libtorrent;
 - (void)pause {
     if (_downloadStatus != PTTorrentDownloadStatusDownloading) return;
     
-    // Not auto-managed any more, or libtorrent's auto-manager resumes the paused download.
+    // A stream reading this download's file keeps the torrent running: it is paused when the
+    // last such stream stops (sharedTorrentDidLoseGuests).
+    if (![self.session hasGuests:self]) [self pauseTorrent];
+    [self setDownloadStatus:PTTorrentDownloadStatusPaused];
+}
+
+- (void)pauseTorrent {
+    if (!self.torrentHandle.is_valid()) return;
+    // Never auto-managed (libtorrent's auto-manager would resume the paused download).
     self.torrentHandle.unset_flags(torrent_flags::auto_managed);
     self.torrentHandle.pause(torrent_handle::graceful_pause);
-    [self setDownloadStatus:PTTorrentDownloadStatusPaused];
 }
 
 - (void)resume {
@@ -217,6 +225,25 @@ using namespace libtorrent;
     }
 
     [self setDownloadStatus:PTTorrentDownloadStatusDownloading];
+}
+
+#pragma mark - Shared torrent (a stream of the same torrent reads this download's file)
+
+- (BOOL)canJoinSharedTorrent {
+    return NO; // a download keeps its own copy of the file
+}
+
+- (BOOL)handsTorrentOverToGuests {
+    return NO; // finished or stopped, the download removes its torrent; its file stays its own
+}
+
+- (void)sharedTorrentWillGainGuests {
+    // A paused download runs while a stream reads it.
+    if (_downloadStatus == PTTorrentDownloadStatusPaused && self.torrentHandle.is_valid()) self.torrentHandle.resume();
+}
+
+- (void)sharedTorrentDidLoseGuests {
+    if (_downloadStatus == PTTorrentDownloadStatusPaused) [self pauseTorrent];
 }
 
 - (BOOL)delete {

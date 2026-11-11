@@ -10,3 +10,9 @@
 
 /* (No Commment) */
 "There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "Non c'è abbastanza spazio per riprodurre questo video, nemmeno con lo spazio limitato. Cancella almeno %1$@ e riprova.";
+
+/* A stream cannot start: the same torrent is already streamed (in a way that cannot be shared) or downloaded. */
+"This video is already being played or downloaded. Stop the other playback or the download, then try again." = "Questo video è già in riproduzione o in download. Interrompi l'altra riproduzione o il download, poi riprova.";
+
+/* A stream that was reading the file of an offline download of the same torrent stops: the download was stopped before the file was complete. */
+"This video was playing from its download, and the download was stopped." = "Questo video veniva riprodotto dal suo download, e il download è stato interrotto.";

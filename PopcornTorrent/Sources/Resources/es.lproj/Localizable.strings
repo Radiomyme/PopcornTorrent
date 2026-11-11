@@ -8,4 +8,10 @@
 "Could not create download directory" = "No se pudo crear el directorio de descarga";
 
 /* (No Commment) */
-"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "No hay suficiente espacio para reproducir este vídeo, ni siquiera con almacenamiento limitado. Por favor, borre al menos %1$@ y vuelva a intentarlo.";
+"There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "No hay suficiente espacio para reproducir este vídeo, ni siquiera con almacenamiento limitado. Libera al menos %1$@ y vuelve a intentarlo.";
+
+/* A stream cannot start: the same torrent is already streamed (in a way that cannot be shared) or downloaded. */
+"This video is already being played or downloaded. Stop the other playback or the download, then try again." = "Este vídeo ya se está reproduciendo o descargando. Detén la otra reproducción o la descarga y vuelve a intentarlo.";
+
+/* A stream that was reading the file of an offline download of the same torrent stops: the download was stopped before the file was complete. */
+"This video was playing from its download, and the download was stopped." = "Este vídeo se estaba reproduciendo desde su descarga, y la descarga se ha detenido.";

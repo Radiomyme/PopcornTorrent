@@ -33,6 +33,8 @@ using namespace libtorrent;
     PTStorageMode _storageMode;
     // _status holds strings: it is written from the alerts queue and the main queue.
     std::mutex _statusMutex;
+    // This stream joined a torrent another streamer of the session added (see joinTorrent:).
+    BOOL _guest;
 }
 
 - (instancetype)init {
@@ -179,10 +181,12 @@ using namespace libtorrent;
     }
 
     Boolean didTryFastResume = false;
+    BOOL createdDirectory = NO;
 
     _savePath = [basePath stringByAppendingPathComponent:pathComponent];
     //create folder for torrents
     if (![[NSFileManager defaultManager] fileExistsAtPath:_savePath]) {
+        createdDirectory = YES;
         NSError *error;
         [[NSFileManager defaultManager] createDirectoryAtPath:self.savePath
                                   withIntermediateDirectories:YES
@@ -218,14 +222,20 @@ using namespace libtorrent;
     NSError *error;
     _torrentHandle = [self.session addTorrent:self params:tp error:&error];
 
-    // torrent exists, give it a new session, so there is no interference
+    // The torrent is already in the session: an offline download in progress (or a stream
+    // in full mode). Join it: read its file, no second download, no second session.
     if (error && error.code == -2) {
         error = nil;
-        self.session = [[PTTorrentsSession alloc] init];
-        self.deleteOnlyDownloadedFile = YES;
-        PTTorrentStreamer *existing = [[PTTorrentsSession sharedSession] torrentStreamerForTorrentHandle:_torrentHandle];
-        existing.deleteOnlyDownloadedFile = YES;
-        _torrentHandle = [self.session addTorrent:self params:tp error:&error];
+        _torrentHandle = [self.session joinTorrent:self params:tp error:&error];
+        if (!error) {
+            _guest = YES;
+            NSString *ownDirectory = _savePath;
+            _savePath = [self.session ownerOfGuest:self].savePath ?: _savePath;
+            if (createdDirectory && ![ownDirectory isEqualToString:_savePath]) {
+                [[NSFileManager defaultManager] removeItemAtPath:ownDirectory error:nil];
+            }
+            NSLog(@"PopcornTorrent: %@ is already in the session, this stream reads its file in %@", filePathOrMagnetLink.lastPathComponent, _savePath);
+        }
     }
 
     if (error) {
@@ -275,13 +285,31 @@ using namespace libtorrent;
 - (void)cancelStreamingAndDeleteData:(BOOL)deleteData {
     auto controller = std::atomic_exchange(&_controller, std::shared_ptr<ptbounded::StreamController>());
     BOOL const bounded = self.storageMode == PTStorageModeBounded;
-    if (controller) controller->cancel();
-    // A file with deleted pieces cannot be resumed: bounded mode always deletes it.
-    if (bounded) deleteData = YES;
-
-    [self.session removeTorrent:self
-                    deleteFiles:deleteData && !self.deleteOnlyDownloadedFile
-                 saveResumeData:!bounded];
+    BOOL const guest = _guest;
+    // Whether the files are this streamer's to delete.
+    BOOL ownsFiles = !guest;
+    if (guest) {
+        // The torrent and its files belong to the streamer this stream joined (a download):
+        // never removed, paused or deleted here. Our window stops driving the torrent and
+        // the one before ours (the download's) drives it again.
+        _guest = NO;
+        auto next = [self.session leaveTorrent:self];
+        if (controller) controller->detach(next);
+        else if (next) next->resumePlanning();
+        if (controller) controller->cancel();
+    } else {
+        // A file with deleted pieces cannot be resumed: bounded mode always deletes it.
+        if (bounded) deleteData = YES;
+        BOOL const handedOver = [self.session removeTorrent:self deleteFiles:deleteData saveResumeData:!bounded];
+        if (handedOver) {
+            // Streams joined this (full-mode) stream: the oldest one now owns the torrent and
+            // its files. Only our plugin goes.
+            ownsFiles = NO;
+            if (controller) controller->detach(nullptr);
+        }
+        if (controller) controller->cancel();
+    }
+    _torrentHandle = libtorrent::torrent_handle();
 
     required_pieces.clear();
     required_pieces.shrink_to_fit();
@@ -305,14 +333,9 @@ using namespace libtorrent;
         _storageMode = PTStorageModeUndetermined;
     }
 
-    if (deleteData) {
-        if (self.deleteOnlyDownloadedFile) {
-            NSString *filePath = [self.savePath stringByAppendingPathComponent:_fileName];
-            [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
-        } else {
-            // delete whole directory
-            [[NSFileManager defaultManager] removeItemAtPath:self.savePath error:nil];
-        }
+    if (deleteData || !ownsFiles) {
+        // delete whole directory
+        if (deleteData && ownsFiles) [[NSFileManager defaultManager] removeItemAtPath:self.savePath error:nil];
         _savePath = nil;
         _fileName = nil;
         _requiredSpace = 0;
@@ -437,6 +460,12 @@ using namespace libtorrent;
 
 - (void)metadataReceivedAlert:(torrent_handle)th {
     auto controller = [self controller];
+    // The alert and the direct call at start (metadata already there) may both come.
+    if (controller && controller->isConfigured()) return;
+    if (_guest) {
+        [self guestMetadataReceivedAlert:th];
+        return;
+    }
     int selectedIndex = [self selectedFileIndexInTorrent:th];
     file_index_t file_index = file_index_t(selectedIndex);
 
@@ -491,6 +520,79 @@ using namespace libtorrent;
     @synchronized (self) {
         _storageMode = bounded ? PTStorageModeBounded : PTStorageModeFull;
     }
+    if (bounded) {
+        NSLog(@"PopcornTorrent: bounded storage for %@ (%lld bytes, %lld free, torrent budget %lld, reserve %lld)",
+              _fileName, file_size, input.freeBytes, plan.torrentBudget, input.reserveBytes);
+    }
+
+    [self configureController:controller torrent:th fileIndex:file_index filePath:filePath bounded:bounded
+                         plan:plan reserveBytes:input.reserveBytes fileExisted:input.heldBytes > 0 sharedTorrent:NO];
+    if (controller && input.requestedBudget > 0) controller->setTorrentBudget(input.requestedBudget);
+
+    [self updateAndMonitorTorrentProgress];
+
+    // file already downloaded
+    if (_isFinished) {
+        [self torrentFinishedAlert:th];
+        return;
+    }
+}
+
+/// A stream that joined a torrent another streamer added (an offline download): it reads
+/// that streamer's file, in full mode (the download keeps the whole file anyway: no space
+/// check), with its own window, piece states and verification (its own plugin).
+- (void)guestMetadataReceivedAlert:(torrent_handle)th {
+    auto controller = [self controller];
+    if (!controller || !_guest) return;
+    PTTorrentStreamer *owner = [self.session ownerOfGuest:self];
+    int const ownerIndex = owner ? owner->selectedFileIndex : -1;
+    if (owner && ownerIndex < 0) {
+        // The owner has not processed this metadata yet (it gets the alert first): look again.
+        __weak __typeof__(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __typeof__(self) strongSelf = weakSelf;
+            if (strongSelf && strongSelf->_torrentHandle.is_valid()) [strongSelf metadataReceivedAlert:strongSelf->_torrentHandle];
+        });
+        return;
+    }
+    int const selectedIndex = [self selectedFileIndexInTorrent:th];
+    if (owner == nil || ownerIndex != selectedIndex) {
+        // Another file of the torrent: its priorities are the owner's (one file per torrent).
+        NSString *description = @"This video is already being played or downloaded. Stop the other playback or the download, then try again.".localizedString;
+        [self handleTorrentError:[NSError errorWithDomain:PTTorrentStreamerErrorDomain code:PTTorrentStreamerErrorTorrentInUse userInfo:@{NSLocalizedDescriptionKey: description}]];
+        return;
+    }
+    file_index_t const file_index = file_index_t(selectedIndex);
+    auto ti = th.torrent_file();
+    _requiredSpace = ti->files().file_size(file_index);
+    _fileName = [NSString stringWithCString:ti->files().file_path(file_index).c_str() encoding:NSUTF8StringEncoding];
+    if (owner.savePath) _savePath = owner.savePath;
+    NSString *filePath = [self.savePath stringByAppendingPathComponent:_fileName];
+    @synchronized (self) {
+        _storageMode = PTStorageModeFull;
+    }
+    ptbounded::BudgetPlan plan;
+    plan.decision = ptbounded::StorageDecision::Full;
+    [self configureController:controller torrent:th fileIndex:file_index filePath:filePath bounded:NO
+                         plan:plan reserveBytes:self.storageReserve fileExisted:YES sharedTorrent:YES];
+    th.add_extension(ptbounded::makeStreamPluginFactory(controller));
+
+    [self updateAndMonitorTorrentProgress];
+    if (_isFinished) [self torrentFinishedAlert:th];
+}
+
+/// The controller of this stream: window, pins, pieces needed before it is ready, hashes.
+- (void)configureController:(std::shared_ptr<ptbounded::StreamController> const &)controller
+                    torrent:(torrent_handle const &)th
+                  fileIndex:(file_index_t)file_index
+                   filePath:(NSString *)filePath
+                    bounded:(BOOL)bounded
+                       plan:(ptbounded::BudgetPlan const &)plan
+               reserveBytes:(int64_t)reserveBytes
+                fileExisted:(BOOL)fileExisted
+              sharedTorrent:(BOOL)sharedTorrent {
+    auto ti = th.torrent_file();
+    int64_t const file_size = ti->files().file_size(file_index);
 
     // download first pieces
     MIN_PIECES = (ti->files().file_size(file_index) * 0.03) / ti->piece_length();
@@ -503,10 +605,17 @@ using namespace libtorrent;
     config.geometry.pieceLength = ti->piece_length();
     config.budget = plan;
     config.bounded = bounded;
-    config.reserveBytes = input.reserveBytes;
+    config.reserveBytes = reserveBytes;
     config.filePath = std::string(filePath.fileSystemRepresentation);
     config.directoryPath = std::string(self.savePath.fileSystemRepresentation);
-    config.fileExisted = input.heldBytes > 0;
+    config.fileExisted = fileExisted;
+    config.sharedTorrent = sharedTorrent;
+    // The tail a player reads at open (MKV Cues, an MP4 moov stored at the end) is pinned at
+    // top priority: at least kTailPinBytes in whole pieces (at most 10 pieces), never fewer
+    // pieces than before. The stream still waits only for the last 1 or 2 of them, as before
+    // (full mode: only those get deadlines; the rest come right after the head window).
+    int const tailPieces = ptbounded::tailPinPieces(config.geometry, bounded ? ptbounded::kTailPinPieces : maxEndPieces);
+    config.urgentTailPieces = bounded ? 0 : maxEndPieces;
     if (bounded) {
         // A window of at least 32 MiB at top priority, fetched first by the sequential
         // picker. No libtorrent deadlines here: while time-critical pieces exist it keeps
@@ -516,17 +625,15 @@ using namespace libtorrent;
         int window = std::max<int>(MIN_PIECES, int((32 * ptbounded::kMiB + pieceLength - 1) / pieceLength));
         window = std::min<int>(window, int(std::max<int64_t>(2, plan.minAhead / pieceLength / 2)));
         config.windowPieces = std::max(2, std::min(window, 32));
-        config.tailPieces = ptbounded::kTailPinPieces;
+        config.tailPieces = tailPieces;
         config.deadlineFirstMs = PIECE_DEADLINE_MILLIS;
         config.deadlineStepMs = 20;
         config.useDeadlines = false;
-        NSLog(@"PopcornTorrent: bounded storage for %@ (%lld bytes, %lld free, torrent budget %lld, reserve %lld)",
-              _fileName, file_size, input.freeBytes, plan.torrentBudget, input.reserveBytes);
     } else {
         // Same window as before: the next MIN_PIECES missing pieces, 100 ms deadlines,
         // the last pieces at top priority.
         config.windowPieces = MIN_PIECES;
-        config.tailPieces = maxEndPieces;
+        config.tailPieces = tailPieces;
         config.deadlineFirstMs = PIECE_DEADLINE_MILLIS;
         config.deadlineStepMs = 0;
     }
@@ -570,18 +677,7 @@ using namespace libtorrent;
         sha1_hash const hash = ti->hash_for_piece(piece);
         std::memcpy(&config.pieceHashes[size_t(i) * 20], hash.data(), 20);
     }
-    if (controller) {
-        controller->configure(config);
-        if (input.requestedBudget > 0) controller->setTorrentBudget(input.requestedBudget);
-    }
-
-    [self updateAndMonitorTorrentProgress];
-
-    // file already downloaded
-    if (_isFinished) {
-        [self torrentFinishedAlert:th];
-        return;
-    }
+    if (controller) controller->configure(config);
 }
 
 /// Status shared by the 0.5 s monitor and the piece / finished alerts.
@@ -681,7 +777,60 @@ using namespace libtorrent;
     });
 
     // Stop the finished torrent (no seeding); it is removed from the session at cancel.
-    [self.session finishTorrent:self];
+    // A stream that joined a download's torrent leaves that to the download.
+    if (!_guest) [self.session finishTorrent:self];
+}
+
+#pragma mark - Shared torrents
+
+- (BOOL)isGuest {
+    return _guest;
+}
+
+- (BOOL)canJoinSharedTorrent {
+    return YES;
+}
+
+- (BOOL)canShareTorrentWithGuests {
+    if (_guest) return NO;
+    // A bounded stream deletes what its reader consumed: nobody else can read its file.
+    PTStorageMode const mode = self.storageMode;
+    return mode == PTStorageModeFull || (mode == PTStorageModeUndetermined && !self.allowsBoundedStorage);
+}
+
+- (BOOL)handsTorrentOverToGuests {
+    // A stream gives its torrent (and its files) to the streams that joined it; a download
+    // keeps its own (PTTorrentDownload).
+    return YES;
+}
+
+- (void)sharedTorrentWillGainGuests {}
+
+- (void)sharedTorrentDidLoseGuests {}
+
+- (void)sharedTorrentBecameOwned {
+    // The streamer this stream joined left and handed its torrent over: from now on this
+    // stream owns it (and its files), as if it had added it.
+    _guest = NO;
+}
+
+- (void)sharedTorrentRemovedByOwner:(BOOL)deletedFiles {
+    if (!_guest) return;
+    // The torrent is gone: nothing to drive or query any more.
+    _torrentHandle = libtorrent::torrent_handle();
+    auto controller = [self controller];
+    if (!deletedFiles && controller && controller->allPiecesHaveData()) {
+        // The download finished: the whole file is there, keep reading it.
+        _isFinished = true;
+        _torrentStatus.bufferingProgress = 1;
+        _torrentStatus.totalProgress = 1;
+        _totalDownloaded = _requiredSpace;
+        if (_progressBlock) _progressBlock(_torrentStatus);
+        [[NSNotificationCenter defaultCenter] postNotificationName:PTTorrentStatusDidChangeNotification object:self];
+        return;
+    }
+    NSString *description = @"This video was playing from its download, and the download was stopped.".localizedString;
+    [self handleTorrentError:[NSError errorWithDomain:PTTorrentStreamerErrorDomain code:PTTorrentStreamerErrorSharedTorrentRemoved userInfo:@{NSLocalizedDescriptionKey: description}]];
 }
 
 @synthesize status = _status;
@@ -778,6 +927,11 @@ using namespace libtorrent;
 - (BOOL)isRangeAvailable:(int64_t)fileOffset length:(int64_t)length {
     auto controller = [self controller];
     return controller ? controller->isRangeOnDisk(fileOffset, length) : NO;
+}
+
+- (int64_t)contiguousAvailableOffsetBefore:(int64_t)fileOffset {
+    auto controller = [self controller];
+    return controller ? controller->contiguousAvailableStart(fileOffset) : MAX(0, fileOffset);
 }
 
 - (BOOL)isFileComplete {

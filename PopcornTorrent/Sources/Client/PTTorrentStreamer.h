@@ -57,6 +57,10 @@ typedef NS_ERROR_ENUM(PTTorrentStreamerErrorDomain, PTTorrentStreamerError) {
     PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage = -5,
     /// Another file error (I/O error, permissions...) stopped the torrent. `NSLocalizedDescriptionKey` is libtorrent's message.
     PTTorrentStreamerErrorFile = -6,
+    /// The torrent is already used by this app in a way that cannot be shared: a bounded stream of it, a stream of another file of it, or (for a download) any stream or download of it. Stop the other one and try again.
+    PTTorrentStreamerErrorTorrentInUse = -7,
+    /// This stream was reading the file of an offline download of the same torrent (see `cancelStreamingAndDeleteData:`), and the download was stopped or removed before the file was complete.
+    PTTorrentStreamerErrorSharedTorrentRemoved = -8,
 };
 
 /**
@@ -103,6 +107,8 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
 
 /**
  Cancels loading of the current torrent and optionally clears the download directory. The torrent is removed from the session (it no longer downloads or uploads in the background).
+
+ A stream of a torrent that an offline download of this app (`PTTorrentDownload`) is downloading does not download it a second time: it reads the download's file (always in full mode) and its window drives the torrent while it plays. Cancelling such a stream never removes, pauses or deletes anything of the download, whatever `deleteData` is; the download goes on as before.
  
  @param deleteData  Pass `YES` to clear the download directory, `NO` to keep the downloaded directory. In bounded mode the data is always deleted: a file with deleted pieces cannot be resumed.
  */
@@ -189,7 +195,7 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
 @property (atomic) int64_t consumedBefore;
 
 /**
- Bounded mode: data below this offset (apart from the pinned head) is deleted, or consumed and queued for deletion (pieces are deleted in batches of 32 MiB or once a second), and can never be read again: a rewind before it must be blocked. 0 in full mode or when nothing was consumed yet. To know whether data at or above it can be read now, use `isRangeAvailable:length:` (pieces skipped by a forward seek are not on disk either; once consumed they are never downloaded, and the HTTP server answers 410 for them as for deleted data).
+ Bounded mode: data below this offset (apart from the pinned head) is deleted, or consumed and queued for deletion (pieces are deleted in batches of 32 MiB or once a second), and can never be read again: a rewind before it must be blocked. It is the end of the highest consumed piece: every piece lying entirely below `consumedBefore` minus one guard piece, pinned pieces excepted. Exact at call time (it follows `setConsumedBefore:` at once) and never decreases. 0 in full mode or when nothing was consumed yet. It says nothing about the data above it: pieces skipped by a forward seek are not on disk either (once consumed they are never downloaded, and the HTTP server answers 410 for them as for deleted data). For a rewind use `contiguousAvailableOffsetBefore:`, or `isRangeAvailable:length:` for one range.
  */
 @property (atomic, readonly) int64_t lowestAvailableOffset;
 
@@ -199,14 +205,19 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
 @property (atomic, readonly) int64_t servedOffset;
 
 /**
- The first offset at or after `fileOffset` that is not on disk now, or the file size if everything from `fileOffset` to the end is on disk. A piece counts as on disk once it passed its hash check and was verified as written to the file.
+ The first offset at or after `fileOffset` that is not on disk now (`fileOffset` itself if its piece is missing), or the file size if everything from `fileOffset` to the end is on disk. A piece counts as on disk once it passed its hash check and was verified as written to the file. Consumed pieces still on disk count (see `isRangeAvailable:length:`).
  */
 - (int64_t)firstMissingOffsetFrom:(int64_t)fileOffset;
 
 /**
- `YES` if every byte of `[fileOffset, fileOffset + length)` is on disk now and can be read from the file.
+ `YES` if every byte of `[fileOffset, fileOffset + length)` is on disk now and can be read from the file. `NO` for an empty range or one outside the file. A snapshot: in bounded mode data below `lowestAvailableOffset` is deleted within about a second even if it is still on disk; data ahead of the read position can be dropped when the disk is full (and is downloaded again).
  */
 - (BOOL)isRangeAvailable:(int64_t)fileOffset length:(int64_t)length;
+
+/**
+ The lowest offset `start` <= `fileOffset` such that every byte of `[start, fileOffset)` is on disk now and, in bounded mode, stays there (pinned head and tail, or not consumed yet): the backward counterpart of `firstMissingOffsetFrom:`. `fileOffset` when the byte just before it is not available. Rewind policy for a reader at `readPosition`: a rewind to `target` that then reads forward finds every byte up to the current position iff `target >= [streamer contiguousAvailableOffsetBefore:streamer.readPosition]` (a gap left by a forward seek, or deleted data, stops it). Cheap: one pass over the piece states.
+ */
+- (int64_t)contiguousAvailableOffsetBefore:(int64_t)fileOffset NS_SWIFT_NAME(contiguousAvailableOffset(before:));
 
 /**
  `YES` if every byte of the selected file is on disk now. Never `YES` in bounded mode once something was deleted.

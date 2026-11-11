@@ -44,7 +44,6 @@ using namespace libtorrent;
 @property (nonatomic, getter=isStreaming) BOOL streaming;
 
 @property (nonatomic, strong, nonnull) PTTorrentsSession *session;
-@property (nonatomic) bool deleteOnlyDownloadedFile;
 
 @property (nonatomic, copy, nullable) PTTorrentStreamerProgress progressBlock;
 @property (nonatomic, copy, nullable) PTTorrentStreamerReadyToPlay readyToPlayBlock;
@@ -68,5 +67,24 @@ using namespace libtorrent;
 - (void)handleTorrentError:(NSError *_Nullable)error;
 - (void)fileErrorAlert:(NSString *_Nonnull)description diskFull:(BOOL)diskFull;
 - (void)prioritizeNextPieces:(torrent_handle)th;
+
+#pragma mark Shared torrents (see -[PTTorrentsSession joinTorrent:params:error:])
+
+/// `YES` while this stream reads a torrent another streamer added (an offline download).
+@property (nonatomic, readonly, getter=isGuest) BOOL guest;
+/// May this streamer join a torrent another one added? `NO` for downloads (own copy).
+- (BOOL)canJoinSharedTorrent;
+/// May streams join this streamer's torrent? Only when it keeps the whole file (never bounded).
+- (BOOL)canShareTorrentWithGuests;
+/// When this streamer removes its torrent while streams still read it: `YES` (streams) hands
+/// the torrent and its files over to the oldest of them, `NO` (downloads) removes it anyway.
+- (BOOL)handsTorrentOverToGuests;
+/// This guest now owns the torrent it joined (its owner handed it over).
+- (void)sharedTorrentBecameOwned;
+/// The first stream joins this streamer's torrent / the last one leaves (main thread).
+- (void)sharedTorrentWillGainGuests;
+- (void)sharedTorrentDidLoseGuests;
+/// The streamer that added the torrent this guest reads removed it (main thread).
+- (void)sharedTorrentRemovedByOwner:(BOOL)deletedFiles;
 
 @end

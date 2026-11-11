@@ -8,3 +8,9 @@
 
 /* Bounded storage cannot start. {Amount of space the user has to free} */
 "There is not enough space to stream this video, even with limited storage. Please clear at least %@ and try again." = "Il n'y a pas assez d'espace pour lire cette vidéo, même avec le stockage limité. Libérez au moins %1$@ puis réessayez.";
+
+/* A stream cannot start: the same torrent is already streamed (in a way that cannot be shared) or downloaded. */
+"This video is already being played or downloaded. Stop the other playback or the download, then try again." = "Cette vidéo est déjà en cours de lecture ou de téléchargement. Arrêtez l'autre lecture ou le téléchargement, puis réessayez.";
+
+/* A stream that was reading the file of an offline download of the same torrent stops: the download was stopped before the file was complete. */
+"This video was playing from its download, and the download was stopped." = "Cette vidéo était lue depuis son téléchargement, et le téléchargement a été arrêté.";
