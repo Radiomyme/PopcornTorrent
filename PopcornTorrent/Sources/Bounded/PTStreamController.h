@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -47,6 +48,9 @@ struct StreamConfig {
     std::string filePath;                // absolute path of the selected file
     std::string directoryPath;           // existing directory on the same volume
     std::vector<int32_t> requiredPieces; // must be on disk before the stream is ready
+    std::string pieceHashes;             // SHA-1 of each piece of the file (20 bytes per piece, from
+                                         // firstPiece()); zeros for a piece not wholly inside the file
+    bool fileExisted = false;            // the file held data before the stream started
 };
 
 enum ReadResult : int {
@@ -84,6 +88,7 @@ struct StreamStatistics {
     int64_t diskFullEvents = 0;
     int64_t fileErrors = 0;
     int64_t dontHaveSent = 0;
+    int64_t partialPunched = 0;
     int64_t waiters = 0;
     int downloadLimit = 0;
     int paceState = 0;
@@ -115,6 +120,9 @@ public:
     int64_t firstMissingOffset(int64_t from) const;
     bool isRangeOnDisk(int64_t offset, int64_t length) const;
     bool isOffsetFreed(int64_t offset) const;
+    /// Bounded: the byte will never be readable again in this stream (freed, or consumed
+    /// while it was not on disk). Reads there fail at once.
+    bool isOffsetGone(int64_t offset) const;
     bool isFileComplete() const;
     int64_t bytesOnDisk() const;
     int64_t freeBytes() const;
@@ -136,6 +144,7 @@ public:
     void attach(libtorrent::torrent& torrent);
     void addPeer(std::shared_ptr<PeerPlugin> const& peer);
     void onPiecePassed(libtorrent::torrent& torrent, int32_t piece);
+    void onPieceFailed(int32_t piece);
     void onTick(libtorrent::torrent& torrent);
 
 private:
@@ -147,10 +156,15 @@ private:
     void applyPriorities(libtorrent::torrent& torrent, std::vector<uint8_t> const& priorities);
     void applyDeadlines(libtorrent::torrent& torrent, std::vector<std::pair<int32_t, int>> const& deadlines);
     void releasePieces(libtorrent::torrent& torrent, std::vector<int32_t> const& pieces, uint8_t newState);
+    void punchPartialPieces(libtorrent::torrent& torrent);
+    std::vector<uint8_t> snapshotStates() const;
     bool isPinnedOffset(int64_t offset) const;
     void sweepWaiters(PlanOutput const& plan);
-    void scheduleVerify(int32_t piece, int attempt);
-    void verify(int32_t piece, int attempt);
+    void scheduleVerify(int32_t piece, int attempt, bool flushed);
+    void verify(int32_t piece, int attempt, bool flushed);
+    bool isSuspect(int32_t piece) const;
+    bool hasPieceHash(int32_t piece) const;
+    bool contentMatches(int32_t piece);
     void punch(int32_t piece, uint8_t newState);
     void markOnDisk(int32_t piece);
     void scheduleHeadParse();
@@ -168,6 +182,10 @@ private:
     std::atomic<bool> m_bounded{false};
     std::atomic<bool> m_cancelled{false};
     std::unique_ptr<std::atomic<uint8_t>[]> m_states;
+    // Pieces whose region of the file may hold stale bytes (a failed hash check, a file
+    // that existed before), or every piece on a volume without holes: verified by content.
+    std::unique_ptr<std::atomic<bool>[]> m_suspect;
+    bool m_holesSupported = true;
     int32_t m_count = 0;
     int32_t m_first = 0;
 
@@ -191,8 +209,8 @@ private:
     std::atomic<int64_t> m_aheadBytes{0}, m_behindBytes{0}, m_pinnedBytes{0}, m_dataBytes{0};
     std::atomic<int64_t> m_aheadBudget{0}, m_lastFreeBytes{0};
     std::atomic<int64_t> m_freedPieces{0}, m_droppedPieces{0}, m_punchedBytes{0}, m_punchErrors{0};
-    std::atomic<int64_t> m_diskFullEvents{0}, m_fileErrors{0}, m_dontHaveSent{0};
-    std::atomic<int64_t> m_pendingPunches{0}, m_allocatedBytes{0};
+    std::atomic<int64_t> m_diskFullEvents{0}, m_fileErrors{0}, m_dontHaveSent{0}, m_partialPunched{0};
+    std::atomic<int64_t> m_pendingPunches{0}, m_pendingPunchBytes{0}, m_allocatedBytes{0};
     std::atomic<int> m_downloadLimit{0}, m_paceState{0};
     std::atomic<int> m_windowTotal{0}, m_windowOnDisk{0};
     std::atomic<double> m_consumeRate{0};
@@ -210,10 +228,13 @@ private:
     int64_t m_lastTickReadPosition = -1;
     std::vector<std::weak_ptr<PeerPlugin>> m_peers;
     std::vector<uint8_t> m_lastPlanPriorities;
+    int32_t m_capSentinel = -1;
+    std::set<int32_t> m_partialPunchedPieces;
 
     // HTTP readers waiting for a piece (guarded by m_mutex).
     struct Waiter {
         std::chrono::steady_clock::time_point since;
+        int64_t reader;
         std::function<void(int)> resume;
     };
     struct Reader {

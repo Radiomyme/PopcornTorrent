@@ -20,6 +20,7 @@
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/piece_picker.hpp>
 #include <libtorrent/disk_interface.hpp>
+#include <libtorrent/hasher.hpp>
 #include <libtorrent/aux_/session_interface.hpp>
 #include <boost/asio/post.hpp>
 
@@ -31,11 +32,15 @@ namespace {
 
 constexpr int64_t kBlock = 4096;            // APFS hole granularity (f_bsize, _PC_MIN_HOLE_SIZE)
 constexpr int64_t kMaxReadChunk = 1 * kMiB; // largest chunk handed to one HTTP write
+// Bounded mode: a waiting read of a reader that is not the streaming one (a prefetch, an
+// abandoned request) gives up after this, so it does not keep its piece urgent forever.
 constexpr auto kWaiterTimeout = std::chrono::seconds(120);
 // A primary HTTP reader silent for this long hands the read position to another one.
 constexpr auto kPrimaryReaderSilence = std::chrono::milliseconds(2000);
 // Pieces are freed in batches behind one disk fence (async_clear_piece blocks the storage).
 constexpr int64_t kFreeBatchBytes = 32 * kMiB;
+// Retry delay of a verification by content (it reads the whole piece back).
+constexpr int64_t kContentRetryNanos = 200 * NSEC_PER_MSEC;
 
 int64_t alignUp(int64_t value) { return (value + kBlock - 1) / kBlock * kBlock; }
 
@@ -98,6 +103,10 @@ public:
         m_controller->onPiecePassed(m_torrent, int32_t(static_cast<int>(piece)));
     }
 
+    void on_piece_failed(lt::piece_index_t piece) override {
+        m_controller->onPieceFailed(int32_t(static_cast<int>(piece)));
+    }
+
     void on_files_checked() override { m_controller->requestUpdate(); }
 
     void tick() override { m_controller->onTick(m_torrent); }
@@ -139,7 +148,13 @@ void StreamController::configure(StreamConfig const& config) {
     m_first = config.geometry.firstPiece();
     m_count = config.geometry.pieceCount();
     m_states.reset(new std::atomic<uint8_t>[size_t(m_count)]);
-    for (int32_t i = 0; i < m_count; ++i) m_states[size_t(i)].store(PieceMissing);
+    m_suspect.reset(new std::atomic<bool>[size_t(m_count)]);
+    for (int32_t i = 0; i < m_count; ++i) {
+        m_states[size_t(i)].store(PieceMissing);
+        m_suspect[size_t(i)].store(false);
+    }
+    // Without holes (HFS+, exFAT) SEEK_HOLE cannot tell written blocks from unwritten ones.
+    m_holesSupported = !config.directoryPath.empty() && pathconf(config.directoryPath.c_str(), _PC_MIN_HOLE_SIZE) > 0;
     m_bounded.store(config.bounded);
     m_headPinEnd.store(config.bounded ? kHeadPinLimit : 0);
     m_lastFreeBytes.store(freeBytes());
@@ -226,6 +241,12 @@ bool StreamController::isOffsetFreed(int64_t offset) const {
     return stateOf(m_config.geometry.pieceAt(offset)) == PieceFreed;
 }
 
+bool StreamController::isOffsetGone(int64_t offset) const {
+    if (!m_configured.load() || !m_bounded.load()) return false;
+    int32_t const piece = m_config.geometry.pieceAt(offset);
+    return isGone(m_config.geometry, pins(), stateOf(piece), piece, m_consumedBefore.load());
+}
+
 bool StreamController::isFileComplete() const {
     if (!m_configured.load()) return false;
     for (int32_t i = 0; i < m_count; ++i) {
@@ -291,6 +312,7 @@ StreamStatistics StreamController::statistics() const {
     s.diskFullEvents = m_diskFullEvents.load();
     s.fileErrors = m_fileErrors.load();
     s.dontHaveSent = m_dontHaveSent.load();
+    s.partialPunched = m_partialPunched.load();
     s.downloadLimit = m_downloadLimit.load();
     s.paceState = m_paceState.load();
     s.consumeRate = m_consumeRate.load();
@@ -386,18 +408,33 @@ void StreamController::addPeer(std::shared_ptr<PeerPlugin> const& peer) {
 void StreamController::onPiecePassed(lt::torrent& torrent, int32_t piece) {
     if (!inFile(piece) || m_cancelled.load()) return;
     uint8_t expected = PieceMissing;
-    if (!slot(piece).compare_exchange_strong(expected, PieceVerifying)) return;
+    if (!slot(piece).compare_exchange_strong(expected, PieceVerifying)) {
+        if (debugTrace()) NSLog(@"PopcornTorrent bounded: piece %d passed in state %d", piece, int(expected));
+        return;
+    }
     m_everDownloaded.fetch_add(m_config.geometry.pieceBytes(piece));
+    // A piece downloaded in this session into a file that already held data may land
+    // over stale bytes, and a volume without holes (HFS+, exFAT) cannot tell written
+    // blocks from unwritten ones: no hole check then, the content is verified instead.
+    if (m_config.fileExisted || !m_holesSupported) m_suspect[size_t(piece - m_first)].store(true);
     // libtorrent already asked its cache to write the piece (torrent::piece_passed);
     // verify the file once that flush is done, and right away in case it already is.
-    scheduleVerify(piece, 0);
+    scheduleVerify(piece, 0, false);
     if (torrent.has_storage()) {
         std::weak_ptr<StreamController> weak = weak_from_this();
         torrent.session().disk_thread().async_flush_piece(torrent.storage(), lt::piece_index_t(piece), [weak, piece] {
-            if (auto self = weak.lock()) self->scheduleVerify(piece, 0);
+            if (auto self = weak.lock()) self->scheduleVerify(piece, 0, true);
         });
+    } else {
+        scheduleVerify(piece, 0, true);
     }
     requestUpdate();
+}
+
+void StreamController::onPieceFailed(int32_t piece) {
+    // The failed blocks may already be in the file: the next download of this piece
+    // writes over them, so it is verified by content.
+    if (inFile(piece)) m_suspect[size_t(piece - m_first)].store(true);
 }
 
 void StreamController::requestFlush(int32_t piece) {
@@ -416,9 +453,12 @@ void StreamController::onTick(lt::torrent& torrent) {
     if (!m_configured.load() || m_cancelled.load()) return;
     int64_t const position = m_readPosition.load();
     if (m_lastTickReadPosition >= 0) {
-        int64_t const delta = position - m_lastTickReadPosition;
-        double const sample = (delta > 0 && delta < kGiB) ? double(delta) : 0.0;
-        m_consumeRate.store(0.7 * m_consumeRate.load() + 0.3 * sample);
+        // Once a second (torrent_plugin::tick). A seek over data that was never on disk
+        // is not consumption: it would open the pace controller wide (see consumedBetween).
+        double const rate = m_consumeRate.load();
+        int64_t const cap = std::max<int64_t>({int64_t(2 * rate), int64_t(4 * m_config.budget.bytesPerSecond), 16 * kMiB});
+        int64_t const sample = consumedBetween(m_config.geometry, snapshotStates(), m_lastTickReadPosition, position, cap);
+        m_consumeRate.store(0.7 * rate + 0.3 * double(sample));
     }
     m_lastTickReadPosition = position;
     if (debugTrace()) {
@@ -457,10 +497,23 @@ void StreamController::onTick(lt::torrent& torrent) {
             }
         }
         std::string firstMissing;
+        int32_t firstMissingPiece = -1;
         for (int32_t piece = m_plannedReadPiece.load(); piece >= 0 && piece < m_first + m_count && firstMissing.size() < 80; ++piece) {
             if (stateOf(piece) == PieceMissing) {
+                if (firstMissingPiece < 0) firstMissingPiece = piece;
                 firstMissing += std::to_string(piece) + "/" + std::to_string(int(static_cast<std::uint8_t>(torrent.piece_priority(lt::piece_index_t(piece))))) + " ";
             }
+        }
+        if (firstMissingPiece >= 0 && torrent.has_picker()) {
+            // libtorrent's view of the first missing piece: had, and its downloading entry.
+            std::string picker = "have " + std::to_string(int(torrent.have_piece(lt::piece_index_t(firstMissingPiece))));
+            for (auto const& d : torrent.picker().get_download_queue()) {
+                if (int32_t(static_cast<int>(d.index)) != firstMissingPiece) continue;
+                picker += " finished " + std::to_string(int(d.finished)) + " writing " + std::to_string(int(d.writing))
+                    + " requested " + std::to_string(int(d.requested)) + " locked " + std::to_string(int(d.locked))
+                    + " passed " + std::to_string(int(d.passed_hash_check));
+            }
+            NSLog(@"PopcornTorrent bounded: piece %d in libtorrent: %s", firstMissingPiece, picker.c_str());
         }
         NSLog(@"PopcornTorrent bounded: required missing %s | first missing from the reader %s", missingRequired.c_str(), firstMissing.c_str());
         std::string peers;
@@ -489,7 +542,14 @@ void StreamController::onTick(lt::torrent& torrent) {
     }
     m_peers.erase(std::remove_if(m_peers.begin(), m_peers.end(),
                                  [](std::weak_ptr<PeerPlugin> const& p) { return p.expired(); }), m_peers.end());
+    if (m_bounded.load()) punchPartialPieces(torrent);
     apply(torrent, true);
+}
+
+std::vector<uint8_t> StreamController::snapshotStates() const {
+    std::vector<uint8_t> states(static_cast<size_t>(m_count));
+    for (int32_t i = 0; i < m_count; ++i) states[size_t(i)] = m_states[size_t(i)].load();
+    return states;
 }
 
 #pragma mark Planning (network thread)
@@ -509,13 +569,12 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
             uint8_t expected = PieceMissing;
             if (slot(piece).compare_exchange_strong(expected, PieceVerifying)) {
                 m_everDownloaded.fetch_add(m_config.geometry.pieceBytes(piece));
-                scheduleVerify(piece, 0);
+                scheduleVerify(piece, 0, true); // already in the file before the stream started
             }
         }
     }
 
-    std::vector<uint8_t> states = std::vector<uint8_t>(size_t(m_count));
-    for (int32_t i = 0; i < m_count; ++i) states[size_t(i)] = m_states[size_t(i)].load();
+    std::vector<uint8_t> states = snapshotStates();
 
     bool const bounded = m_bounded.load();
     PlanInput input;
@@ -528,10 +587,15 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     input.deadlineFirstMs = m_config.deadlineFirstMs;
     input.deadlineStepMs = m_config.deadlineStepMs;
     input.states = &states;
+    input.capSentinel = m_capSentinel;
     {
-        int64_t const ahead = m_aheadBudget.load();
+        // Data freed but not punched yet still takes its space (right after a seek, the
+        // whole old window): a late window may only fill what is left.
         int64_t const pieceLength = m_config.geometry.pieceLength;
-        input.aheadLimitPieces = int((ahead > 0 ? ahead : m_config.budget.minAhead) / pieceLength);
+        int64_t ahead = m_aheadBudget.load();
+        if (ahead <= 0) ahead = m_config.budget.minAhead;
+        ahead -= m_pendingPunchBytes.load();
+        input.aheadLimitPieces = int(std::max<int64_t>(pieceLength, ahead) / pieceLength);
     }
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -540,6 +604,7 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
         }
     }
     PlanOutput const plan = planWindow(input);
+    m_capSentinel = plan.capSentinel;
 
     m_plannedReadPiece.store(plan.readPiece);
     m_plannedConsumedPiece.store(m_config.geometry.pieceAt(input.consumedBefore));
@@ -619,11 +684,23 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
 
     // Disk full (ENOSPC) or below half the reserve: drop data far ahead of the reader.
     // It is downloaded again later; the stream itself never stops.
+    // Otherwise, while the reader does not wait, the floor and trickle rates must not
+    // make disk use grow over a long pause: data beyond the ahead budget (past the
+    // floor band) or eating into the reserve is dropped the same way.
     // Holes already queued give space back first: never drop again before they land.
     bool const diskFull = m_diskFullPending.load();
-    if ((diskFull || free < m_config.reserveBytes / 2) && m_pendingPunches.load() == 0) {
-        int64_t const need = std::max<int64_t>(m_config.reserveBytes - free, 0) + m_config.geometry.pieceLength;
+    int64_t need = 0;
+    if (diskFull || free < m_config.reserveBytes / 2) {
+        need = std::max<int64_t>(m_config.reserveBytes - free, 0) + m_config.geometry.pieceLength;
+    } else {
+        need = excessAheadBytes(paceInput, m_config.geometry.pieceLength);
+    }
+    if (need > 0 && m_pendingPunches.load() == 0) {
         std::vector<int32_t> const drop = piecesToDrop(input, plan, need);
+        if (debugTrace() && !drop.empty()) {
+            NSLog(@"PopcornTorrent bounded: dropping %zu pieces (%d..%d) for %lld bytes, disk full %d, free %lld",
+                  drop.size(), drop.back(), drop.front(), need, int(diskFull), free);
+        }
         releasePieces(torrent, drop, PieceDropping);
         if (!drop.empty()) m_droppedPieces.fetch_add(int64_t(drop.size()));
     }
@@ -685,7 +762,9 @@ void StreamController::releasePieces(lt::torrent& torrent, std::vector<int32_t> 
     for (int32_t piece : pieces) {
         std::atomic<uint8_t>& state = slot(piece);
         uint8_t previous = state.load();
-        if (!pieceHasData(previous) || !state.compare_exchange_strong(previous, newState)) continue;
+        // Freed: only pieces confirmed on disk (nothing of theirs left in the cache to write).
+        bool const releasable = newState == PieceFreed ? previous == PieceOnDisk : pieceHasData(previous);
+        if (!releasable || !state.compare_exchange_strong(previous, newState)) continue;
         released.push_back(piece);
 
         lt::piece_index_t const index(piece);
@@ -711,6 +790,7 @@ void StreamController::releasePieces(lt::torrent& torrent, std::vector<int32_t> 
     if (released.empty()) return;
     torrent.state_updated();
     m_pendingPunches.fetch_add(int64_t(released.size()));
+    for (int32_t piece : released) m_pendingPunchBytes.fetch_add(m_config.geometry.pieceBytes(piece));
 
     // 4. one fence for the batch: every read or write already queued on this storage
     //    completes, and the cache forgets the last piece, before the holes are punched.
@@ -737,18 +817,59 @@ void StreamController::releasePieces(lt::torrent& torrent, std::vector<int32_t> 
     }
 }
 
+void StreamController::punchPartialPieces(lt::torrent& torrent) {
+    // A forward seek leaves partially downloaded pieces behind: their priority drops to 0,
+    // but blocks already requested still arrive and are written. Once consumed, nothing
+    // reads them again: punch them when no block of theirs is on its way any more.
+    int64_t const consumed = m_consumedBefore.load();
+    if (consumed <= 0 || !torrent.has_picker() || !torrent.has_storage()) return;
+    PinSet const pinSet = pins();
+    std::vector<int32_t> pieces;
+    for (auto const& downloading : torrent.picker().get_download_queue()) {
+        int32_t const piece = int32_t(static_cast<int>(downloading.index));
+        if (!inFile(piece) || stateOf(piece) != PieceMissing) continue;
+        if (!isGone(m_config.geometry, pinSet, PieceMissing, piece, consumed)) continue;
+        // Nothing requested any more, nothing still in libtorrent's write cache (it would be
+        // written after the punch): only finished blocks, already in the file.
+        if (downloading.requested > 0 || downloading.writing > 0 || downloading.finished == 0) continue;
+        if (!m_partialPunchedPieces.insert(piece).second) continue;
+        pieces.push_back(piece);
+    }
+    if (pieces.empty()) return;
+    m_pendingPunches.fetch_add(int64_t(pieces.size()));
+    for (int32_t piece : pieces) m_pendingPunchBytes.fetch_add(m_config.geometry.pieceBytes(piece));
+    m_partialPunched.fetch_add(int64_t(pieces.size()));
+    std::weak_ptr<StreamController> weak = weak_from_this();
+    auto& disk = torrent.session().disk_thread();
+    for (int32_t piece : pieces) {
+        // A fence (writes already queued complete) that also evicts its cached blocks.
+        disk.async_clear_piece(torrent.storage(), lt::piece_index_t(piece), [weak, piece](lt::piece_index_t) {
+            if (auto self = weak.lock()) {
+                dispatch_async(self->m_ioQueue, ^{ self->punch(piece, PieceMissing); });
+            }
+        });
+    }
+}
+
 void StreamController::sweepWaiters(PlanOutput const& plan) {
     auto const now = std::chrono::steady_clock::now();
+    bool const bounded = m_bounded.load();
+    PinSet const pinSet = pins();
+    int64_t const consumed = m_consumedBefore.load();
     std::vector<std::pair<std::function<void(int)>, int>> failed;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto it = m_waiters.begin(); it != m_waiters.end();) {
             int32_t const piece = it->first;
             int result = ReadOK;
-            if (now - it->second.since > kWaiterTimeout) {
+            if (!bounded || !inFile(piece)) {
+                // Full mode: every piece of the file comes eventually, reads wait for it.
+            } else if (isGone(m_config.geometry, pinSet, stateOf(piece), piece, consumed)) {
+                result = ReadFreed; // consumed while not on disk: it never comes
+            } else if (it->second.reader != m_primaryReader && now - it->second.since > kWaiterTimeout) {
                 result = ReadTimedOut;
-            } else if (m_bounded.load() && inFile(piece) && stateOf(piece) == PieceMissing
-                       && plan.priorities.size() == size_t(m_count) && plan.priorities[size_t(piece - m_first)] == 0) {
+            } else if (stateOf(piece) == PieceMissing && plan.priorities.size() == size_t(m_count)
+                       && plan.priorities[size_t(piece - m_first)] == 0) {
                 result = ReadUnwanted; // superseded reader behind the read position
             }
             if (result != ReadOK) {
@@ -764,39 +885,80 @@ void StreamController::sweepWaiters(PlanOutput const& plan) {
 
 #pragma mark File work (I/O queue)
 
-void StreamController::scheduleVerify(int32_t piece, int attempt) {
+void StreamController::scheduleVerify(int32_t piece, int attempt, bool flushed) {
     if (m_cancelled.load()) return;
     std::weak_ptr<StreamController> weak = weak_from_this();
     if (attempt == 0) {
-        dispatch_async(m_ioQueue, ^{ if (auto self = weak.lock()) self->verify(piece, attempt); });
+        dispatch_async(m_ioQueue, ^{ if (auto self = weak.lock()) self->verify(piece, attempt, flushed); });
         return;
     }
-    int64_t const delay = attempt < 20 ? 10 * NSEC_PER_MSEC : 200 * NSEC_PER_MSEC;
+    int64_t const delay = isSuspect(piece) ? kContentRetryNanos : attempt < 20 ? 10 * NSEC_PER_MSEC : 200 * NSEC_PER_MSEC;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), m_ioQueue, ^{
-        if (auto self = weak.lock()) self->verify(piece, attempt);
+        if (auto self = weak.lock()) self->verify(piece, attempt, flushed);
     });
 }
 
-void StreamController::verify(int32_t piece, int attempt) {
-    if (m_cancelled.load() || stateOf(piece) != PieceVerifying) return;
+bool StreamController::isSuspect(int32_t piece) const {
+    return inFile(piece) && m_suspect[size_t(piece - m_first)].load();
+}
+
+bool StreamController::hasPieceHash(int32_t piece) const {
+    size_t const at = size_t(piece - m_first) * 20;
+    if (!inFile(piece) || m_config.pieceHashes.size() < at + 20) return false;
+    char const* hash = m_config.pieceHashes.data() + at;
+    return std::any_of(hash, hash + 20, [](char c) { return c != 0; });
+}
+
+bool StreamController::contentMatches(int32_t piece) {
     FileGeometry const& geo = m_config.geometry;
     int64_t const begin = geo.pieceBegin(piece);
     int64_t const end = geo.pieceEnd(piece);
-    int64_t const alignedBegin = alignUp(begin);
-    int64_t const alignedEnd = end == geo.fileSize ? end : alignDown(end);
+    std::vector<char> buffer(size_t(std::min<int64_t>(kMaxReadChunk, end - begin)));
+    lt::hasher hasher;
+    int const fd = fileDescriptor();
+    std::shared_lock<std::shared_mutex> lock(m_fdLock);
+    if (fd < 0 || fd != m_fd) return false;
+    for (int64_t offset = begin; offset < end;) {
+        size_t const length = size_t(std::min<int64_t>(int64_t(buffer.size()), end - offset));
+        ssize_t const count = pread(fd, buffer.data(), length, off_t(offset));
+        if (count != ssize_t(length)) return false;
+        hasher.update(buffer.data(), int(count));
+        offset += count;
+    }
+    lt::sha1_hash const digest = hasher.final();
+    return std::memcmp(digest.data(), m_config.pieceHashes.data() + size_t(piece - m_first) * 20, 20) == 0;
+}
+
+void StreamController::verify(int32_t piece, int attempt, bool flushed) {
+    if (m_cancelled.load() || stateOf(piece) != PieceVerifying) return;
+    FileGeometry const& geo = m_config.geometry;
 
     bool written = false;
-    {
+    if (isSuspect(piece)) {
+        // Stale bytes, or no holes on this volume: a piece is written once its content
+        // in the file matches its hash. Checked after libtorrent's flush only (it reads the
+        // whole piece back). A piece that is not wholly inside the file (multi-file
+        // torrents) cannot be hashed from it: libtorrent's flush is trusted then.
+        if (!flushed) return; // the flush callback starts its own verification
+        written = hasPieceHash(piece) ? contentMatches(piece) : true;
+    } else {
+        int64_t const begin = geo.pieceBegin(piece);
+        int64_t const end = geo.pieceEnd(piece);
+        int64_t const alignedBegin = alignUp(begin);
+        int64_t const alignedEnd = end == geo.fileSize ? end : alignDown(end);
         int const fd = fileDescriptor();
         std::shared_lock<std::shared_mutex> lock(m_fdLock);
         if (fd >= 0 && fd == m_fd) {
             if (alignedEnd <= alignedBegin) {
                 written = true; // too small to hold a whole block: trust the flush
             } else {
-                // A hole inside the piece means libtorrent's cache has not written it yet.
+                // The region was a hole: a hole left inside the piece means libtorrent's
+                // cache has not written it yet. (Without hole support, only pieces already
+                // in the file when the stream started come here: SEEK_HOLE finds the end
+                // of the file, or fails.)
                 off_t const hole = lseek(fd, off_t(alignedBegin), SEEK_HOLE);
                 if (hole >= 0) written = int64_t(hole) >= alignedEnd;
-                else written = errno != ENXIO; // no hole support on this volume: trust the flush
+                else written = errno != ENXIO; // no hole support: trust libtorrent
             }
         }
     }
@@ -806,7 +968,7 @@ void StreamController::verify(int32_t piece, int attempt) {
         return;
     }
     if (attempt % 10 == 9) requestFlush(piece);
-    scheduleVerify(piece, attempt + 1);
+    scheduleVerify(piece, attempt + 1, flushed);
 }
 
 void StreamController::markOnDisk(int32_t piece) {
@@ -841,9 +1003,18 @@ void StreamController::failWaiters(int32_t piece, int result) {
 
 void StreamController::punch(int32_t piece, uint8_t newState) {
     FileGeometry const& geo = m_config.geometry;
-    int64_t const begin = alignUp(geo.pieceBegin(piece));
+    int64_t const pieceBegin = geo.pieceBegin(piece);
     int64_t const pieceEnd = geo.pieceEnd(piece);
-    int64_t const end = pieceEnd == geo.fileSize ? pieceEnd : alignDown(pieceEnd);
+    // Rounded inward to whole 4 KiB blocks, but a block shared with a neighbour piece
+    // that is freed too is punched as well (pieces that do not start on a block
+    // boundary: a file inside a multi-file torrent).
+    auto freedNeighbour = [&](int32_t neighbour) {
+        return newState == PieceFreed && inFile(neighbour) && stateOf(neighbour) == PieceFreed;
+    };
+    int64_t begin = alignUp(pieceBegin);
+    if (begin != pieceBegin && freedNeighbour(piece - 1)) begin = alignDown(pieceBegin);
+    int64_t end = pieceEnd == geo.fileSize ? pieceEnd : alignDown(pieceEnd);
+    if (end != pieceEnd && freedNeighbour(piece + 1)) end = std::min(alignUp(pieceEnd), geo.fileSize);
     if (end > begin && !m_cancelled.load()) {
         int const fd = fileDescriptor();
         std::shared_lock<std::shared_mutex> lock(m_fdLock);
@@ -858,12 +1029,15 @@ void StreamController::punch(int32_t piece, uint8_t newState) {
         }
     }
     m_pendingPunches.fetch_sub(1);
+    m_pendingPunchBytes.fetch_sub(geo.pieceBytes(piece));
     if (newState == PieceDropping) {
         uint8_t expected = PieceDropping;
         slot(piece).compare_exchange_strong(expected, PieceMissing); // downloadable again
         requestUpdate();
-    } else {
+    } else if (newState == PieceFreed) {
         failWaiters(piece, ReadFreed);
+    } else {
+        return; // a consumed partial piece (punchPartialPieces): its state does not change
     }
     notifyAvailability();
 }
@@ -889,9 +1063,14 @@ void StreamController::parseHead() {
         if (fd != m_fd) return false;
         return pread(fd, buffer, length, off_t(offset)) == ssize_t(length);
     };
-    HeadPins const result = parseHeadPins(read, m_config.geometry.fileSize);
+    FileGeometry const& geo = m_config.geometry;
+    HeadPins const result = parseHeadPins(read, geo.fileSize);
     if (result.status == HeadPins::NeedMore) {
-        int32_t const need = m_config.geometry.pieceAt(result.needOffset);
+        // The bytes it needs may straddle two pieces: wait for the first of them not on
+        // disk yet (markOnDisk parses again when it arrives). All on disk (a read error):
+        // parse again on the next piece.
+        int64_t const missing = firstMissingOffset(result.needOffset);
+        int32_t const need = missing < std::min(result.needOffset + kHeadParserLookahead, geo.fileSize) ? geo.pieceAt(missing) : -1;
         if (m_parserNeedPiece.exchange(need) != need) requestUpdate();
         return;
     }
@@ -950,7 +1129,7 @@ void StreamController::readAsync(int64_t reader, int64_t offset, int64_t maxLeng
 
     int32_t const piece = geo.pieceAt(offset);
     uint8_t state = stateOf(piece);
-    if (state == PieceFreed) { callback(nil, ReadFreed); return; }
+    if (isOffsetGone(offset)) { callback(nil, ReadFreed); return; }
 
     auto self = shared_from_this();
     if (state == PieceOnDisk) {
@@ -969,8 +1148,8 @@ void StreamController::readAsync(int64_t reader, int64_t offset, int64_t maxLeng
     {
         std::unique_lock<std::mutex> lock(m_mutex);
         state = stateOf(piece);
-        if (state != PieceOnDisk && state != PieceFreed) {
-            m_waiters.emplace(piece, Waiter{std::chrono::steady_clock::now(), [self, reader, offset, maxLength, callback](int result) {
+        if (state != PieceOnDisk && !isOffsetGone(offset)) {
+            m_waiters.emplace(piece, Waiter{std::chrono::steady_clock::now(), reader, [self, reader, offset, maxLength, callback](int result) {
                 if (result != ReadOK) callback(nil, result);
                 else self->readAsync(reader, offset, maxLength, callback);
             }});

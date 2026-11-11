@@ -43,8 +43,9 @@ static int64_t const PTGatedFileResponseChunk = 512 * 1024;
         [response setValue:[NSString stringWithFormat:@"bytes */%lld", fileSize] forAdditionalHeader:@"Content-Range"];
         return response;
     }
-    if (controller->isOffsetFreed(start)) {
-        // Deleted in bounded mode: fail now instead of making the player wait.
+    if (controller->isOffsetGone(start)) {
+        // Deleted in bounded mode, or consumed before it was ever downloaded (skipped by a
+        // seek): it never comes back. Fail now instead of making the player wait.
         return [GCDWebServerErrorResponse responseWithStatusCode:410];
     }
 
