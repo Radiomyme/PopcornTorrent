@@ -697,6 +697,13 @@ window at 7 in random order); 1 s: 1.2-1.7 s. The stalled peer: ready after 16-2
 rescue for waiting readers only (nobody reads before the stream is ready), 7.1 s once the
 required pieces count as waited for.
 
+After the review (`request_queue_time` 2 s, moderated peer counts, 10 s connect timeout;
+`standard_set.sh`, one run each, Mac, 2026-11-12): S1 stream ready 5.98 s, 11.93 MB/s; S1
+download 48.7 s, 11.94 MB/s; S1 forward seek: first MiB 2.28 s (1.5 s of stalls), 11.66 MB/s;
+S2 stream ready 5.57 s, 35.45 MB/s; H (8 peers 1.2-1.5 s away, 256 MiB download) 97.5 s,
+2.97 MB/s (`request_queue_time` 1 s: 13 % in 3 min; 3 s: 79.5 s, 3.71 MB/s); X (4 near, 4
+far) 41.4 s, 7.13 MB/s (1 s: 6.50; 3 s: 7.51).
+
 Tests on this version (all under `localhost-only.sb`): `PopcornTorrentLogicTests` 39/39,
 `PopcornTorrent-Tests` 4/4 (offline, 4.9 s), SessionHarness network 9/9 for each profile (tv,
 ios, mac), zombie 8/8, starve 8/8, guest 16/16, background 5/5, legacy 6/6, premetadata 12/12;
