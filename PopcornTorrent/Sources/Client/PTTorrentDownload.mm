@@ -280,10 +280,27 @@ using namespace libtorrent;
 - (void)sharedTorrentWillGainGuests {
     // A paused download runs while a stream reads it.
     if (_downloadStatus == PTTorrentDownloadStatusPaused && self.torrentHandle.is_valid()) self.torrentHandle.resume();
+    [self updateSequentialDownload];
 }
 
 - (void)sharedTorrentDidLoseGuests {
     if (_downloadStatus == PTTorrentDownloadStatusPaused) [self pauseTorrent];
+    [self updateSequentialDownload];
+}
+
+#pragma mark - Piece order
+
+- (BOOL)wantsSequentialDownload {
+    // Nobody plays it: the rarest pieces first, like any BitTorrent client (no wait at the end
+    // on pieces only a few peers have, and a healthier swarm). Played here (playWithHandler:)
+    // or by a stream that joined it: in file order, the stream's window first.
+    return self.isStreaming || [self.session hasGuests:self];
+}
+
+- (void)updateSequentialDownload {
+    if (!self.torrentHandle.is_valid()) return;
+    if ([self wantsSequentialDownload]) self.torrentHandle.set_flags(torrent_flags::sequential_download);
+    else self.torrentHandle.unset_flags(torrent_flags::sequential_download);
 }
 
 - (BOOL)delete {
@@ -315,6 +332,7 @@ using namespace libtorrent;
         // start player
         if (self.torrentStatus.totalProgress > 0.03) {
             self.streaming = YES;
+            [self updateSequentialDownload];
             [self startWebServerAndPlay];
         }
     } else if (_downloadStatus == PTTorrentDownloadStatusFinished) {
@@ -336,6 +354,7 @@ using namespace libtorrent;
         if (self.mediaServer.isRunning) [self.mediaServer stop];
         [self.mediaServer removeAllHandlers];
         self.mediaServer = [[GCDWebServer alloc] init];
+        [self updateSequentialDownload];
     } else {
         [super cancelStreamingAndDeleteData:deleteData];
     }

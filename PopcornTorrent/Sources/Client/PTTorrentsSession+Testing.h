@@ -19,4 +19,16 @@
 /// background: reopens the listen sockets and re-announces every torrent.
 - (void)reopenNetworkForTesting;
 
+/// Makes sessions created afterwards use the network settings of another platform: "tv",
+/// "ios" or "mac" (nil: this one). Call it before the first `+sharedSession`.
++ (void)setNetworkProfileForTesting:(NSString *)profile;
+
+/// The trackers a public torrent with `trackers` gets: its own, then the default public
+/// trackers it does not have (never added in loopback testing, nor to private torrents).
++ (NSArray<NSString *> *)trackersForTesting:(NSArray<NSString *> *)trackers;
+
+/// The session's network settings, by libtorrent setting name, and "torrent_connections"
+/// (the peers allowed per torrent).
+- (NSDictionary<NSString *, NSNumber *> *)networkSettingsForTesting;
+
 @end

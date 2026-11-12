@@ -425,17 +425,105 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     input.deadlinePieces = 3;
     input.deadlineFirstMs = 100;
     input.states = &states;
-    PlanOutput const plan = planWindow(input);
+    PlanOutput plan = planWindow(input);
     XCTAssertTrue(plan.toFree.empty());
     XCTAssertEqual(plan.lowestAvailableOffset, 0);
     for (int i = 0; i < 100; ++i) XCTAssertGreaterThanOrEqual(plan.priorities[size_t(i)], 1);
-    // The window slides over the pieces already there, like the old chained windows.
-    XCTAssertEqual(plan.deadlines.size(), size_t(4));
+    // The window is the 3 pieces from the read piece, all here: the only deadline is the missing
+    // tail pin. The pieces after them (61..) are not time-critical: any deadline would hold
+    // every peer to one request at a time; the sequential picker brings them in order.
+    XCTAssertEqual(plan.windowEndPiece, 53);
+    XCTAssertEqual(plan.deadlines.size(), size_t(1));
+    XCTAssertEqual(plan.deadlines[0].first, 99); // missing tail pin
+    XCTAssertEqual(plan.priorities[61], 1);
+    // The reader gets close to the missing pieces: those of its window become time-critical.
+    input.readPosition = 59 * kMiB;
+    plan = planWindow(input);
+    XCTAssertEqual(plan.windowEndPiece, 62);
+    XCTAssertEqual(plan.deadlines.size(), size_t(2));
     XCTAssertEqual(plan.deadlines[0].first, 61);
-    XCTAssertEqual(plan.deadlines[2].first, 63);
-    XCTAssertEqual(plan.deadlines[2].second, 100);
-    XCTAssertEqual(plan.deadlines[3].first, 99); // missing tail pin
-    XCTAssertEqual(plan.windowEndPiece, 64);
+    XCTAssertEqual(plan.deadlines[0].second, 100);
+    XCTAssertEqual(plan.priorities[61], 7);
+    XCTAssertEqual(plan.priorities[62], 1);
+    XCTAssertEqual(plan.deadlines[1].first, 99);
+}
+
+- (void)testFullModeDeadlinesOnlyNearTheReader {
+    // Full mode, a window of 8 pieces whose first 2 are time-critical: the rest of the window
+    // at 7 without a deadline, the rest of the file at 1, the gap a seek left behind at 1.
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceMissing);
+    for (int i = 0; i < 10; ++i) states[size_t(i)] = PieceOnDisk;
+    PlanInput input;
+    input.geometry = geo;
+    input.readPosition = 40 * kMiB;
+    input.pins.tailStart = 99 * kMiB;
+    input.deadlinePieces = 8;
+    input.deadlineHorizonPieces = 2;
+    input.deadlineFirstMs = 100;
+    input.states = &states;
+    PlanOutput plan = planWindow(input);
+    XCTAssertEqual(plan.windowEndPiece, 48);
+    for (int i = 40; i < 48; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 7);
+    XCTAssertEqual(plan.priorities[48], 1);
+    XCTAssertEqual(plan.priorities[20], 1);
+    std::vector<int32_t> deadlinePieces;
+    for (auto const& d : plan.deadlines) deadlinePieces.push_back(d.first);
+    XCTAssertEqual(deadlinePieces, (std::vector<int32_t>{40, 41, 99}));
+    // Negative horizon: no deadline ahead of time, the pins at 7 without one either; only a
+    // piece a reader waits for gets one.
+    input.deadlineHorizonPieces = -1;
+    plan = planWindow(input);
+    XCTAssertTrue(plan.deadlines.empty());
+    XCTAssertEqual(plan.priorities[40], 7);
+    XCTAssertEqual(plan.priorities[99], 7);
+    // The full-mode setting: the first 3 pieces of the window at 7, the rest at 6 (file order,
+    // like the gap behind at 1), no deadline.
+    input.topPriorityPieces = 3;
+    plan = planWindow(input);
+    XCTAssertTrue(plan.deadlines.empty());
+    for (int i = 40; i < 43; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 7);
+    for (int i = 43; i < 48; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 6);
+    XCTAssertEqual(plan.priorities[48], 1);
+    XCTAssertEqual(plan.priorities[20], 1);
+    XCTAssertEqual(plan.windowEndPiece, 48);
+    input.topPriorityPieces = 0;
+    input.urgentPieces = {40};
+    plan = planWindow(input);
+    XCTAssertEqual(plan.deadlines.size(), size_t(1));
+    XCTAssertEqual(plan.deadlines[0].first, 40);
+}
+
+- (void)testFullModeLateDeadlinesOnly {
+    // Full mode with lateDeadlinesOnly: a piece a reader waits for is fetched first (7) and gets
+    // a deadline only once it is late. Bounded mode ignores it.
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceOnDisk);
+    states[70] = PieceMissing;
+    states[71] = PieceMissing;
+    PlanInput input;
+    input.geometry = geo;
+    input.readPosition = 70 * kMiB;
+    input.deadlinePieces = 4;
+    input.deadlineHorizonPieces = -1;
+    input.deadlineFirstMs = 100;
+    input.states = &states;
+    input.urgentPieces = {70};
+    input.lateDeadlinesOnly = true;
+    PlanOutput plan = planWindow(input);
+    XCTAssertEqual(plan.priorities[70], 7);
+    XCTAssertEqual(plan.priorities[71], 7);
+    XCTAssertTrue(plan.deadlines.empty());
+    input.latePieces = {70};
+    plan = planWindow(input);
+    XCTAssertEqual(plan.deadlines.size(), size_t(1));
+    XCTAssertEqual(plan.deadlines[0].first, 70);
+    XCTAssertEqual(plan.deadlines[0].second, 100);
+    input.bounded = true;
+    input.latePieces = {};
+    plan = planWindow(input);
+    XCTAssertTrue(std::any_of(plan.deadlines.begin(), plan.deadlines.end(),
+                              [](std::pair<int32_t, int> const& d) { return d.first == 70; }));
 }
 
 - (void)testPiecesToDropAreFarAheadAndNeverPinned {
@@ -579,7 +667,7 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     // 1 MiB pieces: 8 tail pieces pinned, the stream waits for the last 2 (as before).
     FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
     std::vector<uint8_t> states(100, PieceMissing);
-    for (int i = 0; i < 5; ++i) states[size_t(i)] = PieceOnDisk;
+    for (int i = 0; i < 2; ++i) states[size_t(i)] = PieceOnDisk;
     PlanInput input;
     input.geometry = geo;
     input.readPosition = 0;
@@ -592,10 +680,11 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     for (int i = 92; i < 100; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 7);
     std::vector<int32_t> deadlinePieces;
     for (auto const& d : plan.deadlines) deadlinePieces.push_back(d.first);
-    XCTAssertEqual(deadlinePieces, (std::vector<int32_t>{5, 6, 7, 8, 98, 99}));
+    // The window is pieces 0..3 (on disk, but 2 and 3), then the last 2 tail pins.
+    XCTAssertEqual(deadlinePieces, (std::vector<int32_t>{2, 3, 98, 99}));
     // Without the split every missing pin is time-critical.
     input.urgentTailStart = -1;
-    XCTAssertEqual(planWindow(input).deadlines.size(), size_t(4 + 8));
+    XCTAssertEqual(planWindow(input).deadlines.size(), size_t(2 + 8));
 }
 
 - (void)testLowestAvailableOffsetFollowsTheConsumerAtOnce {

@@ -40,7 +40,12 @@ struct StreamConfig {
     BudgetPlan budget;
     bool bounded = false;
     int64_t reserveBytes = kDefaultReserveBytes;
-    int windowPieces = 1;                // deadline window (MIN_PIECES in full mode)
+    int windowPieces = 1;                // window ahead of the read piece (MIN_PIECES in full mode)
+    int deadlineHorizonPieces = 0;       // full mode: time-critical part of the window (0 = all of it,
+                                         // negative: none, only late pieces readers wait for)
+    int topPriorityPieces = 0;           // full mode: the window pieces at priority 7 (0 = all)
+    int lateAfterMs = 0;                 // full mode: a piece a reader waits for gets a deadline after
+                                         // this long (0: at once)
     int tailPieces = kTailPinPieces;     // pinned pieces at the end of the file
     int urgentTailPieces = 0;            // full mode: only the last `urgentTailPieces` of them get
                                          // deadlines (the stream waits for those), 0 = all
@@ -93,6 +98,7 @@ struct StreamStatistics {
     int64_t diskFullEvents = 0;
     int64_t fileErrors = 0;
     int64_t dontHaveSent = 0;
+    int64_t rescuedBlocks = 0;      // block requests of late pieces taken back from slow peers
     int64_t partialPunched = 0;
     int64_t reclaimedBytes = 0;     // allocation runaway: blocks punched out of regions with no data
     bool presized = false;          // the file was created at its final size (a hole) before any write
@@ -192,6 +198,11 @@ private:
     void resetDeadlines(libtorrent::torrent& torrent);
     void releasePieces(libtorrent::torrent& torrent, std::vector<int32_t> const& pieces, uint8_t newState);
     void punchPartialPieces(libtorrent::torrent& torrent);
+    /// How long a reader waits for a piece before it is late (see rescueLatePieces).
+    std::chrono::milliseconds lateThreshold() const;
+    /// Network thread, once a second: the requests for blocks of late pieces that slow or
+    /// stalled peers would deliver after kRescueEtaMs are taken back, for faster peers.
+    void rescueLatePieces(libtorrent::torrent& torrent);
     /// Allocation runaway backstop (network thread): the file holds far more blocks than
     /// its data while the disk is short; punches every missing piece libtorrent has no
     /// block of back to a hole. Returns the bytes punched.
@@ -257,6 +268,9 @@ private:
     std::atomic<int64_t> m_freedPieces{0}, m_droppedPieces{0}, m_punchedBytes{0}, m_punchErrors{0};
     std::atomic<int64_t> m_diskFullEvents{0}, m_fileErrors{0}, m_dontHaveSent{0}, m_partialPunched{0};
     std::atomic<int64_t> m_reclaimedBytes{0}, m_stuckRestored{0};
+    std::atomic<int64_t> m_rescuedBlocks{0};   // block requests taken back from slow peers
+    std::atomic<int64_t> m_torrentRate{0};     // payload bytes/s of the torrent (network thread, each tick)
+    std::chrono::steady_clock::time_point m_configuredAt; // set once by configure()
     std::atomic<bool> m_presized{false};
     std::atomic<int64_t> m_starvedSinceNanos{0}; // steady clock, 0 = not starved
     double m_lastReclaimTime = 0; // network thread

@@ -195,8 +195,17 @@ PlanOutput planWindow(PlanInput const& in) {
     out.readPiece = geo.pieceAt(in.readPosition);
     out.windowEndPiece = std::min(last + 1, out.readPiece + windowPieces);
 
-    int deadlineIndex = 0;
-    int32_t lastDeadlinePiece = out.readPiece - 1;
+    // Full mode: deadlines only within the horizon (none by default, see PTTorrentStreamer).
+    // While a torrent has any piece with a deadline, libtorrent keeps every peer to one normal
+    // request at a time, for priority-7 pieces only (request_blocks.cpp "time critical mode"),
+    // and sends the time-critical requests once a second: the whole download crawls at a
+    // fraction of what the peers can give. A window of the next missing pieces, wherever they
+    // were, kept it in that mode until the file was complete (NetworkBench, see
+    // BOUNDED_STORAGE.md "Network"). Horizon 0: the whole window; negative: no deadline ahead
+    // of time (pins included), only for the pieces a reader waits for.
+    int const horizon = in.deadlineHorizonPieces > 0 ? std::min(in.deadlineHorizonPieces, windowPieces)
+        : in.deadlineHorizonPieces == 0 ? windowPieces : 0;
+    bool const pinDeadlines = in.bounded || in.deadlineHorizonPieces >= 0;
     std::vector<int32_t> missingPins;
     int64_t lowest = 0;
 
@@ -248,9 +257,8 @@ PlanOutput planWindow(PlanInput const& in) {
             continue;
         }
 
-        bool const inWindow = in.bounded ? piece < out.windowEndPiece : deadlineIndex < windowPieces;
-        if (inWindow) {
-            int const step = in.bounded ? int(piece - out.readPiece) : deadlineIndex;
+        if (piece < out.windowEndPiece) {
+            int const step = int(piece - out.readPiece);
             // Bounded: 6 (kBoundedWindowPriority), not 7. libtorrent's sequential picker takes the
             // top-priority (7) pieces in a random order (its priority buckets are shuffled), and
             // the other wanted pieces in index order from the first one missing: with the whole
@@ -258,16 +266,18 @@ PlanOutput planWindow(PlanInput const& in) {
             // (7.1 s with a 12 MB/s seed, against 1.07 s in full mode: part-3 coverage md4, mc3).
             // At 6 the window comes in file order, after the pins and the pieces a reader waits for
             // (7: the read piece itself after a seek, see urgentPieces below).
-            out.priorities[size_t(i)] = in.bounded ? kBoundedWindowPriority : 7;
-            out.deadlines.emplace_back(piece, in.deadlineFirstMs + step * in.deadlineStepMs);
-            ++deadlineIndex;
-            lastDeadlinePiece = piece;
+            // Full mode: 7 for the first topPriorityPieces (before the gaps a seek left behind,
+            // at 1: the sequential picker takes 1 to 6 alike, in file order; few enough that
+            // their random order within priority 7 does not matter), 6 beyond, and a deadline
+            // within the horizon.
+            bool const timeCritical = in.bounded || step < horizon;
+            bool const top = !in.bounded && (in.topPriorityPieces <= 0 || step < in.topPriorityPieces || timeCritical);
+            out.priorities[size_t(i)] = top ? 7 : kBoundedWindowPriority;
+            if (timeCritical) out.deadlines.emplace_back(piece, in.deadlineFirstMs + step * in.deadlineStepMs);
         } else {
             out.priorities[size_t(i)] = 1;
         }
     }
-
-    if (!in.bounded) out.windowEndPiece = std::max(out.readPiece, lastDeadlinePiece + 1);
 
     for (int32_t piece : in.urgentPieces) {
         if (piece < first || piece > last) continue;
@@ -278,13 +288,19 @@ PlanOutput planWindow(PlanInput const& in) {
         bool const scheduled = out.priorities[i] == 7 && std::any_of(out.deadlines.begin(), out.deadlines.end(),
             [piece](std::pair<int32_t, int> const& d) { return d.first == piece; });
         out.priorities[i] = 7;
-        if (!scheduled) out.deadlines.emplace_back(piece, in.deadlineFirstMs);
+        // Full mode: a deadline only rescues a piece that is late (see lateDeadlinesOnly): any
+        // deadline throttles the whole torrent (see the horizon above).
+        bool const late = in.bounded || !in.lateDeadlinesOnly
+            || std::find(in.latePieces.begin(), in.latePieces.end(), piece) != in.latePieces.end();
+        if (!scheduled && late) out.deadlines.emplace_back(piece, in.deadlineFirstMs);
         out.urgent = true;
     }
 
 
     int const pinMs = in.deadlineFirstMs + windowPieces * in.deadlineStepMs;
-    for (int32_t piece : missingPins) out.deadlines.emplace_back(piece, pinMs);
+    if (pinDeadlines) {
+        for (int32_t piece : missingPins) out.deadlines.emplace_back(piece, pinMs);
+    }
     out.urgent = !out.deadlines.empty();
 
     // A piece the reader needs is late: until it is here, nothing beyond the ahead

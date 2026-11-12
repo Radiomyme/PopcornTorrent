@@ -15,13 +15,15 @@
 #import <libtorrent/alert_types.hpp>
 #import <libtorrent/bencode.hpp>
 #import <libtorrent/write_resume_data.hpp>
-#import <libtorrent/extensions/smart_ban.hpp>
-#import <libtorrent/extensions/ut_metadata.hpp>
+#import <libtorrent/announce_entry.hpp>
 #include "libtorrent/hex.hpp" // to_hex
 #include <libtorrent/peer_connection.hpp>
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/aux_/session_interface.hpp>
 #include <boost/asio/post.hpp>
+#include <algorithm>
+#include <cctype>
+#include <set>
 #import "../Bounded/PTStreamController.h"
 #import "../Resources/NSString+Localization.h"
 
@@ -36,6 +38,110 @@ using namespace libtorrent;
 
 // Testing aid: -1 = normal session, otherwise the loopback port (0 = any).
 static int PTLoopbackTestingPort = -1;
+// Testing aid: the network profile of another platform ("tv", "ios", "mac"; nil = this one).
+static NSString *PTNetworkProfileOverride = nil;
+
+#pragma mark - Network tuning
+
+// What each kind of device can afford to download fast (NetworkBench numbers and the
+// reasons for each value: BOUNDED_STORAGE.md, "Network").
+struct PTNetworkTuning {
+    int torrentConnections;   // peers per torrent (libtorrent: unlimited; this fork had 60)
+    int connectionsLimit;     // peers for the whole session (libtorrent: 200)
+    int connectionSpeed;      // connection attempts per second (libtorrent: 30)
+    int connectBoost;         // attempts at once when a torrent starts (libtorrent: 30)
+    int queuedDiskBytes;      // received data waiting for the disk before peers are no longer read (1 MiB)
+    int requestQueue;         // most block requests in flight to one peer (500, 16 KiB each)
+    bool portMapping;         // UPnP and NAT-PMP: peers behind the router can connect to us
+    bool localDiscovery;      // LSD (multicast)
+};
+
+static PTNetworkTuning PTNetworkTuningForProfile(NSString *profile) {
+    if (profile == nil) {
+#if TARGET_OS_TV
+        profile = @"tv";
+#elif TARGET_OS_IOS
+        profile = @"ios";
+#else
+        profile = @"mac";
+#endif
+    }
+    if ([profile isEqualToString:@"tv"]) {
+        // Plugged in, usually on Ethernet or 5 GHz Wi-Fi, a few GB of RAM: about 100 peers
+        // cost a few MB. tvOS has no local network privacy: UPnP, NAT-PMP and LSD need no
+        // entitlement and show no prompt (TN3179).
+        return {100, 300, 50, 50, 4 * 1024 * 1024, 500, true, true};
+    }
+    if ([profile isEqualToString:@"ios"]) {
+        // On battery. iOS asks the user before any unicast to the local network (NAT-PMP talks
+        // to the router) and needs the multicast entitlement for UPnP and LSD: none of them.
+        return {80, 200, 40, 40, 2 * 1024 * 1024, 500, false, false};
+    }
+    // Mac: more of everything. macOS 15+ asks once for the local network (the multicast
+    // entitlement is not needed there); UPnP / NAT-PMP / LSD just fail when it is denied.
+    return {200, 600, 100, 80, 16 * 1024 * 1024, 1000, true, true};
+}
+
+/// Public trackers added to every public torrent, after its own: magnets from the indexers
+/// often carry few trackers (or dead ones) and peers come faster from several at once (every
+/// tracker and tier is announced to, see setupSession). Never added to private torrents
+/// (BEP 27) nor in the offline tests.
+static std::vector<std::string> const& PTDefaultTrackers() {
+    static std::vector<std::string> const trackers = {
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://open.stealth.si:80/announce",
+        "udp://tracker.torrent.eu.org:451/announce",
+        "udp://exodus.desync.com:6969/announce",
+        "udp://explodie.org:6969/announce",
+        "udp://tracker.dler.org:6969/announce",
+        "udp://tracker.qu.ax:6969/announce",
+        "udp://opentracker.io:6969/announce",
+        "udp://tracker.theoks.net:6969/announce",
+        "udp://tracker-udp.gbitt.info:80/announce",
+        "udp://tracker.tiny-vps.com:6969/announce",
+        "http://tracker.opentrackr.org:1337/announce",
+    };
+    return trackers;
+}
+
+/// `existing` followed by the default trackers it does not have yet (same URL, ignoring case
+/// and a trailing slash), each in its own tier after the existing ones.
+static void PTAppendDefaultTrackers(std::vector<std::string>& trackers, std::vector<int>& tiers) {
+    auto normalized = [](std::string url) {
+        std::transform(url.begin(), url.end(), url.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        while (!url.empty() && url.back() == '/') url.pop_back();
+        return url;
+    };
+    if (tiers.size() != trackers.size()) tiers.resize(trackers.size(), 0);
+    std::set<std::string> known;
+    int tier = 0;
+    for (size_t i = 0; i < trackers.size(); ++i) {
+        known.insert(normalized(trackers[i]));
+        tier = std::max(tier, tiers[i] + 1);
+    }
+    for (std::string const& url : PTDefaultTrackers()) {
+        if (!known.insert(normalized(url)).second) continue;
+        trackers.push_back(url);
+        tiers.push_back(tier++);
+    }
+}
+
+/// The TCP/UDP port the session listens on (the next 10 when it is taken): picked at random
+/// once per installation, outside the well-known BitTorrent ports (6881-6889) some networks
+/// throttle or block, and not shared by two devices behind the same router (their port
+/// mappings would collide), kept in the app's defaults so the router's mapping and the peers
+/// that learned it stay valid.
+static int PTListenPort(void) {
+    static NSString *const key = @"PopcornTorrentListenPort";
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    int port = (int)[defaults integerForKey:key];
+    if (port < 1024 || port > 65000) {
+        port = 20000 + (int)arc4random_uniform(28000); // below the ephemeral range (49152+)
+        [defaults setInteger:port forKey:key];
+    }
+    return port;
+}
 
 @interface PTTorrentsSession () {
 }
@@ -54,6 +160,7 @@ static int PTLoopbackTestingPort = -1;
 @implementation PTTorrentsSession {
     libtorrent::session *_session;
     std::string _listenInterfaces;
+    int _torrentConnections;
     bool _dhtEnabled;
     int _minReconnectTime;
     NSInteger _reopenGeneration;
@@ -61,6 +168,45 @@ static int PTLoopbackTestingPort = -1;
 
 + (void)prepareSharedSessionForLoopbackTestingOnPort:(int)port {
     PTLoopbackTestingPort = MAX(0, port);
+}
+
++ (void)setNetworkProfileForTesting:(NSString *)profile {
+    PTNetworkProfileOverride = [profile copy];
+}
+
++ (NSArray<NSString *> *)trackersForTesting:(NSArray<NSString *> *)trackers {
+    std::vector<std::string> list;
+    for (NSString *url in trackers) list.push_back(url.UTF8String);
+    std::vector<int> tiers;
+    for (size_t i = 0; i < list.size(); ++i) tiers.push_back(int(i));
+    PTAppendDefaultTrackers(list, tiers);
+    NSMutableArray<NSString *> *result = [NSMutableArray array];
+    for (std::string const& url : list) [result addObject:[NSString stringWithUTF8String:url.c_str()]];
+    return result;
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)networkSettingsForTesting {
+    if (_session == nullptr) return @{};
+    settings_pack const pack = _session->get_settings();
+    return @{
+        @"connections_limit": @(pack.get_int(settings_pack::connections_limit)),
+        @"connection_speed": @(pack.get_int(settings_pack::connection_speed)),
+        @"torrent_connect_boost": @(pack.get_int(settings_pack::torrent_connect_boost)),
+        @"max_queued_disk_bytes": @(pack.get_int(settings_pack::max_queued_disk_bytes)),
+        @"max_out_request_queue": @(pack.get_int(settings_pack::max_out_request_queue)),
+        @"peer_connect_timeout": @(pack.get_int(settings_pack::peer_connect_timeout)),
+        @"utp_connect_timeout": @(pack.get_int(settings_pack::utp_connect_timeout)),
+        @"file_pool_size": @(pack.get_int(settings_pack::file_pool_size)),
+        @"request_queue_time": @(pack.get_int(settings_pack::request_queue_time)),
+        @"whole_pieces_threshold": @(pack.get_int(settings_pack::whole_pieces_threshold)),
+        @"announce_to_all_tiers": @(pack.get_bool(settings_pack::announce_to_all_tiers)),
+        @"announce_to_all_trackers": @(pack.get_bool(settings_pack::announce_to_all_trackers)),
+        @"enable_upnp": @(pack.get_bool(settings_pack::enable_upnp)),
+        @"enable_natpmp": @(pack.get_bool(settings_pack::enable_natpmp)),
+        @"enable_lsd": @(pack.get_bool(settings_pack::enable_lsd)),
+        @"enable_dht": @(pack.get_bool(settings_pack::enable_dht)),
+        @"torrent_connections": @(_torrentConnections),
+    };
 }
 
 - (int)listenPort {
@@ -123,13 +269,19 @@ static int PTLoopbackTestingPort = -1;
 
 - (void)setupSession {
     settings_pack pack = default_settings();
+    PTNetworkTuning const tuning = PTNetworkTuningForProfile(PTNetworkProfileOverride);
     
+    // libtorrent's node first (dht.libtorrent.org:25401), then the well-known routers. (A stray
+    // quote used to make "dht.transmissionbt.com:6881'" an invalid entry.)
     auto dht_nodes = pack.get_str(settings_pack::dht_bootstrap_nodes);
-    dht_nodes += ",router.bittorrent.com:6881,router.utorrent.com:6881,router.bitcomet.com:6881,dht.transmissionbt.com:6881',dht.aelitis.com:6881,";
+    dht_nodes += ",router.bittorrent.com:6881,router.utorrent.com:6881,router.bitcomet.com:6881,dht.transmissionbt.com:6881,dht.aelitis.com:6881";
     pack.set_str(settings_pack::dht_bootstrap_nodes, dht_nodes);
     
-    pack.set_str(settings_pack::listen_interfaces, "0.0.0.0:6881,[::]:6881");
-    pack.set_int(settings_pack::max_retry_port_bind, 6889 - 6881);
+    if (PTLoopbackTestingPort < 0) {
+        std::string const port = std::to_string(PTListenPort());
+        pack.set_str(settings_pack::listen_interfaces, "0.0.0.0:" + port + ",[::]:" + port);
+    }
+    pack.set_int(settings_pack::max_retry_port_bind, 10);
     
     pack.set_int(settings_pack::alert_mask,
                  alert::status_notification |
@@ -140,12 +292,44 @@ static int PTLoopbackTestingPort = -1;
     
     pack.set_bool(settings_pack::listen_system_port_fallback, false);
     pack.set_bool(settings_pack::suggest_read_cache, false);
-    // libtorrent 1.1 enables UPnP & NAT-PMP by default
-    // turn them off before `libt::session` ctor to avoid split second effects
-    pack.set_bool(settings_pack::enable_upnp, false);
-    pack.set_bool(settings_pack::enable_natpmp, false);
+    // Port mapping (see PTNetworkTuning): without it no peer behind another NAT can ever
+    // connect to us. Set before the session starts (no split second of defaults).
+    pack.set_bool(settings_pack::enable_upnp, tuning.portMapping);
+    pack.set_bool(settings_pack::enable_natpmp, tuning.portMapping);
     pack.set_bool(settings_pack::upnp_ignore_nonrouters, true);
-    pack.set_int(settings_pack::file_pool_size, 2);
+    pack.set_bool(settings_pack::enable_lsd, tuning.localDiscovery);
+    // The selected file, the part file of the others and another torrent's (a stream next to
+    // a download): 2 made libtorrent close and reopen files between writes.
+    pack.set_int(settings_pack::file_pool_size, 8);
+
+    // Peers: more of them, found faster (see PTNetworkTuning). A magnet lists each tracker in
+    // its own tier and libtorrent announced to the first tier that answered only: one tracker.
+    pack.set_int(settings_pack::connections_limit, tuning.connectionsLimit);
+    pack.set_int(settings_pack::connection_speed, tuning.connectionSpeed);
+    pack.set_int(settings_pack::torrent_connect_boost, tuning.connectBoost);
+    pack.set_bool(settings_pack::announce_to_all_tiers, true);
+    pack.set_bool(settings_pack::announce_to_all_trackers, true);
+    // Most peers found by trackers and the DHT do not answer: give up on them after 7 s
+    // instead of 15 (each one holds a connection slot meanwhile).
+    pack.set_int(settings_pack::peer_connect_timeout, 7);
+    // libtorrent tries uTP first with every new peer; a peer without uTP (rtorrent seedboxes)
+    // was only tried over TCP after 3 s.
+    pack.set_int(settings_pack::utp_connect_timeout, 1500);
+    // Throughput: received blocks waiting for the disk (above it libtorrent stops reading
+    // the sockets), requests in flight per peer (fills the bandwidth-delay product of a fast,
+    // distant peer: 500 x 16 KiB = 8 MiB, 1000 on the Mac).
+    pack.set_int(settings_pack::max_queued_disk_bytes, tuning.queuedDiskBytes);
+    pack.set_int(settings_pack::max_out_request_queue, tuning.requestQueue);
+    // Fast peers no longer take whole pieces each (libtorrent: when a peer could download a
+    // piece in 20 s): the blocks of the next pieces are spread over every peer, so pieces
+    // complete in file order at the speed of the whole swarm, not one at the speed of the peer
+    // that took it (a stream waits for the next piece, not for any piece).
+    pack.set_int(settings_pack::whole_pieces_threshold, 0);
+    // Requests in flight per peer: 1 s of its rate instead of 3 (still several times the
+    // bandwidth-delay product of a distant peer). A request is served after the ones queued
+    // before it: a seek, or the next piece of a stream, waited behind 3 s of each peer's queue.
+    pack.set_int(settings_pack::request_queue_time, 1);
+    _torrentConnections = tuning.torrentConnections;
 
     if (PTLoopbackTestingPort >= 0) {
         // Offline tests: localhost only, no DHT, LSD, UPnP or NAT-PMP.
@@ -154,6 +338,8 @@ static int PTLoopbackTestingPort = -1;
         pack.set_str(settings_pack::dht_bootstrap_nodes, "");
         pack.set_bool(settings_pack::enable_dht, false);
         pack.set_bool(settings_pack::enable_lsd, false);
+        pack.set_bool(settings_pack::enable_upnp, false);
+        pack.set_bool(settings_pack::enable_natpmp, false);
         pack.set_bool(settings_pack::allow_multiple_connections_per_ip, true);
     }
 
@@ -161,12 +347,10 @@ static int PTLoopbackTestingPort = -1;
     _dhtEnabled = pack.get_bool(settings_pack::enable_dht);
     _minReconnectTime = pack.get_int(settings_pack::min_reconnect_time);
 
-    // Settings take effect before the session starts (no split second of defaults).
+    // Settings take effect before the session starts (no split second of defaults). The
+    // session parameters bring libtorrent's default plugins: ut_metadata, ut_pex and smart_ban
+    // (ut_metadata and smart_ban used to be added a second time).
     _session = new session(session_params(std::move(pack)));
-    
-    // Enabling plugins
-    _session->add_extension(&lt::create_smart_ban_plugin);
-    _session->add_extension(&lt::create_ut_metadata_plugin);
 }
 
 - (void)setupAlertLoop {
@@ -291,7 +475,15 @@ static int PTLoopbackTestingPort = -1;
     // Streams always run; downloads run until they are paused, explicitly.
     torrentParams.flags &= ~libtorrent::torrent_flags::auto_managed;
     torrentParams.flags &= ~libtorrent::torrent_flags::paused;
-    torrentParams.flags |= libtorrent::torrent_flags::sequential_download;
+    // Streams fetch the file in order (bounded storage depends on it); an offline download
+    // nobody plays fetches the rarest pieces first (PTTorrentDownload, wantsSequentialDownload).
+    if ([torrentStreamer wantsSequentialDownload]) {
+        torrentParams.flags |= libtorrent::torrent_flags::sequential_download;
+    } else {
+        torrentParams.flags &= ~libtorrent::torrent_flags::sequential_download;
+    }
+    bool const isPrivate = torrentParams.ti && torrentParams.ti->priv();
+    if (PTLoopbackTestingPort < 0 && !isPrivate) PTAppendDefaultTrackers(torrentParams.trackers, torrentParams.tracker_tiers);
     // A torrent still in libtorrent but not registered here is an error, not a silent reuse
     // (it would not have this stream's plugin).
     torrentParams.flags |= libtorrent::torrent_flags::duplicate_is_error;
@@ -304,7 +496,7 @@ static int PTLoopbackTestingPort = -1;
         return th;
     }
     
-    th.set_max_connections(60);
+    th.set_max_connections(_torrentConnections);
     th.set_max_uploads(10);
     
     @synchronized (self) {

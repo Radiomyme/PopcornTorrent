@@ -12,6 +12,8 @@
 //   SessionHarness background <work>  the tvOS "long background" network reopen during a stream
 //   SessionHarness premetadata <work> a magnet's status before its metadata: its only peer, a
 //                                     seeder that starts late, shows in the progress block
+//   SessionHarness network <work> [tv|ios|mac]  the network settings of a profile, the default
+//                                     trackers, streams in file order, downloads rarest first
 // Generated payloads (random bytes), private torrents without trackers, a seeder on 127.0.0.1,
 // the streamer's shared session loopback-only (no DHT, LSD, UPnP, NAT-PMP). Run it under
 // sandbox-exec with localhost-only.sb. Every stream and download writes under <work>.
@@ -35,6 +37,7 @@
 #include <libtorrent/address.hpp>
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/announce_entry.hpp>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -909,14 +912,105 @@ static int runPreMetadata(NSString *work) {
     return 0;
 }
 
+/// The network settings of a profile (see PTNetworkTuning in PTtorrentsSession.mm), the default
+/// trackers, and the piece order: streams in order, an offline download rarest first until a
+/// stream joins it. `profile`: "tv", "ios", "mac" or nil (this Mac).
+static int runNetwork(NSString *work, NSString *profile) {
+    NSString *expected = profile ?: @"mac";
+    NSDictionary<NSString *, NSNumber *> *net = [[PTTorrentsSession sharedSession] networkSettingsForTesting];
+    logf(@"profile %@: %@", expected, [[net description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
+    NSDictionary<NSString *, NSArray<NSNumber *> *> *values = @{
+        // torrent_connections, connections_limit, connection_speed, torrent_connect_boost, max_queued_disk_bytes, max_out_request_queue
+        @"tv":  @[@100, @300, @50, @50, @(4 << 20), @500],
+        @"ios": @[@80, @200, @40, @40, @(2 << 20), @500],
+        @"mac": @[@200, @600, @100, @80, @(16 << 20), @1000],
+    };
+    NSArray<NSNumber *> *v = values[expected];
+    BOOL const tuned = [net[@"torrent_connections"] isEqual:v[0]] && [net[@"connections_limit"] isEqual:v[1]]
+        && [net[@"connection_speed"] isEqual:v[2]] && [net[@"torrent_connect_boost"] isEqual:v[3]]
+        && [net[@"max_queued_disk_bytes"] isEqual:v[4]] && [net[@"max_out_request_queue"] isEqual:v[5]];
+    check(tuned, [NSString stringWithFormat:@"%@ profile limits", expected],
+          [NSString stringWithFormat:@"peers %@/torrent, %@ in all, %@ connects/s, boost %@, disk queue %@, request queue %@",
+           net[@"torrent_connections"], net[@"connections_limit"], net[@"connection_speed"], net[@"torrent_connect_boost"],
+           net[@"max_queued_disk_bytes"], net[@"max_out_request_queue"]]);
+    check([net[@"announce_to_all_tiers"] boolValue] && [net[@"announce_to_all_trackers"] boolValue]
+          && [net[@"peer_connect_timeout"] intValue] == 7 && [net[@"utp_connect_timeout"] intValue] == 1500 && [net[@"file_pool_size"] intValue] == 8
+          && [net[@"request_queue_time"] intValue] == 1 && [net[@"whole_pieces_threshold"] intValue] == 0,
+          @"common settings", @"every tracker and tier, 7 s connect timeout, uTP 1.5 s, 8 open files, 1 s request queue, no whole pieces");
+    // Loopback testing: nothing leaves 127.0.0.1, whatever the profile.
+    check(![net[@"enable_upnp"] boolValue] && ![net[@"enable_natpmp"] boolValue] && ![net[@"enable_lsd"] boolValue] && ![net[@"enable_dht"] boolValue],
+          @"offline session: no UPnP, NAT-PMP, LSD, DHT", @"");
+
+    NSArray<NSString *> *trackers = [PTTorrentsSession trackersForTesting:@[@"udp://tracker.example.org:1337/announce", @"UDP://tracker.opentrackr.org:1337/announce/"]];
+    check(trackers.count == 2 + 13 - 1 && [trackers[0] isEqualToString:@"udp://tracker.example.org:1337/announce"]
+          && ![trackers containsObject:@"udp://tracker.opentrackr.org:1337/announce"] && [trackers containsObject:@"udp://open.demonii.com:1337/announce"],
+          @"default trackers after the torrent's own, no duplicate", [NSString stringWithFormat:@"%lu trackers: %@", (unsigned long)trackers.count,
+                                                                     [trackers componentsJoinedByString:@" "]]);
+
+    NSString *streams = [work stringByAppendingPathComponent:@"streams"];
+    NSString *offline = [work stringByAppendingPathComponent:@"offline"];
+    Seeder seeder;
+    int const seederPort = seeder.port;
+    Payload p = makePayload(work, @"net", 48LL << 20, 1 << 20);
+    (void)seeder.seed(p, 1 << 20); // 1 MiB/s: still downloading during the checks
+
+    PTTorrentDownload *d = makeDownload(p.torrent, offline, @"net-dl");
+    spin(30, ^BOOL { nudge(d, seederPort); return d.torrentStatus.totalProgress > 0.05; });
+    lt::torrent_status st = d.torrentHandle.status();
+    std::vector<lt::announce_entry> const dlTrackers = d.torrentHandle.trackers();
+    check(!(st.flags & lt::torrent_flags::sequential_download) && d.torrentHandle.max_connections() == [net[@"torrent_connections"] intValue]
+          && dlTrackers.empty(),
+          @"download: rarest first, peers per torrent, no tracker added (private, offline)",
+          [NSString stringWithFormat:@"sequential %d, max connections %d, trackers %zu, %@", (int)(bool)(st.flags & lt::torrent_flags::sequential_download),
+           d.torrentHandle.max_connections(), dlTrackers.size(), describe(d)]);
+
+    auto rg = std::make_shared<StreamResult>();
+    PTTorrentStreamer *g = [PTTorrentStreamer new];
+    g.downloadDirectoryOverride = streams;
+    startStream(g, p.torrent, rg, @"G");
+    BOOL const ready = waitReady(g, rg, seederPort, 60);
+    spin(1, nil);
+    st = d.torrentHandle.status();
+    check(ready && g.isGuest && (st.flags & lt::torrent_flags::sequential_download), @"a stream joins the download: in file order",
+          [NSString stringWithFormat:@"ready %d, guest %d, sequential %d", ready, g.isGuest, (int)(bool)(st.flags & lt::torrent_flags::sequential_download)]);
+    [g cancelStreamingAndDeleteData:YES];
+    spin(1, nil);
+    st = d.torrentHandle.status();
+    check(!(st.flags & lt::torrent_flags::sequential_download) && d.downloadStatus != PTTorrentDownloadStatusFailed,
+          @"the stream leaves: rarest first again", describe(d));
+    [d stop];
+
+    Payload p2 = makePayload(work, @"net2", 24LL << 20, 1 << 20);
+    (void)seeder.seed(p2, 4 << 20);
+    auto rs = std::make_shared<StreamResult>();
+    PTTorrentStreamer *s = [PTTorrentStreamer new];
+    s.downloadDirectoryOverride = streams;
+    startStream(s, p2.torrent, rs, @"S");
+    BOOL const readyS = waitReady(s, rs, seederPort, 60);
+    st = s.torrentHandle.status();
+    check(readyS && (st.flags & lt::torrent_flags::sequential_download) && s.torrentHandle.max_connections() == [net[@"torrent_connections"] intValue],
+          @"stream: in file order, peers per torrent",
+          [NSString stringWithFormat:@"ready %d, sequential %d, max connections %d", readyS, (int)(bool)(st.flags & lt::torrent_flags::sequential_download),
+           s.torrentHandle.max_connections()]);
+    if (readyS) {
+        NSString *detail = nil;
+        check(readAndCompare(rs->url.port.intValue, s.fileName, p2, 0, p2.size, 60, &detail), @"stream reads the whole file", detail);
+    }
+    [s cancelStreamingAndDeleteData:YES];
+    spin(1, nil);
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata <workdir>\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata|network <workdir> [tv|ios|mac]\n"); return 2; }
         NSString *mode = [NSString stringWithUTF8String:argv[1]];
         NSString *work = [NSString stringWithUTF8String:argv[2]];
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
         [[NSFileManager defaultManager] createDirectoryAtPath:work withIntermediateDirectories:YES attributes:nil error:nil];
         [PTTorrentsSession prepareSharedSessionForLoopbackTestingOnPort:0];
+        NSString *profile = argc > 3 ? [NSString stringWithUTF8String:argv[3]] : nil;
+        if (profile) [PTTorrentsSession setNetworkProfileForTesting:profile];
         int rc = 2;
         if ([mode isEqualToString:@"zombie"]) rc = runZombie(work);
         else if ([mode isEqualToString:@"starve"]) rc = runStarve(work);
@@ -924,6 +1018,7 @@ int main(int argc, const char *argv[]) {
         else if ([mode isEqualToString:@"background"]) rc = runBackground(work);
         else if ([mode isEqualToString:@"legacy"]) rc = runLegacy(work);
         else if ([mode isEqualToString:@"premetadata"]) rc = runPreMetadata(work);
+        else if ([mode isEqualToString:@"network"]) rc = runNetwork(work, profile);
         logf(@"RESULT %@: %d passed, %d failed (rc %d)", mode, gPasses, gFailures, rc);
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
         return gFailures > 0 ? 1 : rc;

@@ -227,14 +227,25 @@ Only pieces of the selected file are ever wanted (fixes the old
 | consumed while missing (a gap skipped by a seek), bounded | 0, forever: "gone", like freed data |
 | freed | 0, forever |
 
-Full mode keeps today's window: the next MIN_PIECES missing pieces at or after
-the read position with 100 ms deadlines, every piece of the file wanted. The tail
-pin is the same byte-sized one (MKV Cues, an MP4 `moov` at the end are there at
-open), but the stream still waits only for the last 1 or 2 pieces, as before: only
-those get deadlines (`urgentTailStart`), the rest of the tail comes at priority 7
-right after the head window. (Gating readiness on the whole tail was tried: in the
-session harness, with 256 KiB pieces at 256 KiB/s, a stream became ready in 15.5 s
-instead of 8 s.)
+Full mode: the window is the MIN_PIECES pieces from the read piece (not the next
+MIN_PIECES missing ones wherever they are, until 5.2.0), every piece of the file wanted
+(the rest at 1, in file order). Its first pieces, at least 8 MiB and 2 pieces
+(`topPriorityPieces`), are at priority 7, the rest of the window at 6: after a forward
+seek the gap left behind (priority 1) would otherwise come before the window (the
+sequential picker takes 1 to 6 alike, in file order), and a whole window at 7 comes in a
+random order. It has **no libtorrent deadline ahead of time** since 5.2.0 (see Network:
+a deadline anywhere held every peer to one request at a time, for the whole download).
+A piece an HTTP reader waits for gets priority 7 at once, and a 100 ms deadline only once
+it is late (`lateAfterMs`, 1 s, and at least the time two pieces take at the torrent's
+current rate, `lateThreshold`); the requests slow peers hold for a late piece are taken
+back (`rescueLatePieces`, both modes). The planner still supports deadlines ahead of time
+(`deadlineHorizonPieces`: 0 = the whole window, N = its first N pieces, negative = none,
+the full-mode setting) and a whole window at 7 (`topPriorityPieces` 0). The tail pin
+is the same byte-sized one (MKV Cues, an MP4 `moov` at the end are there at open), but
+the stream still waits only for the last 1 or 2 pieces, as before (`urgentTailStart`),
+the rest of the tail comes at priority 7 right after the head window. (Gating readiness
+on the whole tail was tried: in the session harness, with 256 KiB pieces at 256 KiB/s,
+a stream became ready in 15.5 s instead of 8 s.)
 
 Piece priorities are compared with libtorrent's own on every update (not with a
 cache): `prioritize_files()` takes a disk-thread round trip and then rewrites every
@@ -541,6 +552,122 @@ dropped peers, and peers lost while the app was suspended, come back at once.
   is removed once the new one is written (before: a new download from zero into another
   folder, maybe of file #0 of a multi-file torrent, listed twice).
 
+## Network (5.2.0)
+
+The session used to run on libtorrent's defaults. What capped the download, and what
+changed (`PTtorrentsSession.mm`, `PTNetworkTuning`; the full-mode window in
+`PTBoundedLogic.cpp` / `PTStreamController.mm`):
+
+**Time-critical mode (the main cap).** While any piece of a torrent has a deadline,
+libtorrent keeps every peer to *one* normal request at a time, for priority-7 pieces
+only, and sends time-critical requests once a second, at most about 2 s of each peer's
+rate (`request_blocks.cpp` "time critical mode", `torrent::request_time_critical_pieces`).
+Full mode put 100 ms deadlines on the next MIN_PIECES *missing* pieces wherever they were,
+so a stream stayed in that mode until its file was complete; an offline download (its
+controller is a full-mode one) too. With a fresh peer it also ramps slowly: its rate is
+unknown, so it gets one time-critical block per second. Now full mode has no deadline
+ahead of time (see Window): the head window, the rest of the window and the file come from
+the normal pipeline (`request_queue_time` of each peer's rate in flight, slow start), in
+file order. A piece a reader waits for gets a deadline only once it is late
+(`lateThreshold`: 1 s, at least two pieces' time at the torrent's rate, so a slow
+connection does not toggle the mode on every piece). Late pieces, and before the stream is
+ready the pieces it needs (head and tail, waited for since the stream was configured), are
+rescued once a second (`rescueLatePieces`, both modes): the requests for them held by a peer
+slower than a quarter of the mean rate of the peers we download from, which it would
+deliver more than 1.5 s later (from its position in that peer's queue, at its rate), are
+cancelled, so faster peers take them. libtorrent itself only takes them back after
+`piece_timeout` (20 s), and its time-critical re-requests need the average time of earlier
+time-critical pieces, unknown until some were downloaded that way. Every new peer gets a
+few requests at once: a stalled one given a block of the head held the start back until
+that block came (NetworkBench, a 4 KB/s peer among 7 at 1.5 MB/s: ready after 16-20 s
+without this rescue, 7.1 s with it, 13.7 s before 5.2.0).
+
+**Whole pieces per peer.** libtorrent gives a peer that could download a piece within
+`whole_pieces_threshold` (20 s) whole pieces: the next piece of a stream then comes at the
+speed of the one peer that took it, and a reader at the download frontier waits on it.
+`whole_pieces_threshold` is 0: the next pieces' blocks are spread over every peer.
+
+**Request queue.** Each peer gets `request_queue_time` of its rate in requests: 3 s → 1 s
+(still several times the bandwidth-delay product of a distant peer: 1.5 MB in flight to a
+1.5 MB/s peer 100 ms away). A peer serves its requests in order: without time-critical
+mode, a seek (or a piece taken back from a slow peer) waited behind 3 s of every peer's
+queue (NetworkBench, first MiB after a forward seek: 3.3 s with 3 s, 1.7 s with 1 s).
+
+**Piece order.** Streams stay sequential (bounded storage relies on it). An offline
+download nobody plays is rarest first (`PTTorrentDownload wantsSequentialDownload`); it
+turns sequential while it is played (`playWithHandler:`) or a stream joined it, and back.
+
+**Peers.** Per torrent 60 → 100 (tvOS) / 80 (iOS) / 200 (Mac); session 200 → 300 / 200 /
+600; connection attempts per second 30 → 50 / 40 / 100 and at a torrent's start 30 → 50 /
+40 / 80; `peer_connect_timeout` 15 → 7 s (most peers from trackers and the DHT never answer,
+each holds a connection slot meanwhile); `utp_connect_timeout` 3 → 1.5 s (libtorrent tries
+uTP first with every new peer; one without uTP, e.g. an rtorrent seedbox, was tried over
+TCP after 3 s, plus up to 1 s to the next connection round). Every tracker and every tier
+is announced to (`announce_to_all_tiers`, `announce_to_all_trackers`): a magnet puts each
+tracker in its own tier and libtorrent announced to the first that answered only. Public
+torrents get 13 well-known public trackers after their own (`PTDefaultTrackers`; never
+private torrents, never in loopback testing). The DHT bootstrap list had a stray quote
+(`dht.transmissionbt.com:6881'`). `ut_metadata` and `smart_ban` were added twice (the
+session parameters already bring libtorrent's default plugins).
+
+**Incoming connections.** UPnP and NAT-PMP were off: nobody behind another NAT could ever
+connect to us. They are on for tvOS (no local network privacy there, TN3179) and the Mac
+(macOS 15+ asks once for the local network; LSD, on by default, already sends multicast;
+when the user refuses they just fail). Off on iOS: NAT-PMP is unicast to the router (the
+local network prompt), UPnP and LSD multicast need the multicast entitlement (LSD is off
+there too: it could never work). The listen port is random (20000-47999), chosen once and
+kept in the app's defaults (`PopcornTorrentListenPort`), the next 10 ports when taken:
+6881 is throttled or blocked on some networks, and two devices behind one router would
+compete for the same mapping.
+
+**Throughput.** `max_queued_disk_bytes` (received data waiting for the disk; above it
+libtorrent stops reading every socket) 1 MiB → 4 MiB (tvOS) / 2 MiB (iOS) / 16 MiB (Mac);
+`max_out_request_queue` 500 (tvOS, iOS: 8 MiB in flight per peer) / 1000 (Mac);
+`file_pool_size` 2 → 8 (the selected file, the part file and another torrent's). Unchanged
+on purpose: the disk cache (32 MiB, the tvOS memory limit), socket buffers (0: the
+system's autotuning), encryption (enabled, not forced), uTP/TCP mixed mode, the upload
+(no limit, 8 unchoke slots).
+
+### NetworkBench results (Mac, 2026-11-12)
+
+`Tools/NetworkBench`: libtorrent seeders on 127.0.0.1, one per peer, each behind a userspace
+TCP proxy that delays both directions by half the round trip and caps what the seeder sends
+(token bucket, a bottleneck buffer of about 250 ms); the client is the fork's
+`PTTorrentStreamer` / `PTTorrentDownload` with the production settings, loopback-only, dialing
+the proxies (TCP: they carry no uTP). 2 MiB pieces. "Before" is 26df96d4 (5.1.0's fork), the
+same bench. Without delay the setup gives 96 % of the cap (3.83 of 4 MB/s): the proxies are
+not the bottleneck. Ready times include about 4 s (before: 5.5 s) of connection setup: the
+first uTP attempt to each peer times out before TCP (`utp_connect_timeout`).
+
+| Swarm | Run | Before | After |
+|---|---|---|---|
+| S1: 8 peers × 1.5 MB/s (12 MB/s), RTT 30-100 ms, 512 MiB | stream, reader as fast as the data comes: ready / file complete / mean rate | 12.9-13.3 s / 65.2-65.8 s / 8.9-9.0 MB/s (3 runs) | 5.96-5.98 s / 48.8-49.1 s / 11.8-11.9 MB/s (3) |
+| S1 | offline download: complete / rate | 65.1-65.3 s / 9.0 MB/s (2) | 48.8 s / 11.9 MB/s (2) |
+| S1 | stream read at 3 MB/s, forward seek 15 % → 90 %: ready / first MiB after the seek / complete | 12.9 s / 1.15 s / 64.5 s (1) | 6.0-6.2 s / 1.17-1.53 s / 48.7-49.3 s (2) |
+| S1, 1 GiB on a 1.4 GB volume (bounded) | ready / 384 MiB read / downloaded | 12.8-14.3 s / 40.9-42.3 s / 415-431 MiB (2) | 8.9-12.7 s / 38.2 s / 404 MiB (2) |
+| S2: 6 peers × 6 MB/s (36 MB/s), RTT 40-140 ms, 1 GiB | stream: ready / complete / rate | 16.8 s / 98-101 s / 11.3-11.6 MB/s (2) | 5.6 s / 34.1 s / 35.3-35.4 MB/s (2) |
+| S2 | offline download | 98.6-98.9 s / 11.5-11.6 MB/s (2) | 34.1 s / 35.4 MB/s (2) |
+| S4: S1 with one peer stalled (4 KB/s) | stream: ready / rate (the 7 others give 10.5 MB/s) | 13.7 s / 8.1 MB/s (1) | 7.1 s / 10.0-10.1 MB/s (2), 12-14 blocks rescued |
+| tvOS profile (`--profile tv`) | S1 stream / S1 download / S2 stream | | 5.9 s, 11.9 MB/s / 11.9 MB/s / 5.6 s, 35.4 MB/s |
+
+Variants tried on S1 (stream, greedy reader, 2 runs each): deadlines on the next missing
+pieces (before) 9.0 MB/s, ready 13 s; deadlines only on the pieces the reader waits for,
+whole pieces per peer kept: 4.3-4.9 MB/s (the next piece came from one peer, and every wait
+switched time-critical mode on and off); the whole window from the read piece with deadlines:
+9.3 MB/s, ready 11 s; its first 4 pieces: 7.9 MB/s; no deadline ahead of time and whole
+pieces kept: 11.3 MB/s, ready 6.7-8.3 s; no deadline ahead of time, `whole_pieces_threshold`
+0: 11.9 MB/s, ready 5.7-6.2 s (with or without the late-piece deadline). The forward seek
+with `request_queue_time` 3 s: 3.3 s to the first MiB (and 6.6 s of stalls after it, a
+window at 7 in random order); 1 s: 1.2-1.7 s. The stalled peer: ready after 16-20 s with the
+rescue for waiting readers only (nobody reads before the stream is ready), 7.1 s once the
+required pieces count as waited for.
+
+Tests on this version (all under `localhost-only.sb`): `PopcornTorrentLogicTests` 39/39,
+`PopcornTorrent-Tests` 4/4 (offline, 4.9 s), SessionHarness network 9/9 for each profile (tv,
+ios, mac), zombie 8/8, starve 8/8, guest 16/16, background 5/5, legacy 6/6, premetadata 12/12;
+BoundedStorageHarness bounded (6 GiB, 3 GB volume, 40 MB/s, 60 s pause, 2 GiB budget) 21/21,
+bounded with 2 forward seeks 23/23 (0.3 s stalled), full (6 GiB, 8 GB volume) 14/14.
+
 ## Statistics and tracing
 
 `storageStatistics` keys: `bounded, fileSize, pieceLength, torrentBudget,
@@ -548,7 +675,7 @@ aheadBudget, aheadBytes, behindBytes, pinnedBytes, dataBytes, bytesOnDisk,
 freeBytes, reserveBytes, readPosition, consumedBefore, lowestAvailableOffset,
 servedOffset, headPinEnd, tailPinStart, everDownloaded, freedPieces,
 droppedPieces, punchedBytes, punchErrors, diskFullEvents, fileErrors,
-dontHaveSent, partialPiecesPunched, reclaimedBytes, presized, stuckPiecesRestored, diskStarvedSeconds,
+dontHaveSent, rescuedBlocks, partialPiecesPunched, reclaimedBytes, presized, stuckPiecesRestored, diskStarvedSeconds,
 waitingReads, downloadLimit, paceState (0 open, 1 proportional, 2 floor, 3 trickle,
 4 emergency), consumeRate`.
 
@@ -597,6 +724,18 @@ SessionHarness guest <work>       # a stream joins a download's torrent (5 scena
 SessionHarness background <work>  # the tvOS network reopen during a stream
 SessionHarness legacy <work>      # a CocoaPods-era download (Metadata.plist, no file index) resumed
 SessionHarness premetadata <work> # a magnet's status before its metadata: a late seeder, one loop, nothing after a cancel
+SessionHarness network <work> [tv|ios|mac]  # a profile's network settings, default trackers, piece order of streams and downloads
+```
+
+Network benchmark (`Tools/NetworkBench`, see Network): a swarm of libtorrent seeders on
+127.0.0.1, each behind a userspace proxy that adds a round-trip time and caps its rate.
+
+```
+cd Tools/NetworkBench && swift build -c release --scratch-path <build>
+zsh run_bench.sh <build>/release/NetworkBench full <work> <label> --size-mib 512 \
+    --peers 30:1.5,40:1.5,50:1.5,60:1.5,70:1.5,80:1.5,90:1.5,100:1.5
+zsh run_bench.sh <build>/release/NetworkBench download <work> <label> ...
+IMAGE_SIZE=1400m zsh run_bench.sh <build>/release/NetworkBench bounded <work> <label> --size-mib 1024 --read-mib 512 ...
 ```
 
 Offline end-to-end harness (`Tools/BoundedStorageHarness`): generates a file of
@@ -790,6 +929,14 @@ private torrents do not exchange metadata), on the Mac:
   is withdrawn by lt_donthave) still fail in 2 of 3 forced-ENOSPC runs; they now pass in the
   ballast run with a 2 GiB budget (2 of 2), where they failed in every earlier run. Not
   investigated: no player uses that path.
+- Network (5.2.0), measured offline only: real swarms (uTP peers, peers that choke us,
+  trackers and the DHT, NATs), UPnP / NAT-PMP on real routers and the random listen port
+  are untested. The Mac app has no `NSLocalNetworkUsageDescription`: macOS 15+ shows its
+  local network prompt with a generic text (LSD already sent multicast before 5.2.0). The
+  upload is still unlimited: on a slow uplink (ADSL) a busy upload can slow the download
+  (TCP acknowledgements queue behind it). Seeks in full mode wait behind about 1 s of each
+  peer's requests (1.2-1.5 s to the first MiB in the bench, 1.15 s with time-critical mode).
 - The time-critical (deadline) path of libtorrent misbehaved with one very fast
   local seed (a window starved, cancels left requests outstanding until the
-  request timeout); bounded mode avoids it, full mode keeps it as before.
+  request timeout); bounded mode avoids it, and since 5.2.0 full mode uses it only
+  for late pieces (see Network).

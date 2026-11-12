@@ -314,6 +314,10 @@ using namespace libtorrent;
     return !_guest;
 }
 
+- (BOOL)wantsSequentialDownload {
+    return YES;
+}
+
 - (BOOL)hasMetadata {
     return _hasMetadata.load();
 }
@@ -821,9 +825,18 @@ using namespace libtorrent;
         config.deadlineStepMs = 20;
         config.useDeadlines = false;
     } else {
-        // Same window as before: the next MIN_PIECES missing pieces, 100 ms deadlines,
-        // the last pieces at top priority.
+        // The MIN_PIECES pieces from the read position: their first 8 MiB (2 pieces at least)
+        // at top priority, the rest at 6, then the rest of the file, all in file order
+        // (sequential picker), at full speed. No deadline ahead of time:
+        // while any piece of a torrent has one, libtorrent holds every peer to one request at
+        // a time (see planWindow); a piece a reader waits for gets one only once it is late
+        // (lateAfterMs, at least two pieces' time at the current rate), and the requests slow
+        // peers hold for it are taken back (StreamController::rescueLatePieces).
+        int64_t const pieceLength = ti->piece_length();
         config.windowPieces = MIN_PIECES;
+        config.topPriorityPieces = std::min(MIN_PIECES, std::max(2, int((8 * ptbounded::kMiB + pieceLength - 1) / pieceLength)));
+        config.deadlineHorizonPieces = -1;
+        config.lateAfterMs = 1000;
         config.tailPieces = tailPieces;
         config.deadlineFirstMs = PIECE_DEADLINE_MILLIS;
         config.deadlineStepMs = 0;
@@ -1251,6 +1264,7 @@ using namespace libtorrent;
         @"diskFullEvents": @(s.diskFullEvents),
         @"fileErrors": @(s.fileErrors),
         @"dontHaveSent": @(s.dontHaveSent),
+        @"rescuedBlocks": @(s.rescuedBlocks),
         @"partialPiecesPunched": @(s.partialPunched),
         @"reclaimedBytes": @(s.reclaimedBytes),
         @"presized": @(s.presized),

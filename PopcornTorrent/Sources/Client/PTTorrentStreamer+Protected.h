@@ -82,6 +82,9 @@ using namespace libtorrent;
 /// `YES` for a stream that added its torrent, `NO` for a guest and for a download (whose status
 /// starts with the metadata, as before).
 - (BOOL)publishesStatusBeforeMetadata;
+/// Whether the torrent is fetched in file order (libtorrent's sequential download): `YES` for
+/// streams, `NO` for an offline download nobody plays (rarest pieces first, see PTTorrentDownload).
+- (BOOL)wantsSequentialDownload;
 
 #pragma mark Shared torrents (see -[PTTorrentsSession joinTorrent:params:error:])
 

@@ -152,6 +152,7 @@ StreamController::~StreamController() {
 void StreamController::configure(StreamConfig const& config) {
     if (m_configured.load() || !config.geometry.valid()) return;
     m_config = config;
+    m_configuredAt = std::chrono::steady_clock::now();
     m_first = config.geometry.firstPiece();
     m_count = config.geometry.pieceCount();
     m_states.reset(new std::atomic<uint8_t>[size_t(m_count)]);
@@ -346,6 +347,7 @@ StreamStatistics StreamController::statistics() const {
     s.diskFullEvents = m_diskFullEvents.load();
     s.fileErrors = m_fileErrors.load();
     s.dontHaveSent = m_dontHaveSent.load();
+    s.rescuedBlocks = m_rescuedBlocks.load();
     s.partialPunched = m_partialPunched.load();
     s.reclaimedBytes = m_reclaimedBytes.load();
     s.presized = m_presized.load() && !presizeDisabled();
@@ -545,8 +547,91 @@ void StreamController::requestFlush(int32_t piece) {
     });
 }
 
+std::chrono::milliseconds StreamController::lateThreshold() const {
+    // At least lateAfterMs, and at least the time two pieces take at the torrent's rate: on a
+    // slow connection every piece takes long, it is not late (a deadline would only throttle
+    // the torrent, see planWindow). Nothing coming at all: 10 s.
+    int64_t const rate = m_torrentRate.load();
+    int64_t const twoPiecesMs = rate > 0 ? 2 * m_config.geometry.pieceLength * 1000 / rate : 10000;
+    return std::chrono::milliseconds(std::max<int64_t>(std::max(0, m_config.lateAfterMs), std::min<int64_t>(twoPiecesMs, 10000)));
+}
+
+void StreamController::rescueLatePieces(lt::torrent& torrent) {
+    // A reader (or the stream, for the pieces it needs to be ready) waits for a piece whose
+    // blocks are all requested, some of them from a peer that is slow or stalled: they would come after its whole queue (peers send in order), or
+    // never; libtorrent only takes them back after piece_timeout (20 s, "snubbed"), and its
+    // time-critical requests only re-request busy blocks once it has timed whole time-critical
+    // pieces. Take back the requests that a peer slower than the others would deliver after
+    // kRescueEtaMs (at its own rate, from its position in its queue): free again, they go to
+    // the next peer that asks, first (priority 7), and the piece's deadline
+    // (lateDeadlinesOnly) puts them at the front.
+    static constexpr int64_t kRescueEtaMs = 1500;
+    if (m_suspended.load() || !torrent.has_picker() || !torrent.valid_metadata()) return;
+    auto const now = std::chrono::steady_clock::now();
+    auto const threshold = lateThreshold();
+    std::vector<int32_t> late;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto const& waiter : m_waiters) {
+            if (now - waiter.second.since < threshold || !inFile(waiter.first) || stateOf(waiter.first) != PieceMissing) continue;
+            if (late.empty() || late.back() != waiter.first) late.push_back(waiter.first);
+        }
+    }
+    // Before it is ready, the stream waits for its required pieces (head and tail) since it
+    // was configured: a slow peer given a block of one of them at the start (each new peer
+    // gets a few requests) held the whole stream back for as long as that block took.
+    if (now - m_configuredAt >= threshold) {
+        for (int32_t piece : m_config.requiredPieces) {
+            if (inFile(piece) && stateOf(piece) == PieceMissing && std::find(late.begin(), late.end(), piece) == late.end()) {
+                late.push_back(piece);
+            }
+        }
+    }
+    if (late.empty()) return;
+    auto const isLate = [&late](lt::piece_block const& block) {
+        return std::find(late.begin(), late.end(), int32_t(static_cast<int>(block.piece_index))) != late.end();
+    };
+    int64_t const blockSize = torrent.block_size();
+    // Slow next to the others: below a quarter of the mean rate of the peers we download from.
+    // (Right after the start every rate is still low: nobody is slow then.)
+    int64_t total = 0;
+    int downloading = 0;
+    for (lt::peer_connection* connection : torrent) {
+        if (connection->is_disconnecting() || connection->download_queue().empty()) continue;
+        total += connection->statistics().download_payload_rate();
+        ++downloading;
+    }
+    if (downloading < 2) return;
+    int64_t const slowRate = total / downloading / 4;
+    std::vector<std::pair<std::shared_ptr<lt::peer_connection>, lt::piece_block>> slow;
+    int peers = 0;
+    for (lt::peer_connection* connection : torrent) {
+        if (connection->is_disconnecting()) continue;
+        int64_t const rate = std::max<int64_t>(1, connection->statistics().download_payload_rate());
+        if (rate >= slowRate) continue;
+        size_t position = 0;
+        size_t const before = slow.size();
+        auto consider = [&](lt::pending_block const& pending) {
+            ++position;
+            if (pending.not_wanted || pending.timed_out || !isLate(pending.block)) return;
+            if (int64_t(position) * blockSize * 1000 / rate > kRescueEtaMs) slow.emplace_back(connection->self(), pending.block);
+        };
+        for (lt::pending_block const& pending : connection->download_queue()) consider(pending);
+        for (lt::pending_block const& pending : connection->request_queue()) consider(pending);
+        if (slow.size() > before) ++peers;
+    }
+    for (auto const& entry : slow) entry.first->cancel_request(entry.second, true);
+    if (!slow.empty()) {
+        m_rescuedBlocks.fetch_add(int64_t(slow.size()));
+        NSLog(@"PopcornTorrent: piece %d late (waited for over %lld ms): %zu block requests taken back from %d slow peers",
+              late.front(), (long long)threshold.count(), slow.size(), peers);
+    }
+}
+
 void StreamController::onTick(lt::torrent& torrent) {
     if (!m_configured.load() || m_cancelled.load()) return;
+    m_torrentRate.store(int64_t(torrent.statistics().transfer_rate(lt::stat::download_payload)));
+    rescueLatePieces(torrent);
     int64_t const position = m_readPosition.load();
     if (m_lastTickReadPosition >= 0) {
         // Once a second (torrent_plugin::tick). A seek over data that was never on disk
@@ -695,6 +780,8 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     input.consumedBefore = m_consumedBefore.load();
     input.pins = pins();
     input.deadlinePieces = m_config.windowPieces;
+    input.deadlineHorizonPieces = m_config.deadlineHorizonPieces;
+    input.topPriorityPieces = m_config.topPriorityPieces;
     input.deadlineFirstMs = m_config.deadlineFirstMs;
     input.deadlineStepMs = m_config.deadlineStepMs;
     input.states = &states;
@@ -713,9 +800,16 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
         input.aheadLimitPieces = int(std::max<int64_t>(pieceLength, ahead) / pieceLength);
     }
     {
+        auto const now = std::chrono::steady_clock::now();
+        auto const lateAfter = lateThreshold();
+        input.lateDeadlinesOnly = !bounded && m_config.lateAfterMs > 0;
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto const& waiter : m_waiters) {
             if (input.urgentPieces.empty() || input.urgentPieces.back() != waiter.first) input.urgentPieces.push_back(waiter.first);
+            if (input.lateDeadlinesOnly && now - waiter.second.since >= lateAfter
+                && (input.latePieces.empty() || input.latePieces.back() != waiter.first)) {
+                input.latePieces.push_back(waiter.first);
+            }
         }
     }
     PlanOutput const plan = planWindow(input);

@@ -153,12 +153,19 @@ struct PlanInput {
     int64_t readPosition = 0;       // next byte the consumer needs (file offset)
     int64_t consumedBefore = 0;     // bytes below are never read again (bounded only)
     PinSet pins;
-    int deadlinePieces = 1;         // size of the deadline window
+    int deadlinePieces = 1;         // size of the window ahead of the read piece, in pieces
+    int deadlineHorizonPieces = 0;  // full mode: only the missing window pieces this close to the
+                                    // read piece get a deadline; 0 = all of them, negative = none
+    int topPriorityPieces = 0;      // full mode: the missing window pieces this close to the read
+                                    // piece get priority 7, the rest of the window
+                                    // kBoundedWindowPriority (file order); 0 = all of them
     int deadlineFirstMs = 0;        // deadline of the first window piece
     int deadlineStepMs = 0;         // added for each further piece (0 = flat)
     std::vector<uint8_t> const* states = nullptr; // pieceCount() entries, index = piece - firstPiece
     std::vector<int32_t> urgentPieces; // pieces a reader waits for: fetched first wherever they are,
                                        // unless freed or already consumed
+    bool lateDeadlinesOnly = false;    // full mode: an urgent piece gets its deadline only once it is
+    std::vector<int32_t> latePieces;   // in latePieces too (a reader waited too long for it)
     int aheadLimitPieces = 0;       // bounded: while pieces the reader needs are missing, pieces
                                     // further than this from the read piece are not wanted, so a
                                     // late piece does not let the rest of the file fill the disk
@@ -174,7 +181,7 @@ struct PlanOutput {
     std::vector<std::pair<int32_t, int>> deadlines; // (piece, milliseconds)
     std::vector<int32_t> toFree;                    // pieces with data that are now consumed
     int32_t readPiece = 0;
-    int32_t windowEndPiece = 0;     // first piece after the deadline window
+    int32_t windowEndPiece = 0;     // first piece after the window (read piece + deadlinePieces)
     bool urgent = false;            // pieces the reader needs now are missing (window, pins, waits)
     int64_t aheadBytes = 0;         // data at or after the read piece (pins excluded)
     int64_t behindBytes = 0;        // data before the read piece still kept (pins excluded)
