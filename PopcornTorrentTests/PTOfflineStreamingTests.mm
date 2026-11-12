@@ -196,8 +196,16 @@ static PTOfflineSeeder *gSeeder = nil;
     return path;
 }
 
+/// `swift test` runs every test target in one process, with one shared session: when the
+/// internet tests are asked for (PT_INTERNET_TESTS=1), these tests stay out of the way instead
+/// of making that session loopback-only first.
+static BOOL PTInternetTestsRequested(void) {
+    return [NSProcessInfo.processInfo.environment[@"PT_INTERNET_TESTS"] isEqualToString:@"1"];
+}
+
 + (void)setUp {
     [super setUp];
+    if (PTInternetTestsRequested()) return;
     // Before the first +sharedSession: the streamer's session listens on 127.0.0.1 only.
     [PTTorrentsSession prepareSharedSessionForLoopbackTestingOnPort:0];
 
@@ -233,10 +241,14 @@ static PTOfflineSeeder *gSeeder = nil;
     [super tearDown];
 }
 
-- (void)setUp {
-    [super setUp];
+- (BOOL)setUpWithError:(NSError *__autoreleasing *)error {
+    if (![super setUpWithError:error]) return NO;
+    if (PTInternetTestsRequested()) {
+        XCTSkip(@"PT_INTERNET_TESTS=1: the shared session is the internet tests' (run these without it)");
+    }
     self.continueAfterFailure = NO;
     XCTAssertGreaterThan(gSeeder.port, 0, @"the seeder listens on 127.0.0.1");
+    return YES;
 }
 
 #pragma mark - Helpers

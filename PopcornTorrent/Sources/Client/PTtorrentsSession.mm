@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cctype>
 #include <set>
+#include <sys/resource.h>
 #import "../Bounded/PTStreamController.h"
 #import "../Resources/NSString+Localization.h"
 
@@ -47,7 +48,7 @@ static NSString *PTNetworkProfileOverride = nil;
 // reasons for each value: BOUNDED_STORAGE.md, "Network").
 struct PTNetworkTuning {
     int torrentConnections;   // peers per torrent (libtorrent: unlimited; this fork had 60)
-    int connectionsLimit;     // peers for the whole session (libtorrent: 200)
+    int connectionsLimit;     // peers for the whole session (libtorrent: 200; see PTRaiseOpenFilesLimit)
     int connectionSpeed;      // connection attempts per second (libtorrent: 30)
     int connectBoost;         // attempts at once when a torrent starts (libtorrent: 30)
     int queuedDiskBytes;      // received data waiting for the disk before peers are no longer read (1 MiB)
@@ -66,20 +67,25 @@ static PTNetworkTuning PTNetworkTuningForProfile(NSString *profile) {
         profile = @"mac";
 #endif
     }
+    // Peers per torrent and connection attempts stay moderate: each attempt to a peer that
+    // never answers holds an entry in the home router's NAT table for 30 s (uTP) to 2 min
+    // (TCP SYN), and small ISP boxes drop connections for the whole household when that
+    // table fills. 100 peers is already well above what a stream uses (NetworkBench: 8).
     if ([profile isEqualToString:@"tv"]) {
         // Plugged in, usually on Ethernet or 5 GHz Wi-Fi, a few GB of RAM: about 100 peers
         // cost a few MB. tvOS has no local network privacy: UPnP, NAT-PMP and LSD need no
         // entitlement and show no prompt (TN3179).
-        return {100, 300, 50, 50, 4 * 1024 * 1024, 500, true, true};
+        return {100, 200, 40, 40, 4 * 1024 * 1024, 500, true, true};
     }
     if ([profile isEqualToString:@"ios"]) {
         // On battery. iOS asks the user before any unicast to the local network (NAT-PMP talks
         // to the router) and needs the multicast entitlement for UPnP and LSD: none of them.
-        return {80, 200, 40, 40, 2 * 1024 * 1024, 500, false, false};
+        return {80, 160, 30, 30, 2 * 1024 * 1024, 500, false, false};
     }
-    // Mac: more of everything. macOS 15+ asks once for the local network (the multicast
-    // entitlement is not needed there); UPnP / NAT-PMP / LSD just fail when it is denied.
-    return {200, 600, 100, 80, 16 * 1024 * 1024, 1000, true, true};
+    // Mac: room for a stream next to several downloads. macOS 15+ asks once for the local
+    // network (the multicast entitlement is not needed there); UPnP / NAT-PMP / LSD just fail
+    // when it is denied.
+    return {100, 400, 50, 50, 16 * 1024 * 1024, 1000, true, true};
 }
 
 /// Public trackers added to every public torrent, after its own: magnets from the indexers
@@ -127,6 +133,22 @@ static void PTAppendDefaultTrackers(std::vector<std::string>& trackers, std::vec
     }
 }
 
+/// Whether a tracker URL carries a key (a passkey in its path or query: "/<key>/announce",
+/// "announce.php?passkey=..."), as private trackers' URLs do; public trackers announce at a
+/// plain "/announce". A magnet with such a tracker may be a private torrent (BEP 27): it gets
+/// the default trackers only once its metadata says it is not.
+static bool PTTrackerLooksKeyed(std::string const& url) {
+    auto const scheme = url.find("://");
+    if (scheme == std::string::npos) return true;
+    auto const slash = url.find('/', scheme + 3);
+    if (slash == std::string::npos) return false; // "udp://host:port"
+    std::string path = url.substr(slash);
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (path.find('?') != std::string::npos) return true;
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    return !(path == "/" || path == "/announce" || path == "/announce.php");
+}
+
 /// The TCP/UDP port the session listens on (the next 10 when it is taken): picked at random
 /// once per installation, outside the well-known BitTorrent ports (6881-6889) some networks
 /// throttle or block, and not shared by two devices behind the same router (their port
@@ -143,6 +165,28 @@ static int PTListenPort(void) {
     return port;
 }
 
+/// libtorrent caps the session's peers at 80 % of the soft limit of open files minus 20
+/// (session_impl, when the session is created). Apps launched from the Finder, the Dock or
+/// SpringBoard get a soft limit of 256: every profile became 188 peers in all, and one stream
+/// could hold most of the process's descriptors, which GCDWebServer (two per HTTP
+/// connection), the remuxed HLS files, AVFoundation, URLSession and SQLite also need (their
+/// open or accept then simply fails). The soft limit is raised once, to 4096 or the hard
+/// limit, before the first session is created.
+static void PTRaiseOpenFilesLimit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return;
+        rlim_t const wanted = std::min<rlim_t>(limit.rlim_max, 4096);
+        if (limit.rlim_cur >= wanted) return;
+        rlim_t const before = limit.rlim_cur;
+        limit.rlim_cur = wanted;
+        if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            NSLog(@"PopcornTorrent: could not raise the open files limit from %llu (errno %d)", (unsigned long long)before, errno);
+        }
+    });
+}
+
 @interface PTTorrentsSession () {
 }
 
@@ -151,6 +195,8 @@ static int PTListenPort(void) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<PTTorrentStreamer *> *> *guests; // streams that joined it, oldest first
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingDeletions; // removals with delete_files not finished yet
 @property (nonatomic, strong) NSMutableDictionary<NSString *, dispatch_group_t> *deletionGroups;
+@property (nonatomic, strong) NSMutableSet<NSString *> *deferredDefaultTrackers;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *deletionFolders; // the folder of a torrent removed with its files // magnets that get the default trackers with their metadata
 @property (nonatomic, strong, nullable) dispatch_queue_t alertsQueue;
 @property (nonatomic, getter=isAlertsLoopActive) BOOL alertsLoopActive;
 
@@ -206,7 +252,22 @@ static int PTListenPort(void) {
         @"enable_lsd": @(pack.get_bool(settings_pack::enable_lsd)),
         @"enable_dht": @(pack.get_bool(settings_pack::enable_dht)),
         @"torrent_connections": @(_torrentConnections),
+        @"open_files_limit": @([PTTorrentsSession openFilesLimit]),
     };
+}
+
++ (long long)openFilesLimit {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -1;
+    return limit.rlim_cur == RLIM_INFINITY ? LLONG_MAX : (long long)limit.rlim_cur;
+}
+
++ (BOOL)trackerLooksKeyedForTesting:(NSString *)url {
+    return PTTrackerLooksKeyed(url.UTF8String);
+}
+
++ (BOOL)isLoopbackTesting {
+    return PTLoopbackTestingPort >= 0;
 }
 
 - (int)listenPort {
@@ -262,12 +323,15 @@ static int PTListenPort(void) {
     self.guests = [@{} mutableCopy];
     self.pendingDeletions = [@{} mutableCopy];
     self.deletionGroups = [@{} mutableCopy];
+    self.deferredDefaultTrackers = [NSMutableSet set];
+    self.deletionFolders = [@{} mutableCopy];
     [self setupSession];
     [self setupAlertLoop];
     return self;
 }
 
 - (void)setupSession {
+    PTRaiseOpenFilesLimit();
     settings_pack pack = default_settings();
     PTNetworkTuning const tuning = PTNetworkTuningForProfile(PTNetworkProfileOverride);
     
@@ -309,9 +373,10 @@ static int PTListenPort(void) {
     pack.set_int(settings_pack::torrent_connect_boost, tuning.connectBoost);
     pack.set_bool(settings_pack::announce_to_all_tiers, true);
     pack.set_bool(settings_pack::announce_to_all_trackers, true);
-    // Most peers found by trackers and the DHT do not answer: give up on them after 7 s
-    // instead of 15 (each one holds a connection slot meanwhile).
-    pack.set_int(settings_pack::peer_connect_timeout, 7);
+    // Most peers found by trackers and the DHT do not answer: give up on them after 10 s
+    // instead of 15 (each one holds a connection slot meanwhile; 7 s made the attempts to
+    // dead peers, and the NAT entries they leave in the router, come twice as fast).
+    pack.set_int(settings_pack::peer_connect_timeout, 10);
     // libtorrent tries uTP first with every new peer; a peer without uTP (rtorrent seedboxes)
     // was only tried over TCP after 3 s.
     pack.set_int(settings_pack::utp_connect_timeout, 1500);
@@ -325,10 +390,14 @@ static int PTListenPort(void) {
     // complete in file order at the speed of the whole swarm, not one at the speed of the peer
     // that took it (a stream waits for the next piece, not for any piece).
     pack.set_int(settings_pack::whole_pieces_threshold, 0);
-    // Requests in flight per peer: 1 s of its rate instead of 3 (still several times the
-    // bandwidth-delay product of a distant peer). A request is served after the ones queued
-    // before it: a seek, or the next piece of a stream, waited behind 3 s of each peer's queue.
-    pack.set_int(settings_pack::request_queue_time, 1);
+    // Requests in flight per peer: 2 s of its rate instead of 3. A request is served after
+    // the ones queued before it: a seek, or the next piece of a stream, waited behind 3 s of
+    // each peer's queue (NetworkBench, forward seek: first MiB 3.1 s at 3, 2.2 s at 2).
+    // Not 1: the queue must cover a peer's round trip, or its rate falls, then its queue,
+    // down to libtorrent's 2-block minimum; peers 1.2-1.5 s away (distant seedboxes, uplinks
+    // bloated by other traffic) delivered 13 % of 256 MiB in 3 min at 1 s, all of it in 96 s
+    // at 2, 79 s at 3.
+    pack.set_int(settings_pack::request_queue_time, 2);
     _torrentConnections = tuning.torrentConnections;
 
     if (PTLoopbackTestingPort >= 0) {
@@ -451,6 +520,33 @@ static int PTListenPort(void) {
 
 - (void)metadataReceivedAlert:(torrent_handle)th {
     for (PTTorrentStreamer *streamer in [self streamersForTorrentHandle:th]) [streamer metadataReceivedAlert:th];
+    [self addDeferredDefaultTrackers:th];
+}
+
+/// A magnet with keyed trackers (see addTorrent): the default trackers once its metadata
+/// says it is public.
+- (void)addDeferredDefaultTrackers:(torrent_handle)th {
+    NSString *hashId = [self hashIDForTorrentHandle:th];
+    @synchronized (self) {
+        if (![self.deferredDefaultTrackers containsObject:hashId]) return;
+        [self.deferredDefaultTrackers removeObject:hashId];
+    }
+    auto const ti = th.torrent_file();
+    if (!ti || ti->priv()) return;
+    std::vector<announce_entry> const existing = th.trackers();
+    std::vector<std::string> urls;
+    std::vector<int> tiers;
+    for (announce_entry const& entry : existing) {
+        urls.push_back(entry.url);
+        tiers.push_back(entry.tier);
+    }
+    size_t const known = urls.size();
+    PTAppendDefaultTrackers(urls, tiers);
+    for (size_t i = known; i < urls.size(); ++i) {
+        announce_entry entry(urls[i]);
+        entry.tier = std::uint8_t(std::min(tiers[i], 255));
+        th.add_tracker(entry);
+    }
 }
 
 - (void)pieceFinishedAlert:(torrent_handle)th forPieceIndex:(piece_index_t)index {
@@ -482,8 +578,13 @@ static int PTListenPort(void) {
     } else {
         torrentParams.flags &= ~libtorrent::torrent_flags::sequential_download;
     }
+    // The default trackers: never for a private torrent (BEP 27: its info-hash must not reach
+    // other trackers). A magnet does not say whether it is private until its metadata comes:
+    // one whose trackers carry a key gets them then, if it is public (metadataReceivedAlert).
     bool const isPrivate = torrentParams.ti && torrentParams.ti->priv();
-    if (PTLoopbackTestingPort < 0 && !isPrivate) PTAppendDefaultTrackers(torrentParams.trackers, torrentParams.tracker_tiers);
+    bool const mayBePrivate = !torrentParams.ti
+        && std::any_of(torrentParams.trackers.begin(), torrentParams.trackers.end(), PTTrackerLooksKeyed);
+    if (PTLoopbackTestingPort < 0 && !isPrivate && !mayBePrivate) PTAppendDefaultTrackers(torrentParams.trackers, torrentParams.tracker_tiers);
     // A torrent still in libtorrent but not registered here is an error, not a silent reuse
     // (it would not have this stream's plugin).
     torrentParams.flags |= libtorrent::torrent_flags::duplicate_is_error;
@@ -501,6 +602,7 @@ static int PTListenPort(void) {
     
     @synchronized (self) {
         self.streamers[[self hashIDForTorrentHandle:th]] = torrentStreamer;
+        if (PTLoopbackTestingPort < 0 && mayBePrivate) [self.deferredDefaultTrackers addObject:[self hashIDForTorrentHandle:th]];
     }
     
 #if TARGET_OS_IOS
@@ -627,6 +729,14 @@ static int PTListenPort(void) {
         if (pending == 1) {
             [self.pendingDeletions removeObjectForKey:hashId];
             [self.deletionGroups removeObjectForKey:hashId];
+            // The streamer removed its folder when it cancelled, but piece writes still queued
+            // on libtorrent's disk thread then created it again; delete_files removes the
+            // files and the torrent's own folders, not this one: it stayed, empty. rmdir only
+            // removes an empty folder (a stream of the same torrent started since writes into
+            // it, and libtorrent creates its folders again when it writes).
+            NSString *folder = self.deletionFolders[hashId];
+            [self.deletionFolders removeObjectForKey:hashId];
+            if (folder.length > 0 && self.streamers[hashId] == nil) rmdir(folder.fileSystemRepresentation);
         } else {
             self.pendingDeletions[hashId] = @(pending - 1);
         }
@@ -733,9 +843,13 @@ static int PTListenPort(void) {
             self.streamers[hashId] = heir;
         } else {
             [self.streamers removeObjectForKey:hashId];
+            [self.deferredDefaultTrackers removeObject:hashId];
             orphans = [guests copy];
             [self.guests removeObjectForKey:hashId];
-            if (deleteFiles) [self deletionStarted:hashId];
+            if (deleteFiles) {
+                [self deletionStarted:hashId];
+                if (torrentStreamer.savePath.length > 0) self.deletionFolders[hashId] = torrentStreamer.savePath;
+            }
         }
     }
     if (heir != nil) {

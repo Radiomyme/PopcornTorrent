@@ -341,6 +341,25 @@ using namespace libtorrent;
     }
 }
 
+/// A download whose selection chose no file (a season pack without the episode): it fails as
+/// any stream does, and its folder goes: the plist the selection saved (status Processing,
+/// file index -1) and the first pieces of other files fetched before the priorities applied
+/// would come back at the next launch as a paused download that can never complete.
+- (void)handleTorrentError:(NSError *)error {
+    if (![error.domain isEqualToString:PTTorrentStreamerErrorDomain] || error.code != PTTorrentStreamerErrorNoFileSelected) {
+        return [super handleTorrentError:error];
+    }
+    __weak __typeof__(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __typeof__(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (strongSelf.failureBlock) strongSelf.failureBlock(error);
+        // Removed with its files (libtorrent deletes them once the writes in flight are done),
+        // the folder and its plist too.
+        [strongSelf cancelStreamingAndDeleteData:YES];
+    });
+}
+
 - (BOOL)publishesStatusBeforeMetadata {
     // The progress block turns a download "Downloading" (totalProgress < 1): it starts with the
     // metadata, as before (the download stays "Processing" while a magnet resolves).

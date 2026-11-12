@@ -587,26 +587,45 @@ without this rescue, 7.1 s with it, 13.7 s before 5.2.0).
 speed of the one peer that took it, and a reader at the download frontier waits on it.
 `whole_pieces_threshold` is 0: the next pieces' blocks are spread over every peer.
 
-**Request queue.** Each peer gets `request_queue_time` of its rate in requests: 3 s → 1 s
-(still several times the bandwidth-delay product of a distant peer: 1.5 MB in flight to a
-1.5 MB/s peer 100 ms away). A peer serves its requests in order: without time-critical
-mode, a seek (or a piece taken back from a slow peer) waited behind 3 s of every peer's
-queue (NetworkBench, first MiB after a forward seek: 3.3 s with 3 s, 1.7 s with 1 s).
+**Request queue.** Each peer gets `request_queue_time` of its rate in requests: 3 s → 2 s.
+A peer serves its requests in order: without time-critical mode, a seek (or a piece taken
+back from a slow peer) waited behind 3 s of every peer's queue (NetworkBench, first MiB
+after a forward seek: 3.1-3.3 s with 3 s, 2.2 s with 2 s, 1.2-1.7 s with 1 s). Not 1 s (the
+first 5.2.0 value): the queue must cover a peer's round trip, or the peer delivers less than
+its queue per round trip, its measured rate falls, its queue with it, down to libtorrent's
+2-block minimum (`peer_connection::update_desired_queue_size`). Peers 1.2-1.5 s away
+(distant seedboxes, uplinks bloated by other traffic: they exist in real swarms) delivered 13 %
+of 256 MiB in 3 min at 1 s, all of it in 96 s at 2 s and 79 s at 3 s (review-network,
+NetworkBench swarm H); 4 near and 4 far peers: 6.5 / 7.1 / 7.5 MB/s (swarm X).
 
 **Piece order.** Streams stay sequential (bounded storage relies on it). An offline
 download nobody plays is rarest first (`PTTorrentDownload wantsSequentialDownload`); it
 turns sequential while it is played (`playWithHandler:`) or a stream joined it, and back.
 
-**Peers.** Per torrent 60 → 100 (tvOS) / 80 (iOS) / 200 (Mac); session 200 → 300 / 200 /
-600; connection attempts per second 30 → 50 / 40 / 100 and at a torrent's start 30 → 50 /
-40 / 80; `peer_connect_timeout` 15 → 7 s (most peers from trackers and the DHT never answer,
-each holds a connection slot meanwhile); `utp_connect_timeout` 3 → 1.5 s (libtorrent tries
+**Peers.** Per torrent 60 → 100 (tvOS) / 80 (iOS) / 100 (Mac); session 200 → 200 / 160 /
+400; connection attempts per second 30 → 40 / 30 / 50 and at a torrent's start 30 → 40 /
+30 / 50; `peer_connect_timeout` 15 → 10 s (most peers from trackers and the DHT never answer,
+each holds a connection slot meanwhile). Kept moderate (the first 5.2.0 values were 200 per
+torrent and 100 attempts a second on the Mac, 7 s timeouts): every attempt to a peer that
+never answers leaves an entry in the home router's NAT table for 30 s (uTP) to 2 min (TCP
+SYN), and small ISP boxes drop connections for the whole household when it fills; the
+benchmark (8 peers) showed no gain from more. **Open files**: libtorrent caps the session's
+peers at 80 % of the soft limit of open files minus 20 when the session is created
+(`session_impl`), and apps launched from the Finder, the Dock or SpringBoard get a soft
+limit of 256: every profile was 188 peers in all, and one stream could hold most of the
+process's descriptors (GCDWebServer, the remuxed HLS files, AVFoundation, URLSession and
+SQLite need them too). The fork raises the soft limit to 4096 (or the hard limit) before the
+first session (`PTRaiseOpenFilesLimit`). `utp_connect_timeout` 3 → 1.5 s (libtorrent tries
 uTP first with every new peer; one without uTP, e.g. an rtorrent seedbox, was tried over
 TCP after 3 s, plus up to 1 s to the next connection round). Every tracker and every tier
 is announced to (`announce_to_all_tiers`, `announce_to_all_trackers`): a magnet puts each
 tracker in its own tier and libtorrent announced to the first that answered only. Public
 torrents get 13 well-known public trackers after their own (`PTDefaultTrackers`; never
-private torrents, never in loopback testing). The DHT bootstrap list had a stray quote
+private torrents, never in loopback testing). A magnet does not say whether it is private
+until its metadata comes (BEP 27: a private torrent's info-hash must not reach other
+trackers): one whose trackers carry a key (a passkey in the path or the query, as private
+trackers' URLs do) gets them once its metadata says it is public; the indexers' magnets
+(plain `/announce` URLs) get them at once. The DHT bootstrap list had a stray quote
 (`dht.transmissionbt.com:6881'`). `ut_metadata` and `smart_ban` were added twice (the
 session parameters already bring libtorrent's default plugins).
 
@@ -626,7 +645,23 @@ libtorrent stops reading every socket) 1 MiB → 4 MiB (tvOS) / 2 MiB (iOS) / 16
 `file_pool_size` 2 → 8 (the selected file, the part file and another torrent's). Unchanged
 on purpose: the disk cache (32 MiB, the tvOS memory limit), socket buffers (0: the
 system's autotuning), encryption (enabled, not forced), uTP/TCP mixed mode, the upload
-(no limit, 8 unchoke slots).
+(no limit, 8 unchoke slots for the whole session: incoming peers do not add slots, and uTP
+uploads yield to other traffic, LEDBAT).
+
+**A pack without the episode.** A magnet's metadata comes before the streamer's priorities:
+libtorrent starts requesting pieces at the default priority meanwhile, and a few MiB of the
+torrent's first files can arrive (a fast loopback seeder: 4.6-5.5 MiB). Holding the
+requests until the priorities are set has no safe form in libtorrent 1.2: in upload mode,
+the metadata's arrival (`update_interest` → `disconnect_if_redundant`) drops every seed as a
+redundant connection (both sides upload-only) before the streamer can leave that mode, and
+all files at priority 0 makes the torrent "finished", which disconnects the seeds too. What is fixed: an offline
+download whose selection chose no file deletes its folder (`PTTorrentDownload
+handleTorrentError:`): the plist saved by the selection (status Processing, file -1) and those
+first pieces came back at the next launch as a paused download that could never complete.
+A stream's folder goes as before. The folder of a torrent removed with its files no longer
+stays behind empty: piece writes still queued on libtorrent's disk thread created it again
+after the streamer removed it; it is removed (`rmdir`, only when empty) once libtorrent's
+deletion is done.
 
 ### NetworkBench results (Mac, 2026-11-12)
 
@@ -724,11 +759,15 @@ SessionHarness guest <work>       # a stream joins a download's torrent (5 scena
 SessionHarness background <work>  # the tvOS network reopen during a stream
 SessionHarness legacy <work>      # a CocoaPods-era download (Metadata.plist, no file index) resumed
 SessionHarness premetadata <work> # a magnet's status before its metadata: a late seeder, one loop, nothing after a cancel
-SessionHarness network <work> [tv|ios|mac]  # a profile's network settings, default trackers, piece order of streams and downloads
+SessionHarness network <work> [tv|ios|mac]  # a profile's network settings (also under `ulimit -S -n 256`), default trackers, piece order of streams and downloads
+SessionHarness nofile <work>      # a download of a pack magnet without the episode: fails once, leaves nothing
 ```
 
 Network benchmark (`Tools/NetworkBench`, see Network): a swarm of libtorrent seeders on
 127.0.0.1, each behind a userspace proxy that adds a round-trip time and caps its rate.
+`standard_set.sh <NetworkBench> <work>` runs the standard set (about 7 min): S1 stream and
+download, S1 forward seek, S2 stream, and the high-latency swarms H (8 peers 1.2-1.5 s away)
+and X (4 near, 4 far).
 
 ```
 cd Tools/NetworkBench && swift build -c release --scratch-path <build>
@@ -931,11 +970,12 @@ private torrents do not exchange metadata), on the Mac:
   investigated: no player uses that path.
 - Network (5.2.0), measured offline only: real swarms (uTP peers, peers that choke us,
   trackers and the DHT, NATs), UPnP / NAT-PMP on real routers and the random listen port
-  are untested. The Mac app has no `NSLocalNetworkUsageDescription`: macOS 15+ shows its
-  local network prompt with a generic text (LSD already sent multicast before 5.2.0). The
-  upload is still unlimited: on a slow uplink (ADSL) a busy upload can slow the download
-  (TCP acknowledgements queue behind it). Seeks in full mode wait behind about 1 s of each
-  peer's requests (1.2-1.5 s to the first MiB in the bench, 1.15 s with time-critical mode).
+  are untested, and so are the open files limit on tvOS and iOS devices (raised by
+  `setrlimit`; a refusal is logged). The upload is still unlimited: on a slow uplink (ADSL)
+  a busy upload can slow the download (TCP acknowledgements queue behind it). Seeks in full
+  mode wait behind about 2 s of each peer's requests (2.2 s to the first MiB in the bench;
+  cancelling the requests outside the new window on a seek would win it back). The first
+  pieces of a pack's other files may arrive before the priorities (see Network).
 - The time-critical (deadline) path of libtorrent misbehaved with one very fast
   local seed (a window starved, cancels left requests outstanding until the
   request timeout); bounded mode avoids it, and since 5.2.0 full mode uses it only

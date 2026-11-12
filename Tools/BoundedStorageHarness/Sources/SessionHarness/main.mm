@@ -14,6 +14,8 @@
 //                                     seeder that starts late, shows in the progress block
 //   SessionHarness network <work> [tv|ios|mac]  the network settings of a profile, the default
 //                                     trackers, streams in file order, downloads rarest first
+//   SessionHarness nofile <work>      a download of a pack magnet without the episode wanted:
+//                                     fails once, and its folder (plist, early pieces) goes
 // Generated payloads (random bytes), private torrents without trackers, a seeder on 127.0.0.1,
 // the streamer's shared session loopback-only (no DHT, LSD, UPnP, NAT-PMP). Run it under
 // sandbox-exec with localhost-only.sb. Every stream and download writes under <work>.
@@ -39,6 +41,7 @@
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/announce_entry.hpp>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -921,12 +924,23 @@ static int runNetwork(NSString *work, NSString *profile) {
     logf(@"profile %@: %@", expected, [[net description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
     NSDictionary<NSString *, NSArray<NSNumber *> *> *values = @{
         // torrent_connections, connections_limit, connection_speed, torrent_connect_boost, max_queued_disk_bytes, max_out_request_queue
-        @"tv":  @[@100, @300, @50, @50, @(4 << 20), @500],
-        @"ios": @[@80, @200, @40, @40, @(2 << 20), @500],
-        @"mac": @[@200, @600, @100, @80, @(16 << 20), @1000],
+        @"tv":  @[@100, @200, @40, @40, @(4 << 20), @500],
+        @"ios": @[@80, @160, @30, @30, @(2 << 20), @500],
+        @"mac": @[@100, @400, @50, @50, @(16 << 20), @1000],
     };
     NSArray<NSNumber *> *v = values[expected];
-    BOOL const tuned = [net[@"torrent_connections"] isEqual:v[0]] && [net[@"connections_limit"] isEqual:v[1]]
+    // libtorrent caps connections_limit at 80 % of (open files - 20) when the session is
+    // created: the fork raises the soft limit to 4096 (or the hard limit) first, so a run under
+    // `ulimit -S -n 256` (an app launched from the Finder) gets the profile's value; under a
+    // hard limit of 256, the cap.
+    long long const files = [net[@"open_files_limit"] longLongValue];
+    struct rlimit rl;
+    getrlimit(RLIMIT_NOFILE, &rl);
+    long long const hard = rl.rlim_max == RLIM_INFINITY ? LLONG_MAX : (long long)rl.rlim_max;
+    check(files >= std::min(4096LL, hard), @"open files limit raised", [NSString stringWithFormat:@"soft %lld, hard %lld", files, hard]);
+    long long const cap = std::max(5LL, (std::min(files, (long long)INT_MAX) - 20) * 8 / 10);
+    NSNumber *expectedLimit = @(std::min([v[1] longLongValue], cap));
+    BOOL const tuned = [net[@"torrent_connections"] isEqual:v[0]] && [net[@"connections_limit"] isEqual:expectedLimit]
         && [net[@"connection_speed"] isEqual:v[2]] && [net[@"torrent_connect_boost"] isEqual:v[3]]
         && [net[@"max_queued_disk_bytes"] isEqual:v[4]] && [net[@"max_out_request_queue"] isEqual:v[5]];
     check(tuned, [NSString stringWithFormat:@"%@ profile limits", expected],
@@ -934,9 +948,9 @@ static int runNetwork(NSString *work, NSString *profile) {
            net[@"torrent_connections"], net[@"connections_limit"], net[@"connection_speed"], net[@"torrent_connect_boost"],
            net[@"max_queued_disk_bytes"], net[@"max_out_request_queue"]]);
     check([net[@"announce_to_all_tiers"] boolValue] && [net[@"announce_to_all_trackers"] boolValue]
-          && [net[@"peer_connect_timeout"] intValue] == 7 && [net[@"utp_connect_timeout"] intValue] == 1500 && [net[@"file_pool_size"] intValue] == 8
-          && [net[@"request_queue_time"] intValue] == 1 && [net[@"whole_pieces_threshold"] intValue] == 0,
-          @"common settings", @"every tracker and tier, 7 s connect timeout, uTP 1.5 s, 8 open files, 1 s request queue, no whole pieces");
+          && [net[@"peer_connect_timeout"] intValue] == 10 && [net[@"utp_connect_timeout"] intValue] == 1500 && [net[@"file_pool_size"] intValue] == 8
+          && [net[@"request_queue_time"] intValue] == 2 && [net[@"whole_pieces_threshold"] intValue] == 0,
+          @"common settings", @"every tracker and tier, 10 s connect timeout, uTP 1.5 s, 8 open files, 2 s request queue, no whole pieces");
     // Loopback testing: nothing leaves 127.0.0.1, whatever the profile.
     check(![net[@"enable_upnp"] boolValue] && ![net[@"enable_natpmp"] boolValue] && ![net[@"enable_lsd"] boolValue] && ![net[@"enable_dht"] boolValue],
           @"offline session: no UPnP, NAT-PMP, LSD, DHT", @"");
@@ -946,6 +960,20 @@ static int runNetwork(NSString *work, NSString *profile) {
           && ![trackers containsObject:@"udp://tracker.opentrackr.org:1337/announce"] && [trackers containsObject:@"udp://open.demonii.com:1337/announce"],
           @"default trackers after the torrent's own, no duplicate", [NSString stringWithFormat:@"%lu trackers: %@", (unsigned long)trackers.count,
                                                                      [trackers componentsJoinedByString:@" "]]);
+
+    NSDictionary<NSString *, NSNumber *> *keyed = @{
+        @"udp://tracker.opentrackr.org:1337/announce": @NO, @"http://tracker.example.org:80/announce/": @NO,
+        @"udp://tracker.example.org:6969": @NO, @"https://tracker.example.org/announce.php": @NO,
+        @"https://tracker.example.org/announce.php?passkey=0123456789abcdef": @YES,
+        @"https://tracker.example.org/0123456789abcdef0123456789abcdef/announce": @YES,
+        @"http://tracker.example.org/announce?uk=abc": @YES,
+    };
+    NSMutableArray<NSString *> *wrongKeyed = [NSMutableArray array];
+    for (NSString *url in keyed) {
+        if ([PTTorrentsSession trackerLooksKeyedForTesting:url] != keyed[url].boolValue) [wrongKeyed addObject:url];
+    }
+    check(wrongKeyed.count == 0, @"magnets with a keyed tracker get the default trackers only after their metadata",
+          wrongKeyed.count ? [wrongKeyed componentsJoinedByString:@" "] : @"plain /announce trackers: at once; passkeys in path or query: after");
 
     NSString *streams = [work stringByAppendingPathComponent:@"streams"];
     NSString *offline = [work stringByAppendingPathComponent:@"offline"];
@@ -1001,9 +1029,65 @@ static int runNetwork(NSString *work, NSString *profile) {
     return 0;
 }
 
+#pragma mark - nofile
+
+/// A download of a public two-episode pack, by magnet, whose selection chooses no file (the
+/// episode is not in the pack): it fails once with PTTorrentStreamerErrorNoFileSelected, and
+/// nothing of it stays in the download directory (before: a plist saved while it was
+/// Processing, with the first pieces of the other episodes, listed again at the next launch
+/// as a paused download that could never complete).
+static int runNoFile(NSString *work) {
+    NSString *seedRoot = [work stringByAppendingPathComponent:@"seed-pack"];
+    NSString *pack = [seedRoot stringByAppendingPathComponent:@"Show.S01.PACK"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:pack withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *name in @[@"Show.S01E01.mkv", @"Show.S01E02.mkv"]) {
+        std::vector<char> buf(8 << 20);
+        arc4random_buf(buf.data(), buf.size());
+        std::ofstream out([pack stringByAppendingPathComponent:name].fileSystemRepresentation, std::ios::binary);
+        out.write(buf.data(), (std::streamsize)buf.size());
+    }
+    lt::file_storage fs;
+    lt::add_files(fs, pack.fileSystemRepresentation);
+    lt::create_torrent ct(fs, 256 << 10);
+    ct.set_priv(false); // a magnet: its metadata comes from the seeder
+    lt::set_piece_hashes(ct, seedRoot.fileSystemRepresentation);
+    std::vector<char> bytes;
+    lt::bencode(std::back_inserter(bytes), ct.generate());
+    Payload p;
+    p.dir = seedRoot;
+    p.ti = std::make_shared<lt::torrent_info>(bytes.data(), (int)bytes.size());
+    Seeder seeder;
+    int const seederPort = seeder.port;
+    (void)seeder.seed(p, 0);
+
+    NSString *downloads = [work stringByAppendingPathComponent:@"offline"];
+    PTTorrentDownload *d = [[PTTorrentDownload alloc] initWithMediaMetadata:@{MPMediaItemPropertyPersistentID: @"nofile"}
+                                                             downloadStatus:PTTorrentDownloadStatusProcessing];
+    d.downloadDirectoryOverride = downloads;
+    __block int failures = 0;
+    __block NSInteger code = 0;
+    __block int selections = 0;
+    [d startDownloadingFromFileOrMagnetLink:magnetFor(p) selectFileTDownload:^int(NSArray<NSString *> *n, NSArray<NSNumber *> *z) {
+        selections++;
+        return PTTorrentStreamerNoFileIndex;
+    }];
+    // The failure block is the streamer's: wrap it to count (it reaches the manager's delegate).
+    PTTorrentStreamerFailure const inner = d.failureBlock;
+    d.failureBlock = ^(NSError *error) { failures++; code = error.code; if (inner) inner(error); };
+    spin(20, ^BOOL { nudge(d, seederPort); return failures > 0; });
+    spin(3, nil); // libtorrent's deletion of what the early pieces wrote
+    NSArray<NSString *> *left = [[NSFileManager defaultManager] subpathsOfDirectoryAtPath:downloads error:nil] ?: @[];
+    check(failures == 1 && code == PTTorrentStreamerErrorNoFileSelected && selections == 1 && d.downloadStatus == PTTorrentDownloadStatusFailed,
+          @"a pack without the episode: the download fails once",
+          [NSString stringWithFormat:@"%d failures, code %ld, %d selections, status %ld", failures, (long)code, selections, (long)d.downloadStatus]);
+    check(left.count == 0, @"nothing of it stays (no plist to list at the next launch)",
+          left.count ? [left componentsJoinedByString:@", "] : @"download directory empty");
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata|network <workdir> [tv|ios|mac]\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata|network|nofile <workdir> [tv|ios|mac]\n"); return 2; }
         NSString *mode = [NSString stringWithUTF8String:argv[1]];
         NSString *work = [NSString stringWithUTF8String:argv[2]];
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
@@ -1019,6 +1103,7 @@ int main(int argc, const char *argv[]) {
         else if ([mode isEqualToString:@"legacy"]) rc = runLegacy(work);
         else if ([mode isEqualToString:@"premetadata"]) rc = runPreMetadata(work);
         else if ([mode isEqualToString:@"network"]) rc = runNetwork(work, profile);
+        else if ([mode isEqualToString:@"nofile"]) rc = runNoFile(work);
         logf(@"RESULT %@: %d passed, %d failed (rc %d)", mode, gPasses, gFailures, rc);
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
         return gFailures > 0 ? 1 : rc;

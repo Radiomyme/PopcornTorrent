@@ -27,8 +27,18 @@
 /// trackers it does not have (never added in loopback testing, nor to private torrents).
 + (NSArray<NSString *> *)trackersForTesting:(NSArray<NSString *> *)trackers;
 
-/// The session's network settings, by libtorrent setting name, and "torrent_connections"
-/// (the peers allowed per torrent).
+/// The session's network settings, by libtorrent setting name, "torrent_connections" (the
+/// peers allowed per torrent) and "open_files_limit" (the process's soft RLIMIT_NOFILE).
 - (NSDictionary<NSString *, NSNumber *> *)networkSettingsForTesting;
+
+/// Whether a magnet with this tracker waits for its metadata before it gets the default
+/// trackers (the URL carries a key, as private trackers' do).
++ (BOOL)trackerLooksKeyedForTesting:(NSString *)url;
+
+/// The process's soft limit of open files (raised before the first session is created).
++ (long long)openFilesLimit;
+
+/// Whether sessions are made loopback-only (`prepareSharedSessionForLoopbackTestingOnPort:`).
++ (BOOL)isLoopbackTesting;
 
 @end

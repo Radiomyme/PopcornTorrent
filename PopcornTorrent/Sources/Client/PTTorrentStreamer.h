@@ -63,7 +63,7 @@ typedef NS_ERROR_ENUM(PTTorrentStreamerErrorDomain, PTTorrentStreamerError) {
     PTTorrentStreamerErrorTorrentInUse = -7,
     /// This stream was reading the file of an offline download of the same torrent (see `cancelStreamingAndDeleteData:`), and the download was stopped or removed before the file was complete.
     PTTorrentStreamerErrorSharedTorrentRemoved = -8,
-    /// The selection block chose no file of the torrent (`PTTorrentStreamerNoFileIndex`, or any index out of range): the torrent does not hold the video wanted, e.g. a season pack without the requested episode. Nothing was downloaded. `NSLocalizedDescriptionKey` says so.
+    /// The selection block chose no file of the torrent (`PTTorrentStreamerNoFileIndex`, or any index out of range): the torrent does not hold the video wanted, e.g. a season pack without the requested episode. Nothing of that file is downloaded: a .torrent file is not even added; a magnet's other files may have received their first pieces between the metadata and the priorities (a few MiB, removed with the stream's folder). A download (`PTTorrentDownload`) failing so deletes its folder. `NSLocalizedDescriptionKey` says so.
     PTTorrentStreamerErrorNoFileSelected = -9,
 };
 
