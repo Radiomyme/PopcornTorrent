@@ -25,6 +25,7 @@
 
 NSNotificationName const PTTorrentStatusDidChangeNotification = @"com.popcorntimetv.popcorntorrent.status.change";
 NSErrorDomain const PTTorrentStreamerErrorDomain = @"com.popcorntimetv.popcorntorrent.error";
+int const PTTorrentStreamerNoFileIndex = -1;
 
 
 using namespace libtorrent;
@@ -53,6 +54,9 @@ using namespace libtorrent;
     // generation whose loop is scheduled (main queue only, 0: none).
     std::atomic<uint64_t> _monitorGeneration;
     uint64_t _monitorLoopGeneration;
+    // The selection chose no file and the failure was reported (once: the metadata alert
+    // and the direct call at start may both come).
+    std::atomic<bool> _noFileReported;
 }
 
 - (instancetype)init {
@@ -62,6 +66,7 @@ using namespace libtorrent;
         _hasMetadata = false;
         _monitorGeneration = 0;
         _monitorLoopGeneration = 0;
+        _noFileReported = false;
         selectedFileIndex = -1;
         // Opt-in: bounded storage only works when the consumer releases what it read
         // (setConsumedBefore:), which an app has to do on purpose.
@@ -180,7 +185,13 @@ using namespace libtorrent;
                 error = [[NSError alloc] initWithDomain:PTTorrentStreamerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithCString:ec.message().c_str() encoding:NSUTF8StringEncoding]}];
             } else {
                 int index = [self selectedFileIndexInTorrentWithTorrentInfo:tp.ti];
-                MIN_PIECES = ((tp.ti->files().file_size(libtorrent::file_index_t(index)) * 0.03)/tp.ti->piece_length());
+                if (index == PTTorrentStreamerNoFileIndex) {
+                    // None of its files is the one wanted: the torrent is not even added.
+                    _noFileReported = true;
+                    error = [self noFileSelectedError];
+                } else {
+                    MIN_PIECES = ((tp.ti->files().file_size(libtorrent::file_index_t(index)) * 0.03)/tp.ti->piece_length());
+                }
             }
         } else {
             error = [[NSError alloc] initWithDomain:PTTorrentStreamerErrorDomain code:-2 userInfo:@{NSLocalizedDescriptionKey: [NSString localizedStringWithFormat:@"File doesn't exist at path: %@".localizedString, filePath]}];
@@ -396,6 +407,7 @@ using namespace libtorrent;
         _requiredSpace = 0;
         _totalDownloaded = 0;
         selectedFileIndex = -1;
+        _noFileReported = false;
         [self setupSession];
     }
 }
@@ -477,6 +489,9 @@ using namespace libtorrent;
     return [self selectedFileIndexInTorrentWithTorrentInfo:ti];
 }
 
+/// The file the selection block chose, kept for the stream; `PTTorrentStreamerNoFileIndex`
+/// when it chose none (any index out of range): nothing is kept then, the callers fail the
+/// stream (`noFileSelectedError`).
 - (int)selectedFileIndexInTorrentWithTorrentInfo:(std::shared_ptr<const torrent_info>)ti {
     if (selectedFileIndex != -1) {
         return selectedFileIndex;
@@ -486,12 +501,26 @@ using namespace libtorrent;
     NSMutableArray* file_names = [[NSMutableArray alloc] init];
     NSMutableArray* file_sizes = [[NSMutableArray alloc] init];
     for (int i=0; i<ti->num_files(); i++) {
-        [file_names addObject:[NSString stringWithFormat:@"%s", files.file_name(file_index_t(i)).to_string().c_str()]];
+        // UTF-8, as torrents name their files ("%s" read them in the system encoding:
+        // "Сезон 1", "Capítulo" garbled); the old reading for a name that isn't UTF-8.
+        std::string const name = files.file_name(file_index_t(i)).to_string();
+        [file_names addObject:[NSString stringWithUTF8String:name.c_str()] ?: [NSString stringWithFormat:@"%s", name.c_str()]];
         [file_sizes addObject:[NSNumber numberWithLong: files.file_size(file_index_t(i))]];
     }
 
-    selectedFileIndex = self.selectionBlock([file_names copy], [file_sizes copy]);
+    int const index = self.selectionBlock([file_names copy], [file_sizes copy]);
+    if (index < 0 || index >= ti->num_files()) {
+        NSLog(@"PopcornTorrent: the selection chose no file of the torrent (%d, %d files)", index, ti->num_files());
+        return PTTorrentStreamerNoFileIndex;
+    }
+    selectedFileIndex = index;
     return selectedFileIndex;
+}
+
+/// The failure of a stream whose selection chose no file (`PTTorrentStreamerErrorNoFileSelected`).
+- (NSError *)noFileSelectedError {
+    NSString *description = @"This torrent does not contain the requested episode. Please choose another source.".localizedString;
+    return [NSError errorWithDomain:PTTorrentStreamerErrorDomain code:PTTorrentStreamerErrorNoFileSelected userInfo:@{NSLocalizedDescriptionKey: description}];
 }
 
 #pragma mark - Storage
@@ -608,6 +637,14 @@ using namespace libtorrent;
         return;
     }
     int selectedIndex = [self selectedFileIndexInTorrent:th];
+    if (selectedIndex == PTTorrentStreamerNoFileIndex) {
+        // None of its files is wanted: none downloads, and the stream fails (once).
+        auto file_priorities = th.get_file_priorities();
+        std::fill(file_priorities.begin(), file_priorities.end(), dont_download);
+        th.prioritize_files(file_priorities);
+        if (!_noFileReported.exchange(true)) [self handleTorrentError:[self noFileSelectedError]];
+        return;
+    }
     file_index_t file_index = file_index_t(selectedIndex);
 
     // Only the selected file is wanted (the window planner never touches other files).
@@ -704,6 +741,11 @@ using namespace libtorrent;
         return;
     }
     int const selectedIndex = [self selectedFileIndexInTorrent:th];
+    if (selectedIndex == PTTorrentStreamerNoFileIndex) {
+        // Not the owner's file nor any other: the owner's priorities stay as they are.
+        if (!_noFileReported.exchange(true)) [self handleTorrentError:[self noFileSelectedError]];
+        return;
+    }
     if (owner == nil || ownerIndex != selectedIndex) {
         // Another file of the torrent: its priorities are the owner's (one file per torrent).
         NSString *description = @"This video is already being played or downloaded. Stop the other playback or the download, then try again.".localizedString;

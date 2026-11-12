@@ -33,7 +33,7 @@ typedef void (^PTTorrentStreamerFailure)(NSError * _Nonnull error);
  
  @param torrentsAvailable  The available torrents names that the user can select from
  
- @return The index of the item in the array torrentsAvailable the user has selected
+ @return The index of the item in the array torrentsAvailable the user has selected, or `PTTorrentStreamerNoFileIndex` when none of them is the file wanted (a season pack without the requested episode): the stream then fails with `PTTorrentStreamerErrorNoFileSelected` (any other index out of range too)
  */
 typedef int (^PTTorrentStreamerSelection)(NSArray<NSString*> * _Nonnull torrentsAvailable, NSArray<NSNumber*> * _Nonnull fileSizes);
 
@@ -63,7 +63,14 @@ typedef NS_ERROR_ENUM(PTTorrentStreamerErrorDomain, PTTorrentStreamerError) {
     PTTorrentStreamerErrorTorrentInUse = -7,
     /// This stream was reading the file of an offline download of the same torrent (see `cancelStreamingAndDeleteData:`), and the download was stopped or removed before the file was complete.
     PTTorrentStreamerErrorSharedTorrentRemoved = -8,
+    /// The selection block chose no file of the torrent (`PTTorrentStreamerNoFileIndex`, or any index out of range): the torrent does not hold the video wanted, e.g. a season pack without the requested episode. Nothing was downloaded. `NSLocalizedDescriptionKey` says so.
+    PTTorrentStreamerErrorNoFileSelected = -9,
 };
+
+/**
+ What a selection block (`PTTorrentStreamerSelection`) returns when none of the torrent's files is the one wanted: the stream fails with `PTTorrentStreamerErrorNoFileSelected` instead of downloading another file.
+ */
+FOUNDATION_EXPORT int const PTTorrentStreamerNoFileIndex;
 
 /**
  How the selected file is kept on disk. Decided when the torrent metadata is received.

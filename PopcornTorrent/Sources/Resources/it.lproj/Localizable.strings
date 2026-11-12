@@ -19,3 +19,6 @@
 
 /* Bounded storage: the volume stayed full while the video was loading; the space this video itself held is given back when it stops. */
 "There is not enough free space to start this video. Please clear some space and try again." = "Non c’è abbastanza spazio libero per avviare questo video. Libera dello spazio e riprova.";
+
+/* A stream or download fails before downloading anything: the torrent (e.g. a season pack) does not hold the episode that was asked for. */
+"This torrent does not contain the requested episode. Please choose another source." = "Questo torrent non contiene l’episodio richiesto. Scegli un’altra fonte.";

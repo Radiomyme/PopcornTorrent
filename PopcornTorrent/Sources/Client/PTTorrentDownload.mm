@@ -183,9 +183,12 @@ using namespace libtorrent;
 
 /// The file a download loaded from its plist was downloading, among the torrent's
 /// (`names`: file names, `sizes`): its stored index, else the file named like the one in its
-/// folder (`fileName`, a path relative to it), else the largest file.
+/// folder (`fileName`, a path relative to it), else the largest file. A download whose
+/// selection chose no file (`PTTorrentStreamerNoFileIndex` stored: the episode is not in the
+/// pack) chooses none again: resumed, it fails the same way instead of downloading another file.
 + (int)indexOfDownloadedFile:(nullable NSString *)fileName storedIndex:(nullable NSNumber *)storedIndex
                        names:(NSArray<NSString *> *)names sizes:(NSArray<NSNumber *> *)sizes {
+    if (storedIndex != nil && storedIndex.intValue == PTTorrentStreamerNoFileIndex) return PTTorrentStreamerNoFileIndex;
     if (storedIndex != nil && storedIndex.intValue >= 0 && storedIndex.intValue < (int)names.count) return storedIndex.intValue;
     NSString *wanted = fileName.lastPathComponent;
     if (wanted.length > 0) {
