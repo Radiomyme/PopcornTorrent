@@ -567,13 +567,21 @@ the thread, and a 10 ms sampler that logs the calls in flight whenever the alloc
 
 ## Tests
 
-Unit tests (pure logic, no network):
+The whole scheme (Xcode's ⌘U) runs offline in about 10 seconds:
 
 ```
-xcodebuild test -scheme PopcornTorrent -destination "platform=macOS,arch=arm64" -only-testing:PopcornTorrentLogicTests
+xcodebuild test -scheme PopcornTorrent -destination "platform=macOS,arch=arm64"
 ```
 
-Do not run the whole scheme: `PopcornTorrent-Tests` streams public torrents.
+| Target | What | Time |
+|---|---|---|
+| `PopcornTorrentLogicTests` | pure logic of bounded storage (budget, window, pace, container heads) | < 0.1 s |
+| `PopcornTorrent-Tests` | the streamer end to end, offline (`PTOfflineStreamingTests.mm`): a generated season pack (3 episodes, one with a non-ASCII name), its private torrent and a public one, a seeder on 127.0.0.1, the shared session made loopback-only; a .torrent file and a magnet (metadata from the peer), the chosen episode served byte for byte over HTTP, a stream started again from the data kept, a selection of no file failing with `PTTorrentStreamerErrorNoFileSelected` before anything is downloaded, cancel with `deleteData` | ~6 s |
+| `PopcornTorrentInternetTests` | the former `PopcornTorrent-Tests`: streams PUBLIC torrents from the internet (trackers, DHT, real swarms; minutes). Skipped unless the test environment sets `PT_INTERNET_TESTS=1` | skipped |
+
+To run the offline streaming tests inside the sandbox below, build them, then run the bundle:
+`xcodebuild build-for-testing -scheme PopcornTorrent -destination "platform=macOS,arch=arm64" -derivedDataPath <dd>`, then
+`sandbox-exec -f Tools/BoundedStorageHarness/localhost-only.sb xcrun xctest <dd>/Build/Products/Debug/PopcornTorrent-Tests.xctest`.
 
 Run the offline harnesses inside the sandbox profile
 `Tools/BoundedStorageHarness/localhost-only.sb` (`sandbox-exec -f localhost-only.sb ...`):

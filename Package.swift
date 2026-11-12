@@ -31,16 +31,34 @@ let package = Package(
                 .linkedFramework("SystemConfiguration")
             ]
         ),
-        // Pure logic of bounded storage (offline, no network): swift test --filter PopcornTorrentLogicTests
+        // Pure logic of bounded storage (offline, no network, well under a second):
+        // swift test --filter PopcornTorrentLogicTests
         .testTarget(name: "PopcornTorrentLogicTests",
                     dependencies: ["PopcornTorrent"],
                     path: "PopcornTorrentLogicTests",
                     linkerSettings: [
                         .linkedFramework("MediaPlayer")
                     ]),
+        // The streamer end to end, offline (a few seconds): a generated season pack, a
+        // seeder on 127.0.0.1, the session loopback-only (no tracker, DHT, LSD, UPnP, NAT-PMP).
         .testTarget(name: "PopcornTorrent-Tests",
                     dependencies: [.targetItem(name: "PopcornTorrent", condition: nil)],
                     path: "PopcornTorrentTests",
+                    cxxSettings: [
+                        .define("TORRENT_ABI_VERSION", to: "3"),
+                        .define("BOOST_ASIO_HASH_MAP_BUCKETS", to: "1021"),
+                        .headerSearchPath("../include"),
+                        .headerSearchPath("../PopcornTorrent/Sources/Client"),
+                    ],
+                    linkerSettings: [
+                        .linkedFramework("MediaPlayer"),
+                        .linkedFramework("SystemConfiguration")
+                    ]),
+        // Streams PUBLIC torrents from the internet (minutes, real swarms): skipped unless
+        // the test environment sets PT_INTERNET_TESTS=1.
+        .testTarget(name: "PopcornTorrentInternetTests",
+                    dependencies: [.targetItem(name: "PopcornTorrent", condition: nil)],
+                    path: "PopcornTorrentInternetTests",
                     resources: [.copy("big-buck-bunny.torrent")],
                     linkerSettings: [
                         .linkedFramework("MediaPlayer")

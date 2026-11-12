@@ -1,14 +1,24 @@
 //
-//  File.swift
-//  
+//  PopcornTorrentInternetTests.swift
 //
 //  Created by Alexandru Tudose on 26.10.2022.
+//
+//  Streams PUBLIC torrents from the internet (trackers, DHT, real peers): minutes per
+//  test, and it depends on those swarms. Skipped unless the test environment sets
+//  PT_INTERNET_TESTS=1 (edit the scheme's Test action, or
+//  `PT_INTERNET_TESTS=1 swift test --filter PopcornTorrentInternetTests`).
+//  The offline tests in PopcornTorrentTests cover the same paths on 127.0.0.1.
 //
 
 import XCTest
 @testable import PopcornTorrent
 
-class PopcornTorrentTests: XCTestCase {
+class PopcornTorrentInternetTests: XCTestCase {
+
+    override func setUpWithError() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["PT_INTERNET_TESTS"] == "1",
+                          "Streams public torrents from the internet: set PT_INTERNET_TESTS=1 to run it")
+    }
     
     var completeSeasonMagnetLink = "magnet:?xt=urn:btih:c17d1a8de4254ae098206d245aeb78754d798f9f&amp;dn=House.of.the.Dragon.S01.COMPLETE.720p.HMAX.WEBRip.x264-GalaxyTV&amp;tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&amp;tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce&amp;tr=udp%3A%2F%2Ftracker.cyberia.is%3A6969%2Fannounce&amp;tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&amp;tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce&amp;tr=udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce&amp;tr=udp%3A%2F%2Ftracker.birkenwald.de%3A6969%2Fannounce&amp;tr=udp%3A%2F%2Ftracker.moeking.me%3A6969%2Fannounce&amp;tr=udp%3A%2F%2Fipv4.tracker.harry.lu%3A80%2Fannounce&amp;tr=udp%3A%2F%2F9.rarbg.me%3A2970%2Fannounce"
     
