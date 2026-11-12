@@ -75,6 +75,14 @@ using namespace libtorrent;
 - (void)fileErrorAlert:(NSString *_Nonnull)description diskFull:(BOOL)diskFull;
 - (void)prioritizeNextPieces:(torrent_handle)th;
 
+/// Publishes the status now (progress block and `PTTorrentStatusDidChangeNotification`, on the
+/// main queue) and makes sure the 0.5 s monitor runs: one loop per stream. Any thread.
+- (void)updateAndMonitorTorrentProgress;
+/// Whether the status is published from the moment the torrent is added (before its metadata):
+/// `YES` for a stream that added its torrent, `NO` for a guest and for a download (whose status
+/// starts with the metadata, as before).
+- (BOOL)publishesStatusBeforeMetadata;
+
 #pragma mark Shared torrents (see -[PTTorrentsSession joinTorrent:params:error:])
 
 /// `YES` while this stream reads a torrent another streamer added (an offline download).

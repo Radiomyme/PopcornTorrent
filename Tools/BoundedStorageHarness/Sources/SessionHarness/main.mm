@@ -10,6 +10,8 @@
 //   SessionHarness guest <work>       a stream of a torrent an offline download is downloading
 //                                     joins it (see PTTorrentsSession joinTorrent:)
 //   SessionHarness background <work>  the tvOS "long background" network reopen during a stream
+//   SessionHarness premetadata <work> a magnet's status before its metadata: its only peer, a
+//                                     seeder that starts late, shows in the progress block
 // Generated payloads (random bytes), private torrents without trackers, a seeder on 127.0.0.1,
 // the streamer's shared session loopback-only (no DHT, LSD, UPnP, NAT-PMP). Run it under
 // sandbox-exec with localhost-only.sb. Every stream and download writes under <work>.
@@ -22,6 +24,7 @@
 #import "PTTorrentsSession+Protected.h"
 #import "PTTorrentsSession+Testing.h"
 #import "PTTorrentDownload.h"
+#import "PTSize.h"
 #include <libtorrent/session.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/create_torrent.hpp>
@@ -31,6 +34,7 @@
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/address.hpp>
 #include <libtorrent/peer_info.hpp>
+#include <libtorrent/magnet_uri.hpp>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -109,7 +113,7 @@ struct Payload {
     std::shared_ptr<lt::torrent_info> ti;
 };
 
-static Payload makePayload(NSString *work, NSString *name, int64_t size, int pieceLength) {
+static Payload makePayload(NSString *work, NSString *name, int64_t size, int pieceLength, bool priv = true) {
     Payload p;
     p.dir = [work stringByAppendingPathComponent:[@"seed-" stringByAppendingString:name]];
     [[NSFileManager defaultManager] createDirectoryAtPath:p.dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -127,7 +131,8 @@ static Payload makePayload(NSString *work, NSString *name, int64_t size, int pie
     lt::file_storage fs;
     lt::add_files(fs, p.path.fileSystemRepresentation);
     lt::create_torrent ct(fs, pieceLength);
-    ct.set_priv(true);
+    // Private by default; a magnet test needs a public one (no metadata exchange otherwise).
+    ct.set_priv(priv);
     lt::set_piece_hashes(ct, p.dir.fileSystemRepresentation);
     std::vector<char> bytes;
     lt::bencode(std::back_inserter(bytes), ct.generate());
@@ -755,9 +760,158 @@ static int runLegacy(NSString *work) {
     return 0;
 }
 
+#pragma mark - premetadata
+
+/// One progress callback of a stream, with the streamer's loading state at that moment.
+struct StatusSample {
+    double t = 0;          // seconds since the stream started (harness clock)
+    float buffering = 0;
+    int rate = 0;          // download rate, bytes/s
+    int seeds = 0;
+    int peers = 0;
+    bool hasMetadata = false;
+    double sinceStart = 0; // the streamer's timeSinceStart
+};
+
+static NSString *magnetFor(Payload const& p) {
+    return [NSString stringWithUTF8String:lt::make_magnet_uri(*p.ti).c_str()];
+}
+
+/// A magnet's status before its metadata (PTTorrentStreamer.h, Loading): the progress block and
+/// the status notification start when the torrent is added, with 0 peers while nobody answers;
+/// a seeder that starts late (the only peer) then shows as peers and download rate while the
+/// metadata comes in (slowly: 8 KiB/s); one monitor loop per stream (2 callbacks a second, also
+/// after the metadata); nothing after a cancel; a `.torrent` file has its metadata at once; a
+/// download of a magnet stays "Processing" (no status before its metadata, as before).
+static int runPreMetadata(NSString *work) {
+    NSString *downloads = [work stringByAppendingPathComponent:@"streams"];
+    // 64 MiB in 16 KiB pieces: 4096 hashes, an info dictionary of about 80 KiB, served at
+    // 8 KiB/s: about 10 s of metadata exchange. Public: private torrents do not serve metadata.
+    Payload p = makePayload(work, @"premeta", 64LL << 20, 16 << 10, false);
+    NSData *head = payloadRange(p, 0, 65536);
+    NSString *magnet = magnetFor(p);
+    Seeder seeder;
+    int const seederPort = seeder.port;
+    logf(@"payload 64 MiB, %d pieces, magnet %@", p.ti->num_pieces(), magnet);
+
+    __block std::vector<StatusSample> samples;
+    __block int notifications = 0;
+    auto r = std::make_shared<StreamResult>();
+    PTTorrentStreamer *s = [PTTorrentStreamer new];
+    s.downloadDirectoryOverride = downloads;
+    __weak PTTorrentStreamer *weakS = s;
+    check(!s.hasMetadata && s.timeSinceStart == 0, @"idle streamer: no metadata, no clock",
+          [NSString stringWithFormat:@"hasMetadata %d, timeSinceStart %.3f", s.hasMetadata, s.timeSinceStart]);
+    id observer = [[NSNotificationCenter defaultCenter] addObserverForName:PTTorrentStatusDidChangeNotification object:s queue:nil
+                                                                usingBlock:^(NSNotification *note) { notifications++; }];
+    NSDate *t0 = [NSDate date];
+    [s startStreamingFromMultiTorrentFileOrMagnetLink:magnet
+        progress:^(PTTorrentStatus st) {
+            StatusSample x;
+            x.t = -[t0 timeIntervalSinceNow];
+            x.buffering = st.bufferingProgress; x.rate = st.downloadSpeed; x.seeds = st.seeds; x.peers = st.peers;
+            x.hasMetadata = weakS.hasMetadata; x.sinceStart = weakS.timeSinceStart;
+            samples.push_back(x);
+        }
+        readyToPlay:^(NSURL *url, NSURL *file) { r->url = url; r->ready = YES; logf(@"readyToPlay %@ -> %@", url, file.lastPathComponent); }
+        failure:^(NSError *error) { r->failure = error.localizedDescription; r->failureCode = error.code; logf(@"failure %ld: %@", (long)error.code, error.localizedDescription); }
+        selectFileToStream:^int(NSArray<NSString *> *names, NSArray<NSNumber *> *sizes) { return 0; }];
+    check(!s.hasMetadata && s.storageMode == PTStorageModeUndetermined, @"a magnet starts without metadata",
+          [NSString stringWithFormat:@"hasMetadata %d, mode %ld", s.hasMetadata, (long)s.storageMode]);
+
+    // 1. Nobody to connect to for 6 s (the seeder has not added the torrent, nobody is told).
+    spin(6, nil);
+    size_t const before = samples.size();
+    BOOL allEmpty = YES;
+    for (auto const& x : samples) allEmpty = allEmpty && x.peers == 0 && x.seeds == 0 && x.buffering == 0 && !x.hasMetadata;
+    double const clock = s.timeSinceStart, harnessClock = -[t0 timeIntervalSinceNow];
+    check(before >= 10 && before <= 14 && allEmpty, @"status every 0.5 s before the metadata, 0 peers",
+          [NSString stringWithFormat:@"%zu callbacks and %d notifications in 6 s (before: none until the metadata), all 0 peers / 0 %% / no metadata: %d",
+           before, notifications, allEmpty]);
+    check(!s.hasMetadata && fabs(clock - harnessClock) < 0.5 && samples.size() > 1 && samples.back().sinceStart > 5,
+          @"timeSinceStart follows the stream's clock",
+          [NSString stringWithFormat:@"timeSinceStart %.2f s, harness %.2f s, last callback's %.2f s", clock, harnessClock,
+           samples.empty() ? 0.0 : samples.back().sinceStart]);
+
+    // 2. The seeder starts (late), its upload capped at 8 KiB/s, and the stream is told about it.
+    lt::torrent_handle seed = seeder.seed(p, 8 << 10);
+    double const seederAt = -[t0 timeIntervalSinceNow];
+    spin(60, ^BOOL { nudge(s, seederPort); return s.hasMetadata || r->failure != nil; });
+    double const metadataAt = -[t0 timeIntervalSinceNow];
+    int withPeers = 0, withRate = 0, maxPeers = 0, maxRate = 0;
+    for (size_t i = before; i < samples.size(); ++i) {
+        auto const& x = samples[i];
+        if (x.hasMetadata) continue;
+        if (x.peers > 0) { withPeers++; maxPeers = std::max(maxPeers, x.peers); }
+        if (x.peers > 0 && x.rate > 0) { withRate++; maxRate = std::max(maxRate, x.rate); }
+    }
+    check(s.hasMetadata && withPeers >= 2 && withRate >= 1, @"the late seeder shows before the metadata",
+          [NSString stringWithFormat:@"seeder at %.1f s, metadata at %.1f s; %d callbacks before it with peers (max %d), %d with a download rate (max %d B/s)",
+           seederAt, metadataAt, withPeers, maxPeers, withRate, maxRate]);
+    check(s.hasMetadata && s.fileName.length > 0 && s.storageMode == PTStorageModeFull, @"hasMetadata: the file is chosen",
+          [NSString stringWithFormat:@"%@, %lld bytes, mode %ld", s.fileName, s.fileSize.longLongValue, (long)s.storageMode]);
+
+    // 3. One loop: with the seeder at 1 B/s (no piece, no piece alert; still connected) 2
+    // callbacks a second, not 4.
+    seed.set_upload_limit(1);
+    spin(1, nil);
+    size_t const pausedFrom = samples.size();
+    spin(4, nil);
+    size_t const pausedCount = samples.size() - pausedFrom;
+    check(pausedCount >= 6 && pausedCount <= 10, @"one monitor loop after the metadata",
+          [NSString stringWithFormat:@"%zu callbacks in 4 s with no piece coming (two loops: about 16)", pausedCount]);
+
+    // 4. The seeder, unlimited: ready, the right bytes.
+    seed.set_upload_limit(0);
+    BOOL ready = waitReady(s, r, seederPort, 60);
+    check(ready && r->failure == nil, @"ready after the metadata", describe(s));
+    if (ready) {
+        NSInteger status = 0;
+        NSData *httpHead = httpGet(r->url.port.intValue, s.fileName, 0, 65536, &status, 30);
+        check([httpHead isEqualToData:head], @"serves the right bytes", [NSString stringWithFormat:@"HTTP %ld, head matches %d", (long)status, [httpHead isEqualToData:head]]);
+    }
+
+    // 5. Cancel: no more status, no loading state.
+    [s cancelStreamingAndDeleteData:YES];
+    size_t const atCancel = samples.size();
+    int const notesAtCancel = notifications;
+    spin(2, nil);
+    check(samples.size() == atCancel && notifications == notesAtCancel && !s.hasMetadata && s.timeSinceStart == 0,
+          @"nothing after a cancel", [NSString stringWithFormat:@"%zu callbacks and %d notifications in 2 s; hasMetadata %d, timeSinceStart %.2f",
+                                       samples.size() - atCancel, notifications - notesAtCancel, s.hasMetadata, s.timeSinceStart]);
+    [[NSNotificationCenter defaultCenter] removeObserver:observer];
+
+    // 6. The same torrent from its .torrent file: metadata at once; status as before.
+    auto r2 = std::make_shared<StreamResult>();
+    __block int fileCallbacks = 0;
+    PTTorrentStreamer *f = [PTTorrentStreamer new];
+    f.downloadDirectoryOverride = downloads;
+    [f startStreamingFromMultiTorrentFileOrMagnetLink:p.torrent
+        progress:^(PTTorrentStatus st) { fileCallbacks++; }
+        readyToPlay:^(NSURL *url, NSURL *file) { r2->ready = YES; }
+        failure:^(NSError *error) { r2->failure = error.localizedDescription; }
+        selectFileToStream:^int(NSArray<NSString *> *names, NSArray<NSNumber *> *sizes) { return 0; }];
+    BOOL const fileMetadata = f.hasMetadata;
+    BOOL const fileReady = waitReady(f, r2, seederPort, 60);
+    check(fileMetadata && fileReady && fileCallbacks > 0, @"a .torrent file has its metadata at start",
+          [NSString stringWithFormat:@"hasMetadata right after start %d, ready %d, %d callbacks", fileMetadata, fileReady, fileCallbacks]);
+    [f cancelStreamingAndDeleteData:YES];
+
+    // 7. A download of a magnet nobody answers: no status before its metadata, as before.
+    Payload lone = makePayload(work, @"premeta-lone", 1LL << 20, 16 << 10, false);
+    PTTorrentDownload *d = makeDownload(magnetFor(lone), [work stringByAppendingPathComponent:@"offline"], @"tt0000002");
+    spin(3, nil);
+    check(d.downloadStatus == PTTorrentDownloadStatusProcessing && d.torrentStatus.totalProgress == 0 && !d.hasMetadata,
+          @"a download of a magnet stays Processing before its metadata",
+          [NSString stringWithFormat:@"status %ld after 3 s (Processing = %ld)", (long)d.downloadStatus, (long)PTTorrentDownloadStatusProcessing]);
+    [d stop];
+    spin(1, nil);
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy <workdir>\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata <workdir>\n"); return 2; }
         NSString *mode = [NSString stringWithUTF8String:argv[1]];
         NSString *work = [NSString stringWithUTF8String:argv[2]];
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
@@ -769,6 +923,7 @@ int main(int argc, const char *argv[]) {
         else if ([mode isEqualToString:@"guest"]) rc = runGuest(work);
         else if ([mode isEqualToString:@"background"]) rc = runBackground(work);
         else if ([mode isEqualToString:@"legacy"]) rc = runLegacy(work);
+        else if ([mode isEqualToString:@"premetadata"]) rc = runPreMetadata(work);
         logf(@"RESULT %@: %d passed, %d failed (rc %d)", mode, gPasses, gFailures, rc);
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
         return gFailures > 0 ? 1 : rc;

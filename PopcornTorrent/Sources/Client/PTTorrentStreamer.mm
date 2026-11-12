@@ -9,6 +9,7 @@
 #import <sys/mount.h>
 #import <vector>
 #import <mutex>
+#import <atomic>
 #import <libtorrent/bencode.hpp>
 #import "../Security/CocoaSecurity.h"
 #import "../Resources/NSString+Localization.h"
@@ -43,11 +44,24 @@ using namespace libtorrent;
     // Bounded mode: free space needed to start (planBudget), for the start-starvation error.
     int64_t _minimumFreeBytes;
     BOOL _starvationReported;
+    // Loading state, read from any thread: when the stream started (system uptime; 0: none)
+    // and whether its metadata was processed (hasMetadata).
+    std::atomic<double> _startUptime;
+    std::atomic<bool> _hasMetadata;
+    // The 0.5 s status monitor runs one loop per stream: the generation changes at every start
+    // and cancel (a loop of another generation stops); _monitorLoopGeneration is the
+    // generation whose loop is scheduled (main queue only, 0: none).
+    std::atomic<uint64_t> _monitorGeneration;
+    uint64_t _monitorLoopGeneration;
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
+        _startUptime = 0;
+        _hasMetadata = false;
+        _monitorGeneration = 0;
+        _monitorLoopGeneration = 0;
         selectedFileIndex = -1;
         // Opt-in: bounded storage only works when the consumer releases what it read
         // (setConsumedBefore:), which an app has to do on purpose.
@@ -137,6 +151,10 @@ using namespace libtorrent;
     self.progressBlock = progress;
     self.readyToPlayBlock = readyToPlay;
     self.failureBlock = failure;
+    // A new stream: its clock, no metadata yet, and a new monitor generation.
+    _startUptime = [NSProcessInfo processInfo].systemUptime;
+    _hasMetadata = false;
+    ++_monitorGeneration;
 
     error_code ec;
     add_torrent_params tp;
@@ -266,7 +284,32 @@ using namespace libtorrent;
 
     if (![filePathOrMagnetLink hasPrefix:@"magnet"] || _torrentHandle.status().has_metadata) {
         [self metadataReceivedAlert:_torrentHandle];
+    } else if ([self publishesStatusBeforeMetadata]) {
+        // A magnet resolving its metadata: peers, seeds and rate every 0.5 s from now on
+        // (buffering 0), not a silence until the metadata comes (or never, from a dead swarm).
+        // The metadata (alerts thread) joins this loop instead of starting another one.
+        [self updateAndMonitorTorrentProgress];
     }
+}
+
+/// Whether a status read for `generation` may still be posted: that stream still runs (not
+/// cancelled or restarted since). An alert handled on the alerts thread just after a cancel
+/// reads the new generation: no stream runs then (`_startUptime` 0).
+- (BOOL)isStreamOfGeneration:(uint64_t)generation {
+    return _monitorGeneration.load() == generation && _startUptime.load() > 0;
+}
+
+- (BOOL)publishesStatusBeforeMetadata {
+    return !_guest;
+}
+
+- (BOOL)hasMetadata {
+    return _hasMetadata.load();
+}
+
+- (NSTimeInterval)timeSinceStart {
+    double const start = _startUptime.load();
+    return start > 0 ? MAX(0, [NSProcessInfo processInfo].systemUptime - start) : 0;
 }
 
 - (void)handleTorrentError:(NSError *)error {
@@ -292,6 +335,10 @@ using namespace libtorrent;
 
 - (void)cancelStreamingAndDeleteData:(BOOL)deleteData {
     auto controller = std::atomic_exchange(&_controller, std::shared_ptr<ptbounded::StreamController>());
+    // The monitor loop of this stream stops at its next tick; no stream, no loading state.
+    ++_monitorGeneration;
+    _startUptime = 0;
+    _hasMetadata = false;
     BOOL const bounded = self.storageMode == PTStorageModeBounded;
     BOOL const guest = _guest;
     // Whether the files are this streamer's to delete.
@@ -628,6 +675,7 @@ using namespace libtorrent;
                          plan:plan reserveBytes:input.reserveBytes fileExisted:input.heldBytes > 0 sharedTorrent:NO];
     if (controller && input.requestedBudget > 0) controller->setTorrentBudget(input.requestedBudget);
     if (controller && input.pendingExternalBytes > 0) controller->setPendingExternalBytes(input.pendingExternalBytes);
+    _hasMetadata = true;
 
     [self updateAndMonitorTorrentProgress];
 
@@ -676,6 +724,7 @@ using namespace libtorrent;
     [self configureController:controller torrent:th fileIndex:file_index filePath:filePath bounded:NO
                          plan:plan reserveBytes:self.storageReserve fileExisted:YES sharedTorrent:YES];
     th.add_extension(ptbounded::makeStreamPluginFactory(controller));
+    _hasMetadata = true;
 
     [self updateAndMonitorTorrentProgress];
     if (_isFinished) [self torrentFinishedAlert:th];
@@ -813,25 +862,55 @@ using namespace libtorrent;
     _isFinished = finished;
 }
 
+/// Publishes the status now and makes sure the 0.5 s loop runs. Called when the torrent is
+/// added (a stream resolving a magnet's metadata) and at the metadata (alerts thread, or the
+/// start for a `.torrent` file): one loop per stream, whichever comes first starts it. Before,
+/// the loop started at the metadata only, and a second call started a second loop.
 - (void)updateAndMonitorTorrentProgress {
+    if (![self publishTorrentProgress]) return;
+    uint64_t const generation = _monitorGeneration.load();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_monitorGeneration.load() != generation || self->_monitorLoopGeneration == generation) return;
+        self->_monitorLoopGeneration = generation;
+        [self scheduleMonitorTick:generation];
+    });
+}
+
+/// Main queue: the next tick of the loop of `generation`, in 0.5 s. The loop stops when its
+/// stream was cancelled or restarted, or when there is nothing to publish (no progress block,
+/// no torrent, a finished full-mode torrent, a starved bounded start).
+- (void)scheduleMonitorTick:(uint64_t)generation {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (self->_monitorGeneration.load() != generation || ![self publishTorrentProgress]) {
+            if (self->_monitorLoopGeneration == generation) self->_monitorLoopGeneration = 0;
+            return;
+        }
+        [self scheduleMonitorTick:generation];
+    });
+}
+
+/// Reads the torrent's status and posts it (progress block, PTTorrentStatusDidChangeNotification)
+/// on the main queue. Before the metadata: seeds, peers and rates, buffering 0. `NO` when
+/// there is nothing to publish.
+- (BOOL)publishTorrentProgress {
     BOOL const bounded = self.storageMode == PTStorageModeBounded;
     if (!_progressBlock || !_torrentHandle.is_valid() || (self.status.is_finished && !bounded)) {
-        return;
+        return NO;
     }
-    if (bounded && [self failStarvedStart]) return;
+    if (bounded && [self failStarvedStart]) return NO;
 
     torrent_status const status = _torrentHandle.status();
     self.status = status;
     [self refreshTorrentStatus:status];
 
+    uint64_t const generation = _monitorGeneration.load();
     dispatch_async(dispatch_get_main_queue(), ^{
+        // Not for a stream cancelled (or restarted) in the meantime.
+        if (![self isStreamOfGeneration:generation]) return;
         if (_progressBlock) _progressBlock(_torrentStatus);
         [[NSNotificationCenter defaultCenter] postNotificationName:PTTorrentStatusDidChangeNotification object:self];
     });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        [self updateAndMonitorTorrentProgress];
-    });
+    return YES;
 }
 
 /// Main queue. Bounded mode: a stream that is not ready yet while the volume has stayed too full
@@ -869,7 +948,9 @@ using namespace libtorrent;
     self.status = status;
     [self refreshTorrentStatus:status];
 
+    uint64_t const generation = _monitorGeneration.load();
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (![self isStreamOfGeneration:generation]) return; // cancelled or restarted since
         if (_progressBlock) _progressBlock(_torrentStatus);
         [[NSNotificationCenter defaultCenter] postNotificationName:PTTorrentStatusDidChangeNotification object:self];
         [self evaluateReadiness];
@@ -884,7 +965,9 @@ using namespace libtorrent;
         // Every wanted piece is here, but the reader may still seek into a gap:
         // keep the torrent running. It is removed at cancel.
         [self refreshTorrentStatus:status];
+        uint64_t const generation = _monitorGeneration.load();
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (![self isStreamOfGeneration:generation]) return; // cancelled or restarted since
             if (_progressBlock) _progressBlock(_torrentStatus);
             [[NSNotificationCenter defaultCenter] postNotificationName:PTTorrentStatusDidChangeNotification object:self];
         });
@@ -902,7 +985,9 @@ using namespace libtorrent;
     _totalDownloaded = status.total_wanted_done;
     _isFinished = status.is_finished;
 
+    uint64_t const generation = _monitorGeneration.load();
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (![self isStreamOfGeneration:generation]) return; // cancelled or restarted since
         if (_progressBlock) _progressBlock(_torrentStatus);
         [[NSNotificationCenter defaultCenter] postNotificationName:PTTorrentStatusDidChangeNotification object:self];
     });

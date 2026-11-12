@@ -6,7 +6,9 @@
 
 /**
  Block called when the status of the currently streamed torrent is called.
- 
+
+ A stream calls it every 0.5 s from the moment its torrent is added, before the metadata is known (a magnet: seeds, peers and download rate while the metadata resolves, `bufferingProgress` 0; see `hasMetadata`), and when pieces arrive. A `PTTorrentDownload` calls it from the metadata on.
+
  @param status  The buffering progress of the current piece of the torrent, overall buffering of the torrent, the current download speed, the current upload speed, the amount of active seeds downloading from and the amount of peers connected to.
  */
 typedef void (^PTTorrentStreamerProgress)(PTTorrentStatus status);
@@ -138,6 +140,27 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
  The local path to the torrent directory. Will be `nil` if no torrent is being streamed or if the torrent is still processing.
  */
 @property (strong, nonatomic, readonly, nullable) NSString *savePath;
+
+#pragma mark - Loading
+
+/*
+ What a loading screen can show before the stream is ready. The progress block and
+ `PTTorrentStatusDidChangeNotification` start when the torrent is added (every 0.5 s), so a
+ magnet still resolving its metadata, or a swarm that never answers, reports its peers, seeds
+ and download rate (`bufferingProgress` stays 0 until the metadata is known). A stream that
+ joined a torrent already in the session, and `PTTorrentDownload`, report from the metadata
+ on, as before. Both properties can be read from any thread.
+ */
+
+/**
+ `YES` once the torrent's metadata (its file list) is received and the file to stream is chosen: `fileName`, `fileSize` and `storageMode` are set from then on. At once for a `.torrent` file, or a magnet whose metadata is already known (in the session, or resumed); otherwise after the metadata exchange with the peers. `NO` before, and when no stream runs.
+ */
+@property (atomic, readonly) BOOL hasMetadata;
+
+/**
+ Seconds since the current stream was started (`startStreaming…`), on a monotonic clock (system uptime). 0 when no stream runs.
+ */
+@property (atomic, readonly) NSTimeInterval timeSinceStart;
 
 #pragma mark - Bounded storage
 

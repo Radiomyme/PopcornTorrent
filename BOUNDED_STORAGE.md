@@ -73,6 +73,8 @@ the sparse download and the HLS copy fill the volume together late in the film
 @property (atomic, readonly) int64_t bytesOnDisk;    // st_blocks of the file, fresh
 @property (atomic, readonly) NSDictionary<NSString *, NSNumber *> *storageStatistics;
 + (NSString *)holeSupportReportForDirectory:(NSString *)directory passed:(BOOL *)passed; // see When it switches on
+@property (atomic, readonly) BOOL hasMetadata;      // the metadata is in, the file chosen (see Loading status)
+@property (atomic, readonly) NSTimeInterval timeSinceStart; // seconds since startStreaming…, 0: no stream
 ```
 
 Error codes (`PTTorrentStreamerErrorDomain`): -4 not enough space (legacy
@@ -144,6 +146,43 @@ is not wholly inside the selected file (multi-file torrents) cannot be hashed
 from it: libtorrent's flush is trusted then. The remux, which reads the file with a
 `FileHandle`, must only read ranges for which `isRangeAvailable` is `YES`, and
 must only release (`consumedBefore`) what it will never read again.
+
+## Loading status (before the metadata)
+
+A stream's progress block and `PTTorrentStatusDidChangeNotification` used to start only
+when the metadata was in (`metadataReceivedAlert` started the 0.5 s monitor): a magnet
+resolving its metadata, or a swarm that never answers, gave the app nothing at all (the
+Apple TV's loading screen: a spinner, no information, no way to tell a slow start from a
+dead source). Now:
+
+- A stream that adds its torrent starts the monitor at once: every 0.5 s the progress block
+  and the notification carry seeds, peers and the download rate (the metadata exchange
+  counts: protocol bytes), `bufferingProgress` 0 and `totalProgress` 0 until the metadata is
+  in. A `.torrent` file (or a magnet whose metadata is already known) goes through the
+  metadata at once, as before.
+- `hasMetadata` (any thread): `YES` once the metadata is processed and the file chosen
+  (`fileName`, `fileSize`, `storageMode` are set from then on); `NO` before and when no stream
+  runs. `timeSinceStart` (any thread): seconds since `startStreaming…` on the system-uptime
+  clock, 0 when no stream runs. Both reset at cancel.
+- One monitor loop per stream: the loop started before the metadata goes on after it (the
+  metadata publishes once and joins it). Before, every call of the monitor started a loop of
+  its own. A generation counter (bumped at every start and cancel) stops the loop of a
+  cancelled or restarted stream at its next tick.
+- No status after a cancel: a status read before the cancel, or by an alert handled on the
+  alerts thread right after it, is dropped on the main queue (before: one more
+  notification could follow a cancel; the progress block was already nil).
+- Unchanged: `PTTorrentDownload` (its progress block turns it "Downloading": it stays
+  "Processing" until the metadata, as before) and a stream that joined a torrent already in
+  the session (`publishesStatusBeforeMetadata` returns `NO` for both); full and bounded
+  modes after the metadata.
+
+```swift
+streamer.startStreaming(fromMultiTorrentFileOrMagnetLink: magnet, progress: { status in
+    // from the first 0.5 s: status.peers, status.seeds, status.downloadSpeed
+    let phase = streamer.hasMetadata ? "buffering \(status.bufferingProgress)" : "getting the details"
+    // streamer.timeSinceStart: how long this has been going on
+}, readyToPlay: { _, _ in }, failure: { _ in }, selectFileToStream: { _, _ in 0 })
+```
 
 ## Rewinds (what is on disk, for the app)
 
@@ -549,6 +588,7 @@ SessionHarness starve <work>      # 3 cancelled streams then a 4th; 3 active dow
 SessionHarness guest <work>       # a stream joins a download's torrent (5 scenarios)
 SessionHarness background <work>  # the tvOS network reopen during a stream
 SessionHarness legacy <work>      # a CocoaPods-era download (Metadata.plist, no file index) resumed
+SessionHarness premetadata <work> # a magnet's status before its metadata: a late seeder, one loop, nothing after a cancel
 ```
 
 Offline end-to-end harness (`Tools/BoundedStorageHarness`): generates a file of
@@ -686,6 +726,18 @@ sparse images):
 | SessionHarness zombie / starve / guest / background / legacy | 8/8, 8/8, 16/16, 5/5, 6/6 (legacy is new: a CocoaPods-era download resumes in its folder, on file #1 of 2, the seed sends 24 of 48 MiB, one plist left) |
 | hole self-test | PASS on the Mac (APFS sparse image) and in the tvOS 26.5 simulator's sandbox |
 | app, Mac, full mode (10 GiB image, a 4.5 GiB film) | `full mode: file created at … up front`; no allocation jump > 200 MiB in 4 s (before: 61 → 4628 MiB in 4 s at the first tail write); the same player events as before |
+
+### Results (Mac, 2026-11-12, status before the metadata)
+
+All offline (localhost-only sandbox; `premetadata` uses a public torrent without trackers:
+private torrents do not exchange metadata), on the Mac:
+
+| Run | Result |
+|---|---|
+| unit tests (`PopcornTorrentLogicTests`) | 37/37 (the change is not pure logic: covered by the harness) |
+| SessionHarness premetadata | 12/12, twice: a magnet with nobody to connect to reports every 0.5 s from the start (12 callbacks and 12 notifications in 6 s, all 0 peers, 0 %, `hasMetadata` NO; before: none until the metadata); `timeSinceStart` equals the harness clock (6.00 s); a seeder started at 6 s (upload capped at 8 KiB/s: a 64 MiB file in 16 KiB pieces, about 80 KiB of metadata) shows before the metadata in 29 callbacks with 1 peer, 27 with a download rate (max 9.6 KB/s); metadata at 21.7 s: `hasMetadata`, the file and full mode; one loop after it (8 callbacks in 4 s with no piece coming; two loops: about 16); ready, the right bytes; nothing after a cancel (0 callbacks, 0 notifications in 2 s; before the fix one notification could follow); a `.torrent` file has its metadata right after the start; a download of a magnet nobody answers stays Processing |
+| SessionHarness zombie / starve / guest / background / legacy | 8/8, 8/8, 16/16, 5/5, 6/6 |
+| `xcodebuild build` macOS, tvOS, tvOS Simulator, iOS | succeeded, no new warning |
 
 ## Limits and open points
 

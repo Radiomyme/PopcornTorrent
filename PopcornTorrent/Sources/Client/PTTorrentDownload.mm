@@ -320,6 +320,12 @@ using namespace libtorrent;
     }
 }
 
+- (BOOL)publishesStatusBeforeMetadata {
+    // The progress block turns a download "Downloading" (totalProgress < 1): it starts with the
+    // metadata, as before (the download stays "Processing" while a magnet resolves).
+    return NO;
+}
+
 - (void)cancelStreamingAndDeleteData:(BOOL)deleteData {
     if (self.isStreaming && _downloadStatus == PTTorrentDownloadStatusDownloading) {
         self.readyToPlayBlock = nil;
