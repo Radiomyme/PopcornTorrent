@@ -15,7 +15,20 @@
 //   SessionHarness network <work> [tv|ios|mac]  the network settings of a profile, the default
 //                                     trackers, streams in file order, downloads rarest first
 //   SessionHarness nofile <work>      a download of a pack magnet without the episode wanted:
-//                                     fails once, and its folder (plist, early pieces) goes
+//                                     fails once, and its folder (plist, early pieces) goes;
+//                                     another episode's finished download of that pack stays
+//                                     (its own folder, and in a folder they share)
+//   SessionHarness packs <work>       two episodes downloaded from one season pack: a folder
+//                                     each; reloaded from their plists, each plays its own file;
+//                                     deleting or stopping one keeps the other (also in a folder
+//                                     shared before 5.2.0)
+//   SessionHarness trackers <work>    the default trackers (here two on 127.0.0.1 nobody answers):
+//                                     a plain magnet gets them at once, a magnet with a keyed
+//                                     tracker once its metadata says it is public, a private
+//                                     torrent never; UPnP / NAT-PMP / LSD of each profile
+//   SessionHarness restart <work>     a stream cancelled with deleteData and started again at
+//                                     once keeps its folder and decides its storage (bounded,
+//                                     refused) as one started later
 // Generated payloads (random bytes), private torrents without trackers, a seeder on 127.0.0.1,
 // the streamer's shared session loopback-only (no DHT, LSD, UPnP, NAT-PMP). Run it under
 // sandbox-exec with localhost-only.sb. Every stream and download writes under <work>.
@@ -325,6 +338,13 @@ static int runZombie(NSString *work) {
     NSDate *cStart = [NSDate date];
     startStream(c, p.torrent, rc, @"C");
     double addSeconds = -[cStart timeIntervalSinceNow];
+    // B's deletion removes its folder once done (rmdir, when empty): not the one C created
+    // while it waited for that deletion (same folder).
+    BOOL const folderAtStart = [[NSFileManager defaultManager] fileExistsAtPath:c.savePath];
+    spin(1, nil);
+    BOOL const folderLater = [[NSFileManager defaultManager] fileExistsAtPath:c.savePath];
+    check(folderAtStart && folderLater, @"immediate replay keeps its folder",
+          [NSString stringWithFormat:@"at start %d, 1 s later %d", folderAtStart, folderLater]);
     BOOL readyC = waitReady(c, rc, seederPort, 60);
     check(readyC && rc->failure == nil && [c.savePath isEqualToString:folderB], @"immediate replay after a delete is ready",
           [NSString stringWithFormat:@"start returned in %.3f s (waits for the previous deletion), %@", addSeconds, describe(c)]);
@@ -1031,6 +1051,89 @@ static int runNetwork(NSString *work, NSString *profile) {
 
 #pragma mark - nofile
 
+/// A public season pack (a magnet: its metadata comes from the seeder), 8 MiB per episode in
+/// Show.S01.PACK/, and its seeder.
+static Payload makePack(NSString *work, NSArray<NSString *> *names) {
+    NSString *seedRoot = [work stringByAppendingPathComponent:@"seed-pack"];
+    NSString *pack = [seedRoot stringByAppendingPathComponent:@"Show.S01.PACK"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:pack withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *name in names) {
+        std::vector<char> buf(8 << 20);
+        arc4random_buf(buf.data(), buf.size());
+        std::ofstream out([pack stringByAppendingPathComponent:name].fileSystemRepresentation, std::ios::binary);
+        out.write(buf.data(), (std::streamsize)buf.size());
+    }
+    lt::file_storage fs;
+    lt::add_files(fs, pack.fileSystemRepresentation);
+    lt::create_torrent ct(fs, 256 << 10);
+    ct.set_priv(false); // a magnet: its metadata comes from the seeder
+    lt::set_piece_hashes(ct, seedRoot.fileSystemRepresentation);
+    std::vector<char> bytes;
+    lt::bencode(std::back_inserter(bytes), ct.generate());
+    Payload p;
+    p.dir = seedRoot;
+    p.ti = std::make_shared<lt::torrent_info>(bytes.data(), (int)bytes.size());
+    return p;
+}
+
+/// The index of the file whose path ends with `name`, -1 when none.
+static int packIndex(Payload const& p, NSString *name) {
+    for (int i = 0; i < p.ti->num_files(); ++i) {
+        NSString *path = [NSString stringWithUTF8String:p.ti->files().file_path(lt::file_index_t(i)).c_str()];
+        if ([path.lastPathComponent isEqualToString:name]) return i;
+    }
+    return -1;
+}
+
+static NSArray<NSString *> *listing(NSString *dir) {
+    return [[[NSFileManager defaultManager] subpathsOfDirectoryAtPath:dir error:nil] ?: @[] sortedArrayUsingSelector:@selector(compare:)];
+}
+
+static BOOL exists(NSString *path) { return [[NSFileManager defaultManager] fileExistsAtPath:path]; }
+
+/// The variant that names the folder (what `resume` uses): here, to put two downloads in one
+/// folder, as before downloads got their own.
+@interface PTTorrentDownload (HarnessFolder)
+- (void)startDownloadingFromFileOrMagnetLink:(NSString *)filePathOrMagnetLink directoryName:(nullable NSString *)directoryName
+                         selectFileTDownload:(PTTorrentStreamerSelection)callback;
+@end
+
+/// A download of `index` (an episode's file) from `magnet`, into `folder` (nil: its own), run to
+/// the end and saved as PTTorrentDownloadManager does when it finishes.
+static PTTorrentDownload *downloadEpisode(NSString *magnet, NSString *downloads, NSString *folder, NSString *media,
+                                          int index, int seederPort) {
+    PTTorrentDownload *d = [[PTTorrentDownload alloc] initWithMediaMetadata:@{MPMediaItemPropertyPersistentID: media}
+                                                             downloadStatus:PTTorrentDownloadStatusProcessing];
+    d.downloadDirectoryOverride = downloads;
+    [d startDownloadingFromFileOrMagnetLink:magnet directoryName:folder
+                        selectFileTDownload:^int(NSArray<NSString *> *n, NSArray<NSNumber *> *z) { return index; }];
+    spin(60, ^BOOL { nudge(d, seederPort); return d.downloadStatus == PTTorrentDownloadStatusFinished || d.downloadStatus == PTTorrentDownloadStatusFailed; });
+    spin(1, nil);
+    [d save];
+    logf(@"download %@ (file %d): status %ld, %@ in %@", media, index, (long)d.downloadStatus, d.fileName, d.savePath.lastPathComponent);
+    return d;
+}
+
+/// A download of `magnet` whose selection chooses no file, into `folder` (nil: its own): the
+/// number of failures and the error code once it failed.
+static int failNoFile(NSString *magnet, NSString *downloads, NSString *folder, NSString *media, int seederPort,
+                      NSInteger *code, NSString **savePath) {
+    PTTorrentDownload *d = [[PTTorrentDownload alloc] initWithMediaMetadata:@{MPMediaItemPropertyPersistentID: media}
+                                                             downloadStatus:PTTorrentDownloadStatusProcessing];
+    d.downloadDirectoryOverride = downloads;
+    __block int failures = 0;
+    __block NSInteger failureCode = 0;
+    [d startDownloadingFromFileOrMagnetLink:magnet directoryName:folder
+                        selectFileTDownload:^int(NSArray<NSString *> *n, NSArray<NSNumber *> *z) { return PTTorrentStreamerNoFileIndex; }];
+    if (savePath) *savePath = d.savePath;
+    PTTorrentStreamerFailure const inner = d.failureBlock;
+    d.failureBlock = ^(NSError *error) { failures++; failureCode = error.code; if (inner) inner(error); };
+    spin(20, ^BOOL { nudge(d, seederPort); return failures > 0; });
+    spin(3, nil); // libtorrent's deletion of what the early pieces wrote
+    if (code) *code = failureCode;
+    return failures;
+}
+
 /// A download of a public two-episode pack, by magnet, whose selection chooses no file (the
 /// episode is not in the pack): it fails once with PTTorrentStreamerErrorNoFileSelected, and
 /// nothing of it stays in the download directory (before: a plist saved while it was
@@ -1082,12 +1185,278 @@ static int runNoFile(NSString *work) {
           [NSString stringWithFormat:@"%d failures, code %ld, %d selections, status %ld", failures, (long)code, selections, (long)d.downloadStatus]);
     check(left.count == 0, @"nothing of it stays (no plist to list at the next launch)",
           left.count ? [left componentsJoinedByString:@", "] : @"download directory empty");
+
+    // Another episode of the same pack, downloaded before (E01, finished), then the pack chosen
+    // for an episode it lacks: the failure deletes nothing of E01.
+    NSString *magnet = magnetFor(p);
+    int const i1 = packIndex(p, @"Show.S01E01.mkv");
+    NSString *plistName = [NSString stringWithFormat:@"Metadata-file-%d.plist", i1];
+    PTTorrentDownload *e01 = downloadEpisode(magnet, downloads, nil, @"show-s01e01", i1, seederPort);
+    NSString *e01Folder = e01.savePath;
+    NSString *e01File = [e01Folder stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E01.mkv"];
+    NSString *e01Plist = [e01Folder stringByAppendingPathComponent:plistName];
+    NSInteger otherCode = 0;
+    NSString *otherFolder = nil;
+    int const otherFailures = failNoFile(magnet, downloads, nil, @"show-s01e09", seederPort, &otherCode, &otherFolder);
+    check(otherFailures == 1 && otherCode == PTTorrentStreamerErrorNoFileSelected && ![otherFolder isEqualToString:e01Folder]
+          && exists(e01File) && exists(e01Plist) && !exists(otherFolder),
+          @"a finished episode of the pack stays when the pack lacks another one (a folder each)",
+          [NSString stringWithFormat:@"%d failures, code %ld; E01 folder %@, failed download's %@ (gone %d); E01 file %d plist %d",
+           otherFailures, (long)otherCode, e01Folder.lastPathComponent, otherFolder.lastPathComponent, !exists(otherFolder),
+           exists(e01File), exists(e01Plist)]);
+
+    // The same in a folder both share (downloads made before each had its own): no file of the
+    // torrent is deleted (libtorrent's delete_files would delete E01 too), no plist is written.
+    NSString *shared = @"shared-before-5.2";
+    PTTorrentDownload *s01 = downloadEpisode(magnet, downloads, shared, @"legacy-s01e01", i1, seederPort);
+    NSString *sharedFolder = s01.savePath;
+    NSString *sharedFile = [sharedFolder stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E01.mkv"];
+    NSString *sharedPlist = [sharedFolder stringByAppendingPathComponent:plistName];
+    int const sharedFailures = failNoFile(magnet, downloads, shared, @"legacy-s01e09", seederPort, &otherCode, nil);
+    NSArray<NSString *> *sharedLeft = listing(sharedFolder);
+    check(sharedFailures == 1 && exists(sharedFile) && exists(sharedPlist)
+          && ![sharedLeft containsObject:@"Metadata-file--1.plist"] && s01.downloadStatus == PTTorrentDownloadStatusFinished,
+          @"in a shared folder too: the finished episode and its plist stay, no plist for the failed one",
+          [NSString stringWithFormat:@"%d failures; E01 file %d plist %d; folder: %@", sharedFailures, exists(sharedFile), exists(sharedPlist),
+           [sharedLeft componentsJoinedByString:@", "]]);
+    return 0;
+}
+
+#pragma mark - packs
+
+/// Two episodes of one season pack downloaded one after the other (E03, then E01, which sorts
+/// first in a folder): with a folder each, and in one folder (downloads made before 5.2.0).
+/// Reloaded from its plist (the next launch), each plays its own episode; deleting one, or
+/// stopping one still downloading, keeps the other.
+static int runPacks(NSString *work) {
+    Payload p = makePack(work, @[@"Show.S01E01.mkv", @"Show.S01E02.mkv", @"Show.S01E03.mkv"]);
+    Seeder seeder;
+    int const seederPort = seeder.port;
+    (void)seeder.seed(p, 2 << 20); // 2 MiB/s: E02 is stopped while it downloads
+    NSString *magnet = magnetFor(p);
+    int const i1 = packIndex(p, @"Show.S01E01.mkv"), i2 = packIndex(p, @"Show.S01E02.mkv"), i3 = packIndex(p, @"Show.S01E03.mkv");
+    NSString *downloads = [work stringByAppendingPathComponent:@"offline"];
+
+    for (NSString *shared in @[@"", @"shared-before-5.2"]) {
+        NSString *how = shared.length ? @"shared folder" : @"a folder each";
+        NSString *folder = shared.length ? shared : nil;
+        NSString *tag = shared.length ? @"legacy-" : @"";
+        PTTorrentDownload *e03 = downloadEpisode(magnet, downloads, folder, [tag stringByAppendingString:@"show-s01e03"], i3, seederPort);
+        PTTorrentDownload *e01 = downloadEpisode(magnet, downloads, folder, [tag stringByAppendingString:@"show-s01e01"], i1, seederPort);
+        NSString *plist03 = [e03.savePath stringByAppendingPathComponent:[NSString stringWithFormat:@"Metadata-file-%d.plist", i3]];
+        NSString *plist01 = [e01.savePath stringByAppendingPathComponent:[NSString stringWithFormat:@"Metadata-file-%d.plist", i1]];
+        check(e03.downloadStatus == PTTorrentDownloadStatusFinished && e01.downloadStatus == PTTorrentDownloadStatusFinished
+              && ([e03.savePath isEqualToString:e01.savePath] == (shared.length > 0)),
+              [NSString stringWithFormat:@"%@: both episodes downloaded", how],
+              [NSString stringWithFormat:@"E03 in %@: %@; E01 in %@: %@", e03.savePath.lastPathComponent, [listing(e03.savePath) componentsJoinedByString:@", "],
+               e01.savePath.lastPathComponent, [listing(e01.savePath) componentsJoinedByString:@", "]]);
+
+        // The next launch: one download per plist.
+        PTTorrentDownload *r03 = [[PTTorrentDownload alloc] initFromPlist:plist03];
+        PTTorrentDownload *r01 = [[PTTorrentDownload alloc] initFromPlist:plist01];
+        check([r03.fileName.lastPathComponent isEqualToString:@"Show.S01E03.mkv"] && [r01.fileName.lastPathComponent isEqualToString:@"Show.S01E01.mkv"]
+              && r03.downloadStatus == PTTorrentDownloadStatusFinished && r01.downloadStatus == PTTorrentDownloadStatusFinished,
+              [NSString stringWithFormat:@"%@: reloaded from its plist, each download plays its own episode", how],
+              [NSString stringWithFormat:@"E03 plist -> %@, E01 plist -> %@", r03.fileName, r01.fileName]);
+
+        // The user deletes E01 (PTTorrentDownloadManager deleteDownload: -> delete).
+        BOOL const deleted = [r01 delete];
+        NSString *file03 = [e03.savePath stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E03.mkv"];
+        NSString *file01 = [e01.savePath stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E01.mkv"];
+        check(deleted && exists(file03) && exists(plist03) && !exists(file01) && !exists(plist01),
+              [NSString stringWithFormat:@"%@: deleting E01 keeps E03, and deletes E01", how],
+              [NSString stringWithFormat:@"delete %d; E03 file %d plist %d; E01 file %d plist %d; left: %@", deleted, exists(file03), exists(plist03),
+               exists(file01), exists(plist01), [listing(e03.savePath) componentsJoinedByString:@", "]]);
+
+        // E02 starts downloading next to E03 and is stopped (PTTorrentDownloadManager stopDownload:).
+        PTTorrentDownload *e02 = [[PTTorrentDownload alloc] initWithMediaMetadata:@{MPMediaItemPropertyPersistentID: [tag stringByAppendingString:@"show-s01e02"]}
+                                                                   downloadStatus:PTTorrentDownloadStatusProcessing];
+        e02.downloadDirectoryOverride = downloads;
+        [e02 startDownloadingFromFileOrMagnetLink:magnet directoryName:folder
+                              selectFileTDownload:^int(NSArray<NSString *> *n, NSArray<NSNumber *> *z) { return i2; }];
+        spin(30, ^BOOL { nudge(e02, seederPort); return e02.fileName != nil && e02.torrentStatus.totalProgress > 0.2; });
+        NSString *folder02 = e02.savePath;
+        BOOL const stoppedWhileDownloading = e02.downloadStatus == PTTorrentDownloadStatusDownloading;
+        [e02 stop];
+        spin(3, nil); // libtorrent's deletion, and the writes in flight
+        check(stoppedWhileDownloading && exists(file03) && exists(plist03) && !exists([folder02 stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E02.mkv"])
+              && (shared.length > 0 || !exists(folder02)),
+              [NSString stringWithFormat:@"%@: stopping E02 keeps E03, and deletes E02", how],
+              [NSString stringWithFormat:@"stopped while downloading %d; E03 file %d plist %d; E02 folder %@ (exists %d): %@", stoppedWhileDownloading,
+               exists(file03), exists(plist03), folder02.lastPathComponent, exists(folder02), [listing(folder02) componentsJoinedByString:@", "]]);
+
+        // E03 deleted last: its folder goes.
+        BOOL const deleted03 = [r03 delete];
+        check(deleted03 && !exists(e03.savePath), [NSString stringWithFormat:@"%@: the last download deleted takes its folder", how],
+              [NSString stringWithFormat:@"delete %d, folder %@ exists %d: %@", deleted03, e03.savePath.lastPathComponent, exists(e03.savePath),
+               [listing(e03.savePath) componentsJoinedByString:@", "]]);
+    }
+    return 0;
+}
+
+#pragma mark - trackers
+
+static NSArray<NSString *> *trackerURLs(PTTorrentStreamer *s) {
+    NSMutableArray<NSString *> *urls = [NSMutableArray array];
+    lt::torrent_handle h = s.torrentHandle;
+    if (!h.is_valid()) return urls;
+    for (lt::announce_entry const& entry : h.trackers()) [urls addObject:[NSString stringWithUTF8String:entry.url.c_str()]];
+    return urls;
+}
+
+/// The default trackers as a real session adds them, here loopback ones nobody answers (the
+/// session announces to 127.0.0.1:9 only): a plain magnet gets them at once; a magnet whose
+/// tracker carries a key only once its metadata says the torrent is public; a private torrent
+/// never (BEP 27). Then UPnP, NAT-PMP and LSD of each profile, before the loopback override.
+static int runTrackers(NSString *work) {
+    NSArray<NSString *> *defaults = [PTTorrentsSession setDefaultTrackersForTesting:@[
+        @"http://127.0.0.1:9/announce", @"udp://127.0.0.1:9/announce", @"udp://tracker.example.org:1337/announce"]];
+    check(defaults.count == 2, @"only loopback default trackers are accepted in tests", [defaults componentsJoinedByString:@", "]);
+    NSString *downloads = [work stringByAppendingPathComponent:@"streams"];
+    Payload p = makePayload(work, @"public", 8LL << 20, 256 << 10, false);
+    Seeder seeder;
+    int const seederPort = seeder.port;
+    (void)seeder.seed(p, 0);
+    NSString *keyed = @"http://127.0.0.1:9/0123456789abcdef0123456789abcdef/announce";
+    auto hasDefaults = ^BOOL(NSArray<NSString *> *urls) {
+        for (NSString *url in defaults) if (![urls containsObject:url]) return NO;
+        return YES;
+    };
+
+    // A plain magnet (no tracker that carries a key): the default trackers at once.
+    auto ra = std::make_shared<StreamResult>();
+    PTTorrentStreamer *a = [PTTorrentStreamer new];
+    a.downloadDirectoryOverride = downloads;
+    startStream(a, magnetFor(p), ra, @"A");
+    NSArray<NSString *> *atStart = trackerURLs(a);
+    BOOL const readyA = waitReady(a, ra, seederPort, 30);
+    check(readyA && hasDefaults(atStart), @"a plain magnet gets the default trackers at once",
+          [NSString stringWithFormat:@"ready %d, trackers at start: %@", readyA, [atStart componentsJoinedByString:@", "]]);
+    [a cancelStreamingAndDeleteData:YES];
+
+    // The same public torrent from a magnet with a keyed tracker: its own tracker only, until
+    // its metadata; then the default ones after it.
+    NSString *keyedMagnet = [magnetFor(p) stringByAppendingFormat:@"&tr=%@",
+                             [keyed stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.alphanumericCharacterSet]];
+    auto rb = std::make_shared<StreamResult>();
+    PTTorrentStreamer *b = [PTTorrentStreamer new];
+    b.downloadDirectoryOverride = downloads;
+    startStream(b, keyedMagnet, rb, @"B");
+    NSArray<NSString *> *beforeMetadata = trackerURLs(b);
+    BOOL const readyB = waitReady(b, rb, seederPort, 30);
+    spin(1, nil); // add_tracker runs on libtorrent's network thread
+    NSArray<NSString *> *afterMetadata = trackerURLs(b);
+    check(readyB && [beforeMetadata isEqualToArray:@[keyed]] && afterMetadata.count == 1 + defaults.count
+          && [afterMetadata.firstObject isEqualToString:keyed] && hasDefaults(afterMetadata),
+          @"a magnet with a keyed tracker gets the default trackers once its metadata says it is public",
+          [NSString stringWithFormat:@"ready %d; before the metadata: %@; after: %@", readyB,
+           [beforeMetadata componentsJoinedByString:@", "], [afterMetadata componentsJoinedByString:@", "]]);
+    [b cancelStreamingAndDeleteData:YES];
+
+    // A private .torrent with that tracker: never the default ones.
+    Payload q = makePayload(work, @"private", 8LL << 20, 256 << 10, true);
+    {
+        lt::file_storage fs;
+        lt::add_files(fs, q.path.fileSystemRepresentation);
+        lt::create_torrent ct(fs, 256 << 10);
+        ct.set_priv(true);
+        ct.add_tracker(keyed.UTF8String);
+        lt::set_piece_hashes(ct, q.dir.fileSystemRepresentation);
+        std::vector<char> bytes;
+        lt::bencode(std::back_inserter(bytes), ct.generate());
+        std::ofstream t(q.torrent.fileSystemRepresentation, std::ios::binary | std::ios::trunc);
+        t.write(bytes.data(), (std::streamsize)bytes.size());
+        t.close();
+        q.ti = std::make_shared<lt::torrent_info>(std::string(q.torrent.fileSystemRepresentation));
+    }
+    (void)seeder.seed(q, 0);
+    auto rc = std::make_shared<StreamResult>();
+    PTTorrentStreamer *c = [PTTorrentStreamer new];
+    c.downloadDirectoryOverride = downloads;
+    startStream(c, q.torrent, rc, @"C");
+    BOOL const readyC = waitReady(c, rc, seederPort, 30);
+    spin(1, nil);
+    NSArray<NSString *> *privateTrackers = trackerURLs(c);
+    check(readyC && [privateTrackers isEqualToArray:@[keyed]], @"a private torrent never gets the default trackers",
+          [NSString stringWithFormat:@"ready %d, trackers: %@", readyC, [privateTrackers componentsJoinedByString:@", "]]);
+    [c cancelStreamingAndDeleteData:YES];
+    [PTTorrentsSession setDefaultTrackersForTesting:@[]];
+
+    // UPnP / NAT-PMP / LSD per profile: the Apple TV and the Mac open their port on the router
+    // and look for peers on the local network; iOS does neither (no local network prompt).
+    NSDictionary<NSString *, NSNumber *> *expected = @{@"tv": @YES, @"ios": @NO, @"mac": @YES};
+    for (NSString *profile in @[@"tv", @"ios", @"mac"]) {
+        NSDictionary<NSString *, NSNumber *> *settings = [PTTorrentsSession localNetworkSettingsForTesting:profile];
+        BOOL const on = expected[profile].boolValue;
+        check([settings[@"enable_upnp"] boolValue] == on && [settings[@"enable_natpmp"] boolValue] == on && [settings[@"enable_lsd"] boolValue] == on,
+              [NSString stringWithFormat:@"%@ profile: port mapping and local discovery %@", profile, on ? @"on" : @"off"],
+              settings.description);
+    }
+    return 0;
+}
+
+#pragma mark - restart
+
+/// A stream cancelled with deleteData:YES and the same torrent started again at once (the
+/// disk-full retry; on tvOS, playing the same pack again right after a close): libtorrent's
+/// deletion of the first one's files ends with an rmdir of their folder, the folder the new
+/// stream created while it waited. The new stream must keep it, and decide its storage as one
+/// started later: here bounded storage allowed, with a reserve the 64 MiB file does not fit in.
+static int runRestart(NSString *work) {
+    NSString *downloads = [work stringByAppendingPathComponent:@"streams"];
+    Payload p = makePayload(work, @"restart", 64LL << 20, 1 << 20);
+    Seeder seeder;
+    int const seederPort = seeder.port;
+    (void)seeder.seed(p, 0);
+    NSURL *workURL = [NSURL fileURLWithPath:work isDirectory:YES];
+    NSNumber *freeNumber = nil;
+    [workURL getResourceValue:&freeNumber forKey:NSURLVolumeAvailableCapacityKey error:nil];
+    int64_t const reserve = std::max<int64_t>(0, freeNumber.longLongValue - (48LL << 20));
+    auto configure = ^(PTTorrentStreamer *s) {
+        s.downloadDirectoryOverride = downloads;
+        s.allowsBoundedStorage = YES;
+        s.storageReserve = reserve;
+    };
+    for (int round = 0; round < 3; ++round) {
+        auto ra = std::make_shared<StreamResult>();
+        PTTorrentStreamer *a = [PTTorrentStreamer new];
+        a.downloadDirectoryOverride = downloads;
+        startStream(a, p.torrent, ra, @"A");
+        BOOL const readyA = waitReady(a, ra, seederPort, 60);
+        [a cancelStreamingAndDeleteData:YES];
+        auto rb = std::make_shared<StreamResult>();
+        PTTorrentStreamer *b = [PTTorrentStreamer new];
+        configure(b);
+        startStream(b, p.torrent, rb, @"B");
+        BOOL const folderB = exists(b.savePath);
+        PTStorageMode const modeB = b.storageMode; // decided at once (a .torrent file has its metadata)
+        NSString *savePathB = b.savePath;
+        spin(1, nil);
+        NSInteger const codeB = rb->failureCode;   // the failure block runs on the main queue
+        BOOL const folderB1 = savePathB != nil && exists(savePathB);
+        [b cancelStreamingAndDeleteData:YES];
+        spin(3, nil);
+        auto rc = std::make_shared<StreamResult>();
+        PTTorrentStreamer *c = [PTTorrentStreamer new];
+        configure(c);
+        startStream(c, p.torrent, rc, @"C");
+        PTStorageMode const modeC = c.storageMode;
+        spin(1, nil);
+        NSInteger const codeC = rc->failureCode;
+        [c cancelStreamingAndDeleteData:YES];
+        spin(3, nil);
+        // C, started once the deletion is done, is refused: the file does not fit even bounded.
+        check(readyA && folderB && modeB == modeC && codeB == codeC && codeC == PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage,
+              [NSString stringWithFormat:@"round %d: a stream started again at once keeps its folder and decides its storage as a later one", round],
+              [NSString stringWithFormat:@"B (at once) folder %d (1 s later %d) mode %ld code %ld | C (3 s later) mode %ld code %ld",
+               folderB, folderB1, (long)modeB, (long)codeB, (long)modeC, (long)codeC]);
+    }
     return 0;
 }
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata|network|nofile <workdir> [tv|ios|mac]\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata|network|nofile|packs|restart|trackers <workdir> [tv|ios|mac]\n"); return 2; }
         NSString *mode = [NSString stringWithUTF8String:argv[1]];
         NSString *work = [NSString stringWithUTF8String:argv[2]];
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
@@ -1104,6 +1473,9 @@ int main(int argc, const char *argv[]) {
         else if ([mode isEqualToString:@"premetadata"]) rc = runPreMetadata(work);
         else if ([mode isEqualToString:@"network"]) rc = runNetwork(work, profile);
         else if ([mode isEqualToString:@"nofile"]) rc = runNoFile(work);
+        else if ([mode isEqualToString:@"packs"]) rc = runPacks(work);
+        else if ([mode isEqualToString:@"restart"]) rc = runRestart(work);
+        else if ([mode isEqualToString:@"trackers"]) rc = runTrackers(work);
         logf(@"RESULT %@: %d passed, %d failed (rc %d)", mode, gPasses, gFailures, rc);
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
         return gFailures > 0 ? 1 : rc;

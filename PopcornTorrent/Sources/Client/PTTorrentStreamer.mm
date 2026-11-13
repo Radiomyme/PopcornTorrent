@@ -18,6 +18,7 @@
 #import "PTTorrentsSession.h"
 #import "PTTorrentsSession+Protected.h"
 #import "PTSize.h"
+#import "PTTorrentDownload.h"
 #import "../Bounded/PTStreamController.h"
 #import "../Bounded/PTGatedFileResponse.h"
 
@@ -204,7 +205,7 @@ using namespace libtorrent;
     }
 
     //construct the folder path for downloads
-    NSString *pathComponent = directoryName != nil ? directoryName : [MD5String substringToIndex:16];
+    NSString *pathComponent = directoryName != nil ? directoryName : [self folderNameForTorrentNamed:[MD5String substringToIndex:16]];
 
     NSString *basePath = self.downloadDirectoryOverride ?: [[self class] downloadDirectory];
     if (self.downloadDirectoryOverride) {
@@ -488,6 +489,10 @@ using namespace libtorrent;
 }
 
 
+- (NSString *)folderNameForTorrentNamed:(NSString *)name {
+    return name;
+}
+
 - (int)selectedFileIndexInTorrent:(torrent_handle)th {
     std::shared_ptr<const torrent_info> ti = th.torrent_file();
     return [self selectedFileIndexInTorrentWithTorrentInfo:ti];
@@ -505,9 +510,12 @@ using namespace libtorrent;
     NSMutableArray* file_names = [[NSMutableArray alloc] init];
     NSMutableArray* file_sizes = [[NSMutableArray alloc] init];
     for (int i=0; i<ti->num_files(); i++) {
-        // UTF-8, as torrents name their files ("%s" read them in the system encoding:
-        // "Сезон 1", "Capítulo" garbled); the old reading for a name that isn't UTF-8.
-        std::string const name = files.file_name(file_index_t(i)).to_string();
+        // Each file's path inside the torrent, folders included ("Show.S01.1080p/Season 1/
+        // 01 - Title.mkv"): the selection reads the season of a pack numbered by folders, and a
+        // Sample folder, from them (file_name is the last component alone). UTF-8, as torrents
+        // name their files ("%s" read them in the system encoding: "Сезон 1", "Capítulo"
+        // garbled); the old reading for a name that isn't UTF-8.
+        std::string const name = files.file_path(file_index_t(i));
         [file_names addObject:[NSString stringWithUTF8String:name.c_str()] ?: [NSString stringWithFormat:@"%s", name.c_str()]];
         [file_sizes addObject:[NSNumber numberWithLong: files.file_size(file_index_t(i))]];
     }
@@ -529,10 +537,21 @@ using namespace libtorrent;
 
 #pragma mark - Storage
 
+/// `path`, or its nearest parent that exists: a folder that is not there (yet, or any more) is
+/// judged by its volume, not as "unlimited space, no hole punching", which let a film that does
+/// not fit stream in full mode.
++ (NSString *)nearestExistingPath:(NSString *)path {
+    NSString *existing = path;
+    while (existing.length > 1 && ![[NSFileManager defaultManager] fileExistsAtPath:existing]) {
+        existing = existing.stringByDeletingLastPathComponent;
+    }
+    return existing.length > 0 ? existing : path;
+}
+
 /// Free space of the volume holding `path`, read on a fresh URL (a reused
 /// NSURL caches its resource values).
 - (long long)availableSpaceAtPath:(NSString *)path {
-    NSURL *url = [NSURL fileURLWithPath:path isDirectory:YES];
+    NSURL *url = [NSURL fileURLWithPath:[PTTorrentStreamer nearestExistingPath:path] isDirectory:YES];
     [url removeAllCachedResourceValues];
     NSDictionary *results = [url resourceValuesForKeys:@[NSURLVolumeAvailableCapacityKey] error:nil];
     NSNumber *availableSpace = results[NSURLVolumeAvailableCapacityKey];
@@ -545,9 +564,10 @@ using namespace libtorrent;
 /// storage would serve zeros or never give space back: the stream is refused instead, as a film
 /// that does not fit always was (verify-storage F3a: a stream alone cannot tell).
 - (BOOL)volumeSupportsHolesAtPath:(NSString *)path {
-    if (pathconf(path.fileSystemRepresentation, _PC_MIN_HOLE_SIZE) <= 0) return NO;
+    NSString *existing = [PTTorrentStreamer nearestExistingPath:path];
+    if (pathconf(existing.fileSystemRepresentation, _PC_MIN_HOLE_SIZE) <= 0) return NO;
     struct ::statfs volume;
-    if (::statfs(path.fileSystemRepresentation, &volume) != 0) return NO;
+    if (::statfs(existing.fileSystemRepresentation, &volume) != 0) return NO;
     NSString *key = [NSString stringWithFormat:@"%d:%d", volume.f_fsid.val[0], volume.f_fsid.val[1]];
     static NSMutableDictionary<NSString *, NSNumber *> *checked;
     static std::mutex checkedLock;
@@ -752,7 +772,12 @@ using namespace libtorrent;
     }
     if (owner == nil || ownerIndex != selectedIndex) {
         // Another file of the torrent: its priorities are the owner's (one file per torrent).
-        NSString *description = @"This video is already being played or downloaded. Stop the other playback or the download, then try again.".localizedString;
+        // Another episode of a season pack a download is fetching says so: "this video" would
+        // be wrong.
+        BOOL const otherEpisode = owner != nil && ownerIndex >= 0 && [owner isKindOfClass:[PTTorrentDownload class]];
+        NSString *description = otherEpisode
+            ? @"Another episode of this torrent is being downloaded. Try again once that download is finished, or delete it.".localizedString
+            : @"This video is already being played or downloaded. Stop the other playback or the download, then try again.".localizedString;
         [self handleTorrentError:[NSError errorWithDomain:PTTorrentStreamerErrorDomain code:PTTorrentStreamerErrorTorrentInUse userInfo:@{NSLocalizedDescriptionKey: description}]];
         return;
     }
@@ -827,7 +852,8 @@ using namespace libtorrent;
     } else {
         // The MIN_PIECES pieces from the read position: their first 8 MiB (2 pieces at least)
         // at top priority, the rest at 6, then the rest of the file, all in file order
-        // (sequential picker), at full speed. No deadline ahead of time:
+        // (sequential picker), at full speed; a gap a seek or a resume left behind the reader
+        // only once the window is on disk (planWindow, holdGap). No deadline ahead of time:
         // while any piece of a torrent has one, libtorrent holds every peer to one request at
         // a time (see planWindow); a piece a reader waits for gets one only once it is late
         // (lateAfterMs, at least two pieces' time at the current rate), and the requests slow

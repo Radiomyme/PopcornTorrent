@@ -13,6 +13,7 @@
 
 /* A stream cannot start: the same torrent is already streamed (in a way that cannot be shared) or downloaded. */
 "This video is already being played or downloaded. Stop the other playback or the download, then try again." = "هذا الفيديو قيد التشغيل أو التنزيل بالفعل. أوقف التشغيل الآخر أو التنزيل، ثم حاول مجدداً.";
+"Another episode of this torrent is being downloaded. Try again once that download is finished, or delete it." = "يجري تنزيل حلقة أخرى من هذا التورنت. أعد المحاولة بعد انتهاء ذلك التنزيل، أو احذفه.";
 
 /* A stream that was reading the file of an offline download of the same torrent stops: the download was stopped before the file was complete. */
 "This video was playing from its download, and the download was stopped." = "كان هذا الفيديو يُشغَّل من التنزيل الخاص به، وقد تم إيقاف التنزيل.";

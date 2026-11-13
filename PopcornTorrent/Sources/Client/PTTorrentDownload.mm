@@ -5,6 +5,7 @@
 #import "PTTorrentStreamer+Protected.h"
 #import "PTTorrentsSession+Protected.h"
 #import "PTTorrentDownloadManagerListener.h"
+#import "../Security/CocoaSecurity.h"
 #import <MediaPlayer/MPMediaItem.h>
 #if TARGET_OS_IOS || TARGET_OS_TV
 #import <UIKit/UIApplication.h>
@@ -14,11 +15,16 @@ NSString * const PTTorrentItemPropertyDownloadStatus = @"downloadStatus";
 NSString * const MPMediaItemPropertyPathOrLink = @"filePathOrLink";
 NSString * const PTTorrentItemPropertyTorrentProgress = @"progress";
 NSString * const MPMediaItemPropertySelectedFileIndex = @"selectedFileIndex";
+/// The chosen file's path in the download's folder (its path inside the torrent), saved with the
+/// index: a download reloaded from its plist plays that file, not the first video file of its
+/// folder (another episode, in a folder two episodes of one season pack share).
+static NSString * const PTTorrentItemPropertySelectedFilePath = @"selectedFilePath";
 
 using namespace libtorrent;
 
 @implementation PTTorrentDownload {
     PTTorrentDownloadStatus _downloadStatus;
+    NSString *_loadedPlistName; // the plist this download was loaded from (initFromPlist:)
 }
 
 - (PTTorrentDownloadStatus)downloadStatus {
@@ -62,11 +68,17 @@ using namespace libtorrent;
     float progress = [[dictionary objectForKey:PTTorrentItemPropertyTorrentProgress] floatValue];
     
     NSString *savePath = [pathToPlist stringByDeletingLastPathComponent];
-    NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:savePath];
     NSString *fileName;
+    // The file it chose, when saved (since 5.2.0); else the first video file of its folder.
+    id const stored = [dictionary objectForKey:PTTorrentItemPropertySelectedFilePath];
+    if ([stored isKindOfClass:[NSString class]] && [(NSString *)stored length] > 0
+        && [[NSFileManager defaultManager] fileExistsAtPath:[savePath stringByAppendingPathComponent:stored]]) {
+        fileName = stored;
+    }
+    NSDirectoryEnumerator *enumerator = fileName ? nil : [[NSFileManager defaultManager] enumeratorAtPath:savePath];
     
     NSArray *supportedFiles = @[@"mp4", @"mkv", @"avi"];
-    while (fileName = [enumerator nextObject]) {
+    while (enumerator && (fileName = [enumerator nextObject])) {
         NSString *pathExtension = [fileName pathExtension];
         if ([supportedFiles containsObject:pathExtension]) break;
     }
@@ -78,6 +90,7 @@ using namespace libtorrent;
             self = [self initWithMediaMetadata:dictionary downloadStatus:downloadStatus];
             _savePath = savePath;
             _fileName = fileName;
+            _loadedPlistName = pathToPlist.lastPathComponent;
             _requiredSpace = requiredSpace;
             _totalDownloaded = requiredSpace;
             self.isFinished = downloadStatus == PTTorrentDownloadStatusFinished;
@@ -147,12 +160,16 @@ using namespace libtorrent;
     
     self.selectionBlock = ^int(NSArray<NSString *> * _Nonnull torrentsAvailable, NSArray<NSNumber *> * _Nonnull fileSizes) {
         int index = callback(torrentsAvailable, fileSizes);
+        BOOL const chosen = index >= 0 && index < (int)torrentsAvailable.count;
         
         NSMutableDictionary *copy = weakSelf.mediaMetadata.mutableCopy;
         copy[MPMediaItemPropertySelectedFileIndex] = @(index);
+        if (chosen) copy[PTTorrentItemPropertySelectedFilePath] = torrentsAvailable[(NSUInteger)index];
         weakSelf.mediaMetadata = copy;
 
-        [weakSelf save];
+        // Saved once a file is chosen. A selection that chose none (a season pack without the
+        // episode) fails: no plist, nothing listed again at the next launch.
+        if (chosen) [weakSelf save];
         
         return index;
     };
@@ -179,6 +196,50 @@ using namespace libtorrent;
             [delegate downloadDidFail:weakSelf withError:error];
         }
     }];
+}
+
+/// The folder of a new download: the torrent's (`name`), then its media's own suffix. Two
+/// episodes downloaded from one season pack get a folder each: in a shared one, a reloaded
+/// download played the first video file of the folder (the other episode), and deleting or
+/// stopping one deleted the other (libtorrent's delete_files removes every file of the torrent).
+- (NSString *)folderNameForTorrentNamed:(NSString *)name {
+    id const media = _mediaMetadata[MPMediaItemPropertyPersistentID];
+    NSString *key = [media isKindOfClass:[NSString class]] ? media : [media description];
+    if (key.length == 0) return name;
+    return [NSString stringWithFormat:@"%@-%@", name, [[CocoaSecurity md5:key].hexLower substringToIndex:8]];
+}
+
+/// This download's plist names: the one `save` writes, and the one it was loaded from.
+- (NSSet<NSString *> *)ownPlistNames {
+    NSMutableSet<NSString *> *names = [NSMutableSet setWithObject:[self plistName]];
+    if (_loadedPlistName.length > 0) [names addObject:_loadedPlistName];
+    return names;
+}
+
+/// The plists of other downloads in this download's folder: a folder two episodes of one season
+/// pack share (downloads made before each got its own folder). Its other files are theirs.
+- (NSArray<NSString *> *)otherDownloadPlists {
+    if (_savePath.length == 0) return @[];
+    NSSet<NSString *> *own = [self ownPlistNames];
+    NSMutableArray<NSString *> *others = [NSMutableArray array];
+    for (NSString *name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:_savePath error:nil]) {
+        if ([name hasPrefix:@"Metadata"] && [name.pathExtension isEqualToString:@"plist"] && ![own containsObject:name]) {
+            [others addObject:name];
+        }
+    }
+    return others;
+}
+
+/// Removes this download's own file and plists only (a folder another download shares).
+- (BOOL)removeOwnFilesFromFolder:(NSString *)folder fileName:(nullable NSString *)fileName plists:(NSSet<NSString *> *)plists {
+    BOOL removed = YES;
+    if (folder.length == 0) return NO;
+    if (fileName.length > 0) {
+        NSString *file = [folder stringByAppendingPathComponent:fileName];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:file]) removed = [[NSFileManager defaultManager] removeItemAtPath:file error:nil];
+    }
+    for (NSString *name in plists) [[NSFileManager defaultManager] removeItemAtPath:[folder stringByAppendingPathComponent:name] error:nil];
+    return removed;
 }
 
 /// The file a download loaded from its plist was downloading, among the torrent's
@@ -223,7 +284,21 @@ using namespace libtorrent;
 }
 
 - (void)stop {
-    [super cancelStreamingAndDeleteData:YES];
+    if ([self otherDownloadPlists].count > 0) {
+        // Its folder holds another download's episode: libtorrent's delete_files would delete it
+        // too (every file of the torrent). Only this download's file and plist go.
+        NSString *folder = _savePath, *fileName = _fileName;
+        NSSet<NSString *> *plists = [self ownPlistNames];
+        [super cancelStreamingAndDeleteData:NO];
+        [self removeOwnFilesFromFolder:folder fileName:fileName plists:plists];
+        // Writes still queued on libtorrent's disk thread may create the file again: once more
+        // when they are done.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (fileName.length > 0) [[NSFileManager defaultManager] removeItemAtPath:[folder stringByAppendingPathComponent:fileName] error:nil];
+        });
+    } else {
+        [super cancelStreamingAndDeleteData:YES];
+    }
     [self setDownloadStatus:PTTorrentDownloadStatusFailed];
 }
 
@@ -305,14 +380,25 @@ using namespace libtorrent;
 
 - (BOOL)delete {
     NSAssert(_downloadStatus != PTTorrentDownloadStatusPaused && _downloadStatus != PTTorrentDownloadStatusDownloading, @"This method should not be used to stop downloads, only to delete a pre-existing download.");
+    if ([self otherDownloadPlists].count > 0) {
+        // Another download's episode is in this folder: only this download's file and plist go.
+        return [self removeOwnFilesFromFolder:_savePath fileName:_fileName plists:[self ownPlistNames]];
+    }
     return [[NSFileManager defaultManager] removeItemAtPath:_savePath error:nil];
 }
 
-- (BOOL)save {
+/// The name of the plist `save` writes: Metadata-file-<file index>.plist.
+- (NSString *)plistName {
     NSString *index = _mediaMetadata[MPMediaItemPropertySelectedFileIndex] ? [_mediaMetadata[MPMediaItemPropertySelectedFileIndex] stringValue] : @"";
-    NSString *fileName = [NSString stringWithFormat:@"Metadata-file-%@.plist", index];
+    return [NSString stringWithFormat:@"Metadata-file-%@.plist", index];
+}
+
+- (BOOL)save {
+    NSString *fileName = [self plistName];
     NSString *filePath = [_savePath stringByAppendingPathComponent:fileName];
     NSMutableDictionary *copy = _mediaMetadata.mutableCopy;
+    // The file it streams, once known (also saved by the selection, before the metadata path).
+    if (_fileName.length > 0) [copy setObject:_fileName forKey:PTTorrentItemPropertySelectedFilePath];
     [copy setObject:@(_downloadStatus) forKey:PTTorrentItemPropertyDownloadStatus];
     [copy setObject:@(_torrentStatus.totalProgress) forKey:PTTorrentItemPropertyTorrentProgress];
     BOOL const saved = [copy writeToFile:filePath atomically:YES];
@@ -342,9 +428,11 @@ using namespace libtorrent;
 }
 
 /// A download whose selection chose no file (a season pack without the episode): it fails as
-/// any stream does, and its folder goes: the plist the selection saved (status Processing,
-/// file index -1) and the first pieces of other files fetched before the priorities applied
-/// would come back at the next launch as a paused download that can never complete.
+/// any stream does, saves no plist (startDownloadingFromFileOrMagnetLink:), and its folder
+/// goes with the first pieces of other files fetched before the priorities applied. Unless
+/// another download keeps its episode in that folder (a folder shared before downloads got
+/// their own): then only the torrent goes, without deleting any file (libtorrent's
+/// delete_files would delete that episode too).
 - (void)handleTorrentError:(NSError *)error {
     if (![error.domain isEqualToString:PTTorrentStreamerErrorDomain] || error.code != PTTorrentStreamerErrorNoFileSelected) {
         return [super handleTorrentError:error];
@@ -354,9 +442,10 @@ using namespace libtorrent;
         __typeof__(self) strongSelf = weakSelf;
         if (!strongSelf) return;
         if (strongSelf.failureBlock) strongSelf.failureBlock(error);
-        // Removed with its files (libtorrent deletes them once the writes in flight are done),
-        // the folder and its plist too.
-        [strongSelf cancelStreamingAndDeleteData:YES];
+        // Removed with its files (libtorrent deletes them once the writes in flight are done)
+        // and its folder, when no other download keeps an episode there.
+        BOOL const shared = [strongSelf otherDownloadPlists].count > 0;
+        [strongSelf cancelStreamingAndDeleteData:!shared];
     });
 }
 

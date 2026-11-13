@@ -223,6 +223,7 @@ Only pieces of the selected file are ever wanted (fixes the old
 | ahead of the reader | 1 (paced) |
 | behind the reader, on disk | 1 |
 | behind the reader, missing (skipped by a seek), bounded | 0 |
+| behind the reader, missing (a seek, a resume), full | 0 while the window has a missing piece (one kept at 1 when nothing beyond the window is missing), else 1 |
 | consumed (below `consumedBefore` minus one guard piece), bounded | 0, then freed (once confirmed on disk) |
 | consumed while missing (a gap skipped by a seek), bounded | 0, forever: "gone", like freed data |
 | freed | 0, forever |
@@ -230,10 +231,17 @@ Only pieces of the selected file are ever wanted (fixes the old
 Full mode: the window is the MIN_PIECES pieces from the read piece (not the next
 MIN_PIECES missing ones wherever they are, until 5.2.0), every piece of the file wanted
 (the rest at 1, in file order). Its first pieces, at least 8 MiB and 2 pieces
-(`topPriorityPieces`), are at priority 7, the rest of the window at 6: after a forward
-seek the gap left behind (priority 1) would otherwise come before the window (the
-sequential picker takes 1 to 6 alike, in file order), and a whole window at 7 comes in a
-random order. It has **no libtorrent deadline ahead of time** since 5.2.0 (see Network:
+(`topPriorityPieces`), are at priority 7, the rest of the window at 6 (a whole window at
+7 comes in a random order). The gap a forward seek or a resume left behind the reader waits
+at priority 0 while the window has a missing piece, and is wanted (1) again once the window
+is on disk: the sequential picker takes 1 to 6 alike, in file order from the first missing
+piece, so at 1 the gap came before the window's pieces at 6 and filled every peer's
+request queue ahead of them; the reader got what was left of the bandwidth until the whole
+gap was on disk (NetworkBench, S1 1 GiB read at 6 MB/s, seek 5 % → 60 %: 56 s of stalls;
+S2 read at 9 MB/s: 12 s; now 0 s both, the download still at the swarm's rate). One gap
+piece stays wanted when nothing beyond the window is missing: the window's last piece must
+never be the last wanted one (libtorrent would mark the torrent finished, drop its seeds,
+and the stream stops a finished torrent). It has **no libtorrent deadline ahead of time** since 5.2.0 (see Network:
 a deadline anywhere held every peer to one request at a time, for the whole download).
 A piece an HTTP reader waits for gets priority 7 at once, and a 100 ms deadline only once
 it is late (`lateAfterMs`, 1 s, and at least the time two pieces take at the torrent's
@@ -655,13 +663,24 @@ requests until the priorities are set has no safe form in libtorrent 1.2: in upl
 the metadata's arrival (`update_interest` → `disconnect_if_redundant`) drops every seed as a
 redundant connection (both sides upload-only) before the streamer can leave that mode, and
 all files at priority 0 makes the torrent "finished", which disconnects the seeds too. What is fixed: an offline
-download whose selection chose no file deletes its folder (`PTTorrentDownload
-handleTorrentError:`): the plist saved by the selection (status Processing, file -1) and those
-first pieces came back at the next launch as a paused download that could never complete.
+download whose selection chose no file saves no plist and deletes its folder
+(`PTTorrentDownload handleTorrentError:`): the plist the selection used to save (status
+Processing, file -1) and those first pieces came back at the next launch as a paused download
+that could never complete. Every download has its own folder (`folderNameForTorrentNamed:`:
+the torrent's MD5 folder name, then 8 hex digits of its media's id): two episodes of one
+season pack shared a folder, so a reloaded download played the first video file of it (the
+other episode), deleting or stopping one deleted the other (libtorrent's `delete_files`
+removes every file of the torrent), and a pack download failing with -9 deleted a finished
+episode's. A download's plist keeps its file's path (`selectedFilePath`); in a folder shared
+before 5.2.0, `delete`, `stop` and a -9 failure remove only that download's file and plist.
 A stream's folder goes as before. The folder of a torrent removed with its files no longer
 stays behind empty: piece writes still queued on libtorrent's disk thread created it again
 after the streamer removed it; it is removed (`rmdir`, only when empty) once libtorrent's
-deletion is done.
+deletion is done. A stream of the same torrent started meanwhile created that folder before
+it waited for the deletion (`addTorrent`): the folder is created again once the wait is over
+(the rmdir took it: the stream saw no free-space limit and no hole punching, and a film that
+did not fit streamed in full mode). The free space and the hole check read the nearest
+existing parent of a folder that is missing.
 
 ### NetworkBench results (Mac, 2026-11-12)
 
@@ -752,6 +771,19 @@ To run the offline streaming tests inside the sandbox below, build them, then ru
 `xcodebuild build-for-testing -scheme PopcornTorrent -destination "platform=macOS,arch=arm64" -derivedDataPath <dd>`, then
 `sandbox-exec -f Tools/BoundedStorageHarness/localhost-only.sb xcrun xctest <dd>/Build/Products/Debug/PopcornTorrent-Tests.xctest`.
 
+After the second review (Mac, 2026-11-13, one run each, the same bench): the gap behind the
+reader waits for the window in full mode. S1, 1 GiB read at 6 MB/s, forward seek 5 % → 60 %:
+0.0 s of stalls (40518035: 56.3 s; 26df96d4: 0.0 s), complete in 93.9 s at 11.90 MB/s; the
+same without a seek 0.0 s, 11.97 MB/s; S2 read at 9 MB/s, same seek: 0.0 s (12.0 s), 34.99 MB/s;
+S2, resume at 50 %: 0.0 s (12.1 s), 35.04 MB/s. Standard set: S1 stream ready 6.00 s, 11.92 MB/s;
+S1 download 48.8 s, 11.93 MB/s; S1 forward seek (3 MB/s) first MiB 2.51 s, 1.1 s of stalls; S2
+stream ready 5.57 s, 35.38 MB/s; H 97.6 s, 2.97 MB/s; X 41.4 s, 7.12 MB/s. Tests:
+`PopcornTorrentLogicTests` 40/40, `PopcornTorrent-Tests` 4/4, SessionHarness zombie 9/9,
+starve 8/8, guest 16/16, background 5/5, legacy 6/6, premetadata 12/12, nofile 4/4, packs
+10/10, restart 3/3 (0/3 without the folder created again after the wait), trackers 7/7,
+network 11/11 for each profile and under `ulimit -S -n 256`; BoundedStorageHarness bounded
+22/22, bounded with 2 forward seeks 24/24, full 15/15.
+
 Run the offline harnesses inside the sandbox profile
 `Tools/BoundedStorageHarness/localhost-only.sb` (`sandbox-exec -f localhost-only.sb ...`):
 it blocks every connection that is not on 127.0.0.1.
@@ -767,14 +799,18 @@ SessionHarness background <work>  # the tvOS network reopen during a stream
 SessionHarness legacy <work>      # a CocoaPods-era download (Metadata.plist, no file index) resumed
 SessionHarness premetadata <work> # a magnet's status before its metadata: a late seeder, one loop, nothing after a cancel
 SessionHarness network <work> [tv|ios|mac]  # a profile's network settings (also under `ulimit -S -n 256`), default trackers, piece order of streams and downloads
-SessionHarness nofile <work>      # a download of a pack magnet without the episode: fails once, leaves nothing
+SessionHarness nofile <work>      # a download of a pack magnet without the episode: fails once, leaves nothing; a finished episode of the pack stays (own folder, shared folder)
+SessionHarness packs <work>       # two episodes of one pack downloaded: a folder each; reloaded, each plays its own; delete / stop one keeps the other (also in a shared folder)
+SessionHarness restart <work>     # a stream cancelled with deleteData and started again at once keeps its folder and decides its storage as a later one
+SessionHarness trackers <work>    # loopback default trackers: a plain magnet at once, a keyed magnet after its metadata, a private torrent never; UPnP / NAT-PMP / LSD per profile
 ```
 
 Network benchmark (`Tools/NetworkBench`, see Network): a swarm of libtorrent seeders on
 127.0.0.1, each behind a userspace proxy that adds a round-trip time and caps its rate.
-`standard_set.sh <NetworkBench> <work>` runs the standard set (about 7 min): S1 stream and
-download, S1 forward seek, S2 stream, and the high-latency swarms H (8 peers 1.2-1.5 s away)
-and X (4 near, 4 far).
+`standard_set.sh <NetworkBench> <work>` runs the standard set (about 9 min): S1 stream and
+download, S1 forward seek, S1 high-bitrate forward seek (1 GiB read at 6 MB/s, 5 % → 60 %:
+the gap must not compete with the window, stall under 5 s), S2 stream, and the
+high-latency swarms H (8 peers 1.2-1.5 s away) and X (4 near, 4 far).
 
 ```
 cd Tools/NetworkBench && swift build -c release --scratch-path <build>

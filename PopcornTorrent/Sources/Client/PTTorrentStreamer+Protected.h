@@ -85,6 +85,11 @@ using namespace libtorrent;
 /// Whether the torrent is fetched in file order (libtorrent's sequential download): `YES` for
 /// streams, `NO` for an offline download nobody plays (rarest pieces first, see PTTorrentDownload).
 - (BOOL)wantsSequentialDownload;
+/// The folder of the download directory a new stream or download goes into, from `name` (the
+/// first 16 hex digits of the MD5 of its magnet or .torrent file): `name` itself for a stream;
+/// a download adds its media's own suffix (PTTorrentDownload), so two episodes of one season
+/// pack never share a folder.
+- (NSString *_Nonnull)folderNameForTorrentNamed:(NSString *_Nonnull)name;
 
 #pragma mark Shared torrents (see -[PTTorrentsSession joinTorrent:params:error:])
 

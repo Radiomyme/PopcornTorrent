@@ -209,6 +209,31 @@ PlanOutput planWindow(PlanInput const& in) {
     std::vector<int32_t> missingPins;
     int64_t lowest = 0;
 
+    // Full mode: the gap a forward seek (or a resume) left behind the reader waits while the
+    // window ahead has missing pieces. libtorrent's sequential picker takes the priority-7
+    // pieces, then every other wanted piece (1 to 6 alike) in file order from the first one
+    // missing: the gap, wanted at 1, came before the window's pieces at 6 and filled every
+    // peer's request queue (request_queue_time) ahead of them, so the reader got what was left
+    // of the bandwidth until the whole gap was on disk (NetworkBench seek6: a 56 s stall at
+    // 6 MB/s from a 12 MB/s swarm). At 0 it is fetched whenever the window is on disk. One gap
+    // piece stays wanted when nothing else beyond the window is (the sentinel): the window's
+    // last piece must never be the last wanted one, or libtorrent marks the torrent finished
+    // (the stream stops it, and it drops its seeds) with the gap still missing.
+    bool holdGap = false;
+    bool gapSentinelNeeded = false;
+    if (!in.bounded) {
+        int32_t const windowEnd = std::min(out.windowEndPiece, last + 1);
+        for (int32_t piece = std::max(out.readPiece, first); piece < windowEnd && !holdGap; ++piece) {
+            holdGap = !pieceHasData((*in.states)[size_t(piece - first)]);
+        }
+        if (holdGap) {
+            gapSentinelNeeded = true;
+            for (int32_t piece = std::max(windowEnd, first); piece <= last; ++piece) {
+                if (!pieceHasData((*in.states)[size_t(piece - first)])) { gapSentinelNeeded = false; break; }
+            }
+        }
+    }
+
     for (int32_t i = 0; i < count; ++i) {
         int32_t const piece = first + i;
         uint8_t const state = (*in.states)[size_t(i)];
@@ -244,9 +269,14 @@ PlanOutput planWindow(PlanInput const& in) {
             if (data) {
                 out.priorities[size_t(i)] = 1;
                 out.behindBytes += bytes;
-            } else {
+            } else if (in.bounded) {
                 // Bounded: gaps behind the reader (skipped by a seek) are not fetched.
-                out.priorities[size_t(i)] = in.bounded ? 0 : 1;
+                out.priorities[size_t(i)] = 0;
+            } else if (holdGap && !gapSentinelNeeded) {
+                out.priorities[size_t(i)] = 0; // full mode: after the window (see holdGap)
+            } else {
+                out.priorities[size_t(i)] = 1;
+                gapSentinelNeeded = false; // the first missing gap piece is the sentinel
             }
             continue;
         }
@@ -266,10 +296,10 @@ PlanOutput planWindow(PlanInput const& in) {
             // (7.1 s with a 12 MB/s seed, against 1.07 s in full mode: part-3 coverage md4, mc3).
             // At 6 the window comes in file order, after the pins and the pieces a reader waits for
             // (7: the read piece itself after a seek, see urgentPieces below).
-            // Full mode: 7 for the first topPriorityPieces (before the gaps a seek left behind,
-            // at 1: the sequential picker takes 1 to 6 alike, in file order; few enough that
-            // their random order within priority 7 does not matter), 6 beyond, and a deadline
-            // within the horizon.
+            // Full mode: 7 for the first topPriorityPieces (few enough that their random order
+            // within priority 7 does not matter), 6 beyond (file order: the sequential picker
+            // takes 1 to 6 alike, which is why the gap behind waits at 0, see holdGap), and a
+            // deadline within the horizon.
             bool const timeCritical = in.bounded || step < horizon;
             bool const top = !in.bounded && (in.topPriorityPieces <= 0 || step < in.topPriorityPieces || timeCritical);
             out.priorities[size_t(i)] = top ? 7 : kBoundedWindowPriority;

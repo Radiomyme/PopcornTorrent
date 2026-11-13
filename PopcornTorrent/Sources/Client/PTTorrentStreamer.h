@@ -31,7 +31,8 @@ typedef void (^PTTorrentStreamerFailure)(NSError * _Nonnull error);
 /**
  Block called when the torrent metadata have been downloaded and the user has to select the torrent to play
  
- @param torrentsAvailable  The available torrents names that the user can select from
+ @param torrentsAvailable  The torrent's files, in torrent order: each one's path inside the torrent, its folders included ("Show.S01.1080p/Show.S01E02.mkv" in a multi-file torrent, the file name alone in a single-file one)
+ @param fileSizes          Their sizes in bytes
  
  @return The index of the item in the array torrentsAvailable the user has selected, or `PTTorrentStreamerNoFileIndex` when none of them is the file wanted (a season pack without the requested episode): the stream then fails with `PTTorrentStreamerErrorNoFileSelected` (any other index out of range too)
  */
@@ -59,11 +60,11 @@ typedef NS_ERROR_ENUM(PTTorrentStreamerErrorDomain, PTTorrentStreamerError) {
     PTTorrentStreamerErrorNotEnoughSpaceForBoundedStorage = -5,
     /// Another file error (I/O error, permissions...) stopped the torrent. `NSLocalizedDescriptionKey` is libtorrent's message.
     PTTorrentStreamerErrorFile = -6,
-    /// The torrent is already used by this app in a way that cannot be shared: a bounded stream of it, a stream of another file of it, or (for a download) any stream or download of it. Stop the other one and try again.
+    /// The torrent is already used by this app in a way that cannot be shared: a bounded stream of it, a stream of another file of it (another episode of a season pack a download is fetching: the description says so), or (for a download) any stream or download of it. Stop the other one and try again.
     PTTorrentStreamerErrorTorrentInUse = -7,
     /// This stream was reading the file of an offline download of the same torrent (see `cancelStreamingAndDeleteData:`), and the download was stopped or removed before the file was complete.
     PTTorrentStreamerErrorSharedTorrentRemoved = -8,
-    /// The selection block chose no file of the torrent (`PTTorrentStreamerNoFileIndex`, or any index out of range): the torrent does not hold the video wanted, e.g. a season pack without the requested episode. Nothing of that file is downloaded: a .torrent file is not even added; a magnet's other files may have received their first pieces between the metadata and the priorities (a few MiB, removed with the stream's folder). A download (`PTTorrentDownload`) failing so deletes its folder. `NSLocalizedDescriptionKey` says so.
+    /// The selection block chose no file of the torrent (`PTTorrentStreamerNoFileIndex`, or any index out of range): the torrent does not hold the video wanted, e.g. a season pack without the requested episode. Nothing of that file is downloaded: a .torrent file is not even added; a magnet's other files may have received their first pieces between the metadata and the priorities (a few MiB, removed with the stream's folder). A download (`PTTorrentDownload`) failing so saves no plist and deletes its folder (each download has its own; one shared with another download's episode, from before 5.2.0, keeps every file). `NSLocalizedDescriptionKey` says so.
     PTTorrentStreamerErrorNoFileSelected = -9,
 };
 

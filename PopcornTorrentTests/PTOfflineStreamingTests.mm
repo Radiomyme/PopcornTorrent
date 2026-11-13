@@ -71,10 +71,11 @@ void fillPattern(std::vector<char>& buffer, uint64_t seed) {
 /// decomposed names (E + U+0301), one made elsewhere usually precomposed ones.
 NSString *nfc(NSString *name) { return name.precomposedStringWithCanonicalMapping; }
 
-/// The index of `name` among the torrent's names (any normalization), else out of range.
+/// The index of the file `name` among the torrent's (paths inside the torrent: the pack's
+/// folder, then the file), any normalization; else out of range.
 int indexOfName(NSArray<NSString *> *names, NSString *name) {
     for (NSUInteger i = 0; i < names.count; i++) {
-        if ([nfc(names[i]) isEqualToString:nfc(name)]) return (int)i;
+        if ([nfc(names[i].lastPathComponent) isEqualToString:nfc(name)]) return (int)i;
     }
     return (int)names.count;
 }
@@ -358,7 +359,11 @@ static BOOL PTInternetTestsRequested(void) {
     for (PackFile const& file : packFiles()) {
         int const index = indexOfName(result->names, file.name);
         XCTAssertLessThan(index, (int)result->names.count, @"%@ among %@ (UTF-8 names)", file.name, result->names);
+        if (index >= (int)result->names.count) continue;
         XCTAssertEqual(result->sizes[index].longLongValue, file.size, @"%@: its size", file.name);
+        // The selection gets each file's path inside the torrent: the pack's folder names the
+        // season of files numbered by folder ("Season 2/01.mkv").
+        XCTAssertEqualObjects(nfc(result->names[index]), nfc([@"Offline.Show.S01.COMPLETE/" stringByAppendingString:file.name]));
     }
     XCTAssertEqualObjects(nfc(result->fileURL.lastPathComponent), nfc(wanted), @"the chosen file is streamed");
     // The file's path in the torrent: the pack's folder, then the episode.

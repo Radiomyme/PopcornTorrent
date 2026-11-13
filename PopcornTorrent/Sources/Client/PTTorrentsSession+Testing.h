@@ -41,4 +41,16 @@
 /// Whether sessions are made loopback-only (`prepareSharedSessionForLoopbackTestingOnPort:`).
 + (BOOL)isLoopbackTesting;
 
+/// Makes torrents added afterwards get these default trackers in loopback testing, as a real
+/// session adds the public ones (at once, or after the metadata for a magnet with a keyed
+/// tracker; never for a private torrent). URLs on 127.0.0.1 or localhost only (the others
+/// are dropped: a test never announces to a real tracker); returns the ones kept. An empty
+/// list: none again (the default in loopback testing).
++ (NSArray<NSString *> *)setDefaultTrackersForTesting:(NSArray<NSString *> *)trackers;
+
+/// UPnP, NAT-PMP and LSD as the session sets them for a profile ("tv", "ios", "mac"; nil: this
+/// one), before the loopback testing override turns them off: "enable_upnp", "enable_natpmp",
+/// "enable_lsd".
++ (NSDictionary<NSString *, NSNumber *> *)localNetworkSettingsForTesting:(NSString *)profile;
+
 @end

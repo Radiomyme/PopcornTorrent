@@ -12,6 +12,7 @@
 
 /* A stream cannot start: the same torrent is already streamed (in a way that cannot be shared) or downloaded. */
 "This video is already being played or downloaded. Stop the other playback or the download, then try again." = "Este vídeo ya se está reproduciendo o descargando. Detén la otra reproducción o la descarga y vuelve a intentarlo.";
+"Another episode of this torrent is being downloaded. Try again once that download is finished, or delete it." = "Se está descargando otro episodio de este torrent. Vuelve a intentarlo cuando termine esa descarga, o elimínala.";
 
 /* A stream that was reading the file of an offline download of the same torrent stops: the download was stopped before the file was complete. */
 "This video was playing from its download, and the download was stopped." = "Este vídeo se estaba reproduciendo desde su descarga, y la descarga se ha detenido.";

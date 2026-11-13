@@ -450,7 +450,8 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
 
 - (void)testFullModeDeadlinesOnlyNearTheReader {
     // Full mode, a window of 8 pieces whose first 2 are time-critical: the rest of the window
-    // at 7 without a deadline, the rest of the file at 1, the gap a seek left behind at 1.
+    // at 7 without a deadline, the rest of the file at 1, the gap a seek left behind at 0 while
+    // the window is missing pieces (testFullModeGapWaitsForTheWindow).
     FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
     std::vector<uint8_t> states(100, PieceMissing);
     for (int i = 0; i < 10; ++i) states[size_t(i)] = PieceOnDisk;
@@ -466,7 +467,7 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertEqual(plan.windowEndPiece, 48);
     for (int i = 40; i < 48; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 7);
     XCTAssertEqual(plan.priorities[48], 1);
-    XCTAssertEqual(plan.priorities[20], 1);
+    XCTAssertEqual(plan.priorities[20], 0);
     std::vector<int32_t> deadlinePieces;
     for (auto const& d : plan.deadlines) deadlinePieces.push_back(d.first);
     XCTAssertEqual(deadlinePieces, (std::vector<int32_t>{40, 41, 99}));
@@ -477,21 +478,78 @@ ReadAt memoryReader(std::vector<uint8_t> const& data, int64_t available) {
     XCTAssertTrue(plan.deadlines.empty());
     XCTAssertEqual(plan.priorities[40], 7);
     XCTAssertEqual(plan.priorities[99], 7);
-    // The full-mode setting: the first 3 pieces of the window at 7, the rest at 6 (file order,
-    // like the gap behind at 1), no deadline.
+    // The full-mode setting: the first 3 pieces of the window at 7, the rest at 6 (file order),
+    // no deadline.
     input.topPriorityPieces = 3;
     plan = planWindow(input);
     XCTAssertTrue(plan.deadlines.empty());
     for (int i = 40; i < 43; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 7);
     for (int i = 43; i < 48; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 6);
     XCTAssertEqual(plan.priorities[48], 1);
-    XCTAssertEqual(plan.priorities[20], 1);
+    XCTAssertEqual(plan.priorities[20], 0);
     XCTAssertEqual(plan.windowEndPiece, 48);
     input.topPriorityPieces = 0;
     input.urgentPieces = {40};
     plan = planWindow(input);
     XCTAssertEqual(plan.deadlines.size(), size_t(1));
     XCTAssertEqual(plan.deadlines[0].first, 40);
+}
+
+- (void)testFullModeGapWaitsForTheWindow {
+    // Full mode after a forward seek (or a resume): the gap behind the reader is wanted only
+    // once the window ahead is on disk. libtorrent's sequential picker takes 1 to 6 alike in
+    // file order from the first missing piece: at 1 the gap came before the window (at 6) and
+    // the reader got what was left of the bandwidth until the whole gap was on disk.
+    FileGeometry const geo = geometry(0, 100 * kMiB, kMiB);
+    std::vector<uint8_t> states(100, PieceMissing);
+    for (int i = 0; i < 10; ++i) states[size_t(i)] = PieceOnDisk;
+    states[5] = PieceMissing;                       // a hole in what was read before the seek
+    PlanInput input;
+    input.geometry = geo;
+    input.readPosition = 60 * kMiB;
+    input.pins.headEnd = 2 * kMiB;
+    input.pins.tailStart = 99 * kMiB;
+    input.deadlinePieces = 8;
+    input.deadlineHorizonPieces = -1;
+    input.topPriorityPieces = 3;
+    input.states = &states;
+    PlanOutput plan = planWindow(input);
+    for (int i = 10; i < 60; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 0);
+    XCTAssertEqual(plan.priorities[5], 0);
+    XCTAssertEqual(plan.priorities[3], 1);          // on disk: unchanged
+    XCTAssertEqual(plan.priorities[60], 7);
+    XCTAssertEqual(plan.priorities[63], 6);
+    XCTAssertEqual(plan.priorities[68], 1);         // beyond the window: wanted, after it
+    XCTAssertEqual(plan.priorities[99], 7);         // pinned tail
+    // A piece a reader waits for in the gap (a seek back) is fetched first all the same.
+    input.urgentPieces = {30};
+    plan = planWindow(input);
+    XCTAssertEqual(plan.priorities[30], 7);
+    XCTAssertEqual(plan.priorities[31], 0);
+    input.urgentPieces = {};
+    // Window on disk: the gap is wanted again (before the rest of the file, in file order).
+    for (int i = 60; i < 68; ++i) states[size_t(i)] = PieceOnDisk;
+    plan = planWindow(input);
+    for (int i = 10; i < 60; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 1);
+    XCTAssertEqual(plan.priorities[5], 1);
+    // The reader moved on by one piece: its window misses a piece again, the gap waits.
+    input.readPosition = 61 * kMiB;
+    plan = planWindow(input);
+    XCTAssertEqual(plan.priorities[20], 0);
+    XCTAssertEqual(plan.priorities[68], 6);
+    // Nothing missing beyond the window (the rest of the file is on disk): one gap piece stays
+    // wanted, so the window's last piece is never the last wanted one (libtorrent would mark
+    // the torrent finished with the gap still missing).
+    for (int i = 69; i < 100; ++i) states[size_t(i)] = PieceOnDisk;
+    plan = planWindow(input);
+    XCTAssertEqual(plan.priorities[5], 1);          // the first missing gap piece
+    for (int i = 10; i < 60; ++i) XCTAssertEqual(plan.priorities[size_t(i)], 0);
+    XCTAssertEqual(plan.priorities[68], 6);
+    // Bounded mode never fetches the gap.
+    input.bounded = true;
+    states[68] = PieceOnDisk;
+    plan = planWindow(input);
+    XCTAssertEqual(plan.priorities[20], 0);
 }
 
 - (void)testFullModeLateDeadlinesOnly {

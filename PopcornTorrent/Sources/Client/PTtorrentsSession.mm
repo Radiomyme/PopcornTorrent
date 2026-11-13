@@ -41,6 +41,9 @@ using namespace libtorrent;
 static int PTLoopbackTestingPort = -1;
 // Testing aid: the network profile of another platform ("tv", "ios", "mac"; nil = this one).
 static NSString *PTNetworkProfileOverride = nil;
+// Testing aid: default trackers on 127.0.0.1 that loopback testing adds as a real session adds
+// the public ones (nullptr: none are added in loopback testing).
+static std::vector<std::string> *PTDefaultTrackersForTesting = nullptr;
 
 #pragma mark - Network tuning
 
@@ -93,6 +96,7 @@ static PTNetworkTuning PTNetworkTuningForProfile(NSString *profile) {
 /// tracker and tier is announced to, see setupSession). Never added to private torrents
 /// (BEP 27) nor in the offline tests.
 static std::vector<std::string> const& PTDefaultTrackers() {
+    if (PTDefaultTrackersForTesting != nullptr) return *PTDefaultTrackersForTesting;
     static std::vector<std::string> const trackers = {
         "udp://tracker.opentrackr.org:1337/announce",
         "udp://open.demonii.com:1337/announce",
@@ -109,6 +113,21 @@ static std::vector<std::string> const& PTDefaultTrackers() {
         "http://tracker.opentrackr.org:1337/announce",
     };
     return trackers;
+}
+
+/// Whether new torrents get the default trackers: always, but in loopback testing (unless a test
+/// set loopback ones, `setDefaultTrackersForTesting:`).
+static bool PTAddsDefaultTrackers() {
+    return PTLoopbackTestingPort < 0 || PTDefaultTrackersForTesting != nullptr;
+}
+
+/// The local-network settings of a profile (see PTNetworkTuning): the session's, and what the
+/// tests check for each profile (the loopback testing session turns them all off).
+static void PTApplyLocalNetworkSettings(settings_pack& pack, PTNetworkTuning const& tuning) {
+    pack.set_bool(settings_pack::enable_upnp, tuning.portMapping);
+    pack.set_bool(settings_pack::enable_natpmp, tuning.portMapping);
+    pack.set_bool(settings_pack::upnp_ignore_nonrouters, true);
+    pack.set_bool(settings_pack::enable_lsd, tuning.localDiscovery);
 }
 
 /// `existing` followed by the default trackers it does not have yet (same URL, ignoring case
@@ -195,8 +214,8 @@ static void PTRaiseOpenFilesLimit(void) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<PTTorrentStreamer *> *> *guests; // streams that joined it, oldest first
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingDeletions; // removals with delete_files not finished yet
 @property (nonatomic, strong) NSMutableDictionary<NSString *, dispatch_group_t> *deletionGroups;
-@property (nonatomic, strong) NSMutableSet<NSString *> *deferredDefaultTrackers;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *deletionFolders; // the folder of a torrent removed with its files // magnets that get the default trackers with their metadata
+@property (nonatomic, strong) NSMutableSet<NSString *> *deferredDefaultTrackers; // magnets that get the default trackers with their metadata
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *deletionFolders; // the folder of a torrent removed with its files
 @property (nonatomic, strong, nullable) dispatch_queue_t alertsQueue;
 @property (nonatomic, getter=isAlertsLoopActive) BOOL alertsLoopActive;
 
@@ -268,6 +287,31 @@ static void PTRaiseOpenFilesLimit(void) {
 
 + (BOOL)isLoopbackTesting {
     return PTLoopbackTestingPort >= 0;
+}
+
++ (NSArray<NSString *> *)setDefaultTrackersForTesting:(NSArray<NSString *> *)trackers {
+    // Loopback URLs only: a test must never announce to a real tracker.
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    for (NSString *url in trackers) {
+        NSString *host = [NSURL URLWithString:url].host;
+        if ([host isEqualToString:@"127.0.0.1"] || [host isEqualToString:@"localhost"]) [kept addObject:url];
+    }
+    delete PTDefaultTrackersForTesting;
+    PTDefaultTrackersForTesting = nullptr;
+    if (kept.count == 0) return kept;
+    PTDefaultTrackersForTesting = new std::vector<std::string>();
+    for (NSString *url in kept) PTDefaultTrackersForTesting->push_back(url.UTF8String);
+    return kept;
+}
+
++ (NSDictionary<NSString *, NSNumber *> *)localNetworkSettingsForTesting:(NSString *)profile {
+    settings_pack pack;
+    PTApplyLocalNetworkSettings(pack, PTNetworkTuningForProfile(profile));
+    return @{
+        @"enable_upnp": @(pack.get_bool(settings_pack::enable_upnp)),
+        @"enable_natpmp": @(pack.get_bool(settings_pack::enable_natpmp)),
+        @"enable_lsd": @(pack.get_bool(settings_pack::enable_lsd)),
+    };
 }
 
 - (int)listenPort {
@@ -358,10 +402,7 @@ static void PTRaiseOpenFilesLimit(void) {
     pack.set_bool(settings_pack::suggest_read_cache, false);
     // Port mapping (see PTNetworkTuning): without it no peer behind another NAT can ever
     // connect to us. Set before the session starts (no split second of defaults).
-    pack.set_bool(settings_pack::enable_upnp, tuning.portMapping);
-    pack.set_bool(settings_pack::enable_natpmp, tuning.portMapping);
-    pack.set_bool(settings_pack::upnp_ignore_nonrouters, true);
-    pack.set_bool(settings_pack::enable_lsd, tuning.localDiscovery);
+    PTApplyLocalNetworkSettings(pack, tuning);
     // The selected file, the part file of the others and another torrent's (a stream next to
     // a download): 2 made libtorrent close and reopen files between writes.
     pack.set_int(settings_pack::file_pool_size, 8);
@@ -565,6 +606,15 @@ static void PTRaiseOpenFilesLimit(void) {
     // The same torrent removed with its files a moment ago: libtorrent deletes them by path
     // on its disk thread, which would delete the new torrent's file too. Wait for it.
     [self waitForPendingDeletionOf:hashId];
+    // Once that deletion was done, its folder went too when it was empty (deletionFinished:
+    // rmdir): the one this stream created before it waited, when both use the same one (a
+    // stream of the same magnet started again at once). Without it the stream saw no free
+    // space limit and no hole punching (bounded storage disabled, a file that does not fit
+    // streamed in full).
+    if (!torrentParams.save_path.empty()) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:torrentParams.save_path.c_str()]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+    }
 
     // Never auto-managed: libtorrent's auto-manager (3 active downloads by default) would
     // queue a new stream behind other torrents, and resume torrents paused on purpose.
@@ -584,7 +634,7 @@ static void PTRaiseOpenFilesLimit(void) {
     bool const isPrivate = torrentParams.ti && torrentParams.ti->priv();
     bool const mayBePrivate = !torrentParams.ti
         && std::any_of(torrentParams.trackers.begin(), torrentParams.trackers.end(), PTTrackerLooksKeyed);
-    if (PTLoopbackTestingPort < 0 && !isPrivate && !mayBePrivate) PTAppendDefaultTrackers(torrentParams.trackers, torrentParams.tracker_tiers);
+    if (PTAddsDefaultTrackers() && !isPrivate && !mayBePrivate) PTAppendDefaultTrackers(torrentParams.trackers, torrentParams.tracker_tiers);
     // A torrent still in libtorrent but not registered here is an error, not a silent reuse
     // (it would not have this stream's plugin).
     torrentParams.flags |= libtorrent::torrent_flags::duplicate_is_error;
@@ -602,7 +652,7 @@ static void PTRaiseOpenFilesLimit(void) {
     
     @synchronized (self) {
         self.streamers[[self hashIDForTorrentHandle:th]] = torrentStreamer;
-        if (PTLoopbackTestingPort < 0 && mayBePrivate) [self.deferredDefaultTrackers addObject:[self hashIDForTorrentHandle:th]];
+        if (PTAddsDefaultTrackers() && mayBePrivate) [self.deferredDefaultTrackers addObject:[self hashIDForTorrentHandle:th]];
     }
     
 #if TARGET_OS_IOS
