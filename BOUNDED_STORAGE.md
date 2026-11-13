@@ -803,6 +803,18 @@ starve 8/8, guest 16/16, background 5/5, legacy 6/6, premetadata 12/12, nofile 4
 network 11/11 for each profile and under `ulimit -S -n 256`; BoundedStorageHarness bounded
 22/22, bounded with 2 forward seeks 24/24, full 15/15.
 
+After the third review (Mac, 2026-11-13, one run each): full mode's progress counts the file's
+own pieces, and a "finished" with pieces of the file missing is not a finish. S1 forward seek
+at 6 MB/s (s1seekhi): the stream's progress fell by 22.1 points before (0d58fe28), 0.0 now, 1.0 s
+of stalls, 11.79 MB/s; S2 resume at 50 %: 0.0, 35.09 MB/s. Standard set: S1 stream ready 5.97 s,
+11.92 MB/s; S1 download 48.8 s, 11.91 MB/s; S1 forward seek (3 MB/s) first MiB 2.70 s, no
+stall; S2 stream ready 5.60 s, 35.47 MB/s; H 97.8 s, 2.96 MB/s; X 41.3 s, 7.15 MB/s; progressDrop
+0.0 in every run. Tests: `PopcornTorrentLogicTests` 40/40, `PopcornTorrent-Tests` 4/4,
+SessionHarness finish 6/6 (0d58fe28: 2/6), packs 10/10 with the episodes' bytes checked
+(0d58fe28: 9/10, the shared folder's E01 "finished" empty), zombie 9/9, starve 8/8, guest 16/16,
+background 5/5, legacy 6/6, premetadata 12/12, nofile 4/4, restart 3/3, trackers 7/7, network
+11/11 for each profile, all 14 runs in parallel; BoundedStorageHarness bounded 22/22, full 15/15.
+
 Run the offline harnesses inside the sandbox profile
 `Tools/BoundedStorageHarness/localhost-only.sb` (`sandbox-exec -f localhost-only.sb ...`):
 it blocks every connection that is not on 127.0.0.1.
