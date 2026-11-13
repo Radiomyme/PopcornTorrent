@@ -796,6 +796,25 @@ static void PTRaiseOpenFilesLimit(void) {
 
 #pragma mark Network
 
+- (void)retryDroppedPeersSoon {
+    if (_session == nullptr) return;
+    settings_pack fast;
+    fast.set_int(settings_pack::min_reconnect_time, 1);
+    _session->apply_settings(fast);
+    // The last call restores the setting, 30 s after it (a call meanwhile pushes it back).
+    NSInteger generation;
+    @synchronized (self) { generation = ++_reopenGeneration; }
+    __weak __typeof__(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        __typeof__(self) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf->_session == nullptr) return;
+        @synchronized (strongSelf) { if (strongSelf->_reopenGeneration != generation) return; }
+        settings_pack restore;
+        restore.set_int(settings_pack::min_reconnect_time, strongSelf->_minReconnectTime);
+        strongSelf->_session->apply_settings(restore);
+    });
+}
+
 - (void)reopenNetwork {
     if (_session == nullptr) return;
     // No listen socket (nor DHT), then the configured ones again: sockets are recreated even
@@ -808,20 +827,11 @@ static void PTRaiseOpenFilesLimit(void) {
     settings_pack on;
     on.set_str(settings_pack::listen_interfaces, _listenInterfaces);
     if (_dhtEnabled) on.set_bool(settings_pack::enable_dht, true);
+    _session->apply_settings(on);
     // Peers whose connection went with the old sockets (uTP runs over the listen socket's
     // UDP socket) are only retried after min_reconnect_time (60 s): a stream would stall
     // that long. Retry them at once for a little while.
-    on.set_int(settings_pack::min_reconnect_time, 1);
-    _session->apply_settings(on);
-    NSInteger const generation = ++_reopenGeneration;
-    __weak __typeof__(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        __typeof__(self) strongSelf = weakSelf;
-        if (!strongSelf || strongSelf->_session == nullptr || strongSelf->_reopenGeneration != generation) return;
-        settings_pack restore;
-        restore.set_int(settings_pack::min_reconnect_time, strongSelf->_minReconnectTime);
-        strongSelf->_session->apply_settings(restore);
-    });
+    [self retryDroppedPeersSoon];
     for (torrent_handle const& handle : _session->get_torrents()) {
         // uTP connections ran over a UDP socket that is closed now: nothing tells them, and
         // one that does not send would hang until its timeout (about a minute). Drop them:

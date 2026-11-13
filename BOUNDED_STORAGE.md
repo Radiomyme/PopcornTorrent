@@ -92,6 +92,24 @@ changed on purpose:
 - Bounded mode: `torrentStatus.totalProgress` is the share of the file
   downloaded once and reaches 1 only when the whole file is on disk;
   `totalDownloaded` only grows (freed pieces stay counted).
+- Full mode: `torrentStatus.totalProgress` and `totalDownloaded` count the selected file's own
+  pieces (libtorrent's pieces that passed their hash check), not libtorrent's progress
+  (`total_wanted_done / total_wanted`): after a forward seek or a resume the gap behind the
+  reader is not wanted while the window ahead loads (see Window), and libtorrent's progress
+  rose while the reader starved and fell back once the window was on disk (NetworkBench
+  s1seekhi: a 22-point fall; now 0). The stream is finished (progress 1, `finishTorrent`) only
+  with every piece of the file: libtorrent may turn the torrent finished with the gap missing
+  when the last wanted pieces pass before the next plan wants the gap again (then back to
+  downloading at that plan); that "finished" is ignored (`earlyFinishes` in
+  `storageStatistics`), where it used to pause the torrent for good with a hole in the file.
+  A download added in a folder where another episode of its pack finished before 5.2.0 starts
+  that way too (the folder's resume data wants that episode's file alone): it was kept as
+  finished with its own file empty. libtorrent drops the seeds at such a finish, and retries a
+  dropped peer only after `min_reconnect_time` (60 s); its peer list also counts seeds out of
+  its connect candidates while finished, and counts them in again only when it connects to a
+  candidate (`torrent::want_peers` needs one). So the session retries dropped peers after 1 s
+  for 30 s (`retryDroppedPeersSoon`, also used by the tvOS network reopen), and the next plan
+  makes one connection attempt when no candidate is counted (`StreamController::apply`).
 - `cancelStreamingAndDeleteData:` removes the torrent from the session (before:
   paused, and libtorrent's auto-manager could resume it). In bounded mode the
   data is always deleted. A stream that joined an offline download's torrent never
@@ -738,7 +756,8 @@ servedOffset, headPinEnd, tailPinStart, everDownloaded, freedPieces,
 droppedPieces, punchedBytes, punchErrors, diskFullEvents, fileErrors,
 dontHaveSent, rescuedBlocks, partialPiecesPunched, reclaimedBytes, presized, stuckPiecesRestored, diskStarvedSeconds,
 waitingReads, downloadLimit, paceState (0 open, 1 proportional, 2 floor, 3 trickle,
-4 emergency), consumeRate`.
+4 emergency), consumeRate, earlyFinishes` (full mode: libtorrent's "finished" alerts that
+came with pieces of the file missing, not taken as a finish).
 
 `PT_BOUNDED_DEBUG=1` in the environment (Xcode scheme) logs the controller's
 state once a second: read position, piece states, ahead/budget, allocation,
@@ -800,9 +819,10 @@ SessionHarness legacy <work>      # a CocoaPods-era download (Metadata.plist, no
 SessionHarness premetadata <work> # a magnet's status before its metadata: a late seeder, one loop, nothing after a cancel
 SessionHarness network <work> [tv|ios|mac]  # a profile's network settings (also under `ulimit -S -n 256`), default trackers, piece order of streams and downloads
 SessionHarness nofile <work>      # a download of a pack magnet without the episode: fails once, leaves nothing; a finished episode of the pack stays (own folder, shared folder)
-SessionHarness packs <work>       # two episodes of one pack downloaded: a folder each; reloaded, each plays its own; delete / stop one keeps the other (also in a shared folder)
+SessionHarness packs <work>       # two episodes of one pack downloaded (their bytes checked): a folder each; reloaded, each plays its own; delete / stop one keeps the other (also in a shared folder)
 SessionHarness restart <work>     # a stream cancelled with deleteData and started again at once keeps its folder and decides its storage as a later one
 SessionHarness trackers <work>    # loopback default trackers: a plain magnet at once, a keyed magnet after its metadata, a private torrent never; UPnP / NAT-PMP / LSD per profile
+SessionHarness finish <work>      # full mode: libtorrent's "finished" with pieces of the file missing is not a finish (never stopped, the file completes); the progress never goes back
 ```
 
 Network benchmark (`Tools/NetworkBench`, see Network): a swarm of libtorrent seeders on

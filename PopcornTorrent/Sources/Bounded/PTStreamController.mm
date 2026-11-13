@@ -420,6 +420,11 @@ int StreamController::fileDescriptor() {
 
 #pragma mark Updates (any thread -> network thread)
 
+void StreamController::noteEarlyFinish() {
+    m_earlyFinish.store(true);
+    requestUpdate();
+}
+
 void StreamController::requestUpdate() {
     if (m_cancelled.load()) return;
     void *io = m_io.load(std::memory_order_acquire);
@@ -823,6 +828,20 @@ void StreamController::apply(lt::torrent& torrent, bool fromTick) {
     if (!checking && !suspended) {
         applyPriorities(torrent, plan.priorities);
         applyDeadlines(torrent, m_config.useDeadlines ? plan.deadlines : std::vector<std::pair<int32_t, int>>());
+    }
+    if (!checking && !suspended && m_earlyFinish.load() && !torrent.is_finished()) {
+        // Back to downloading after a "finished" with pieces of the file missing: libtorrent
+        // dropped its seeds then, and its peer list counted them out of its connect
+        // candidates. It counts them in again only when it connects to a candidate, which it
+        // never tries with none counted (torrent::want_peers): a torrent that knew only seeds
+        // never connected again (SessionHarness packs: a download in a folder shared before
+        // 5.2.0 stayed at 0 peers). One connection attempt counts them again.
+        m_earlyFinish.store(false);
+        if (!torrent.is_paused() && torrent.num_connect_candidates() == 0 && torrent.num_known_peers() > torrent.num_peers()) {
+            bool const connected = torrent.try_connect_peer();
+            if (debugTrace()) NSLog(@"PopcornTorrent: after an early finish, %d known peers, %d connected: a connection attempt %s",
+                                    torrent.num_known_peers(), torrent.num_peers(), connected ? "started" : "failed");
+        }
     }
 
     if (bounded && !suspended && !plan.toFree.empty()) {

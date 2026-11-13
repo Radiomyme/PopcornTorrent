@@ -29,6 +29,9 @@
 //   SessionHarness restart <work>     a stream cancelled with deleteData and started again at
 //                                     once keeps its folder and decides its storage (bounded,
 //                                     refused) as one started later
+//   SessionHarness finish <work>      full mode: libtorrent's "finished" with pieces of the file
+//                                     missing (the gap behind the reader) is not a finish; the
+//                                     progress follows the file's own pieces
 // Generated payloads (random bytes), private torrents without trackers, a seeder on 127.0.0.1,
 // the streamer's shared session loopback-only (no DHT, LSD, UPnP, NAT-PMP). Run it under
 // sandbox-exec with localhost-only.sb. Every stream and download writes under <work>.
@@ -1125,11 +1128,14 @@ static int failNoFile(NSString *magnet, NSString *downloads, NSString *folder, N
     __block NSInteger failureCode = 0;
     [d startDownloadingFromFileOrMagnetLink:magnet directoryName:folder
                         selectFileTDownload:^int(NSArray<NSString *> *n, NSArray<NSNumber *> *z) { return PTTorrentStreamerNoFileIndex; }];
-    if (savePath) *savePath = d.savePath;
+    NSString *startPath = d.savePath;
+    if (savePath) *savePath = startPath;
     PTTorrentStreamerFailure const inner = d.failureBlock;
     d.failureBlock = ^(NSError *error) { failures++; failureCode = error.code; if (inner) inner(error); };
     spin(20, ^BOOL { nudge(d, seederPort); return failures > 0; });
     spin(3, nil); // libtorrent's deletion of what the early pieces wrote
+    // Its own folder goes with it: later under load (every mode of the harness at once).
+    if (folder == nil && startPath) spin(10, ^BOOL { return !exists(startPath); });
     if (code) *code = failureCode;
     return failures;
 }
@@ -1245,10 +1251,18 @@ static int runPacks(NSString *work) {
         PTTorrentDownload *e01 = downloadEpisode(magnet, downloads, folder, [tag stringByAppendingString:@"show-s01e01"], i1, seederPort);
         NSString *plist03 = [e03.savePath stringByAppendingPathComponent:[NSString stringWithFormat:@"Metadata-file-%d.plist", i3]];
         NSString *plist01 = [e01.savePath stringByAppendingPathComponent:[NSString stringWithFormat:@"Metadata-file-%d.plist", i1]];
+        // Their bytes, not only their files: a download that took libtorrent's "finished" for
+        // its own was kept as finished with its file a hole (in the shared folder, E01 started
+        // finished: the folder's resume data wanted E03 alone).
+        NSString *source03 = sha256OfFile([p.dir stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E03.mkv"]);
+        NSString *source01 = sha256OfFile([p.dir stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E01.mkv"]);
+        BOOL const bytes03 = [sha256OfFile([e03.savePath stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E03.mkv"]) isEqualToString:source03];
+        BOOL const bytes01 = [sha256OfFile([e01.savePath stringByAppendingPathComponent:@"Show.S01.PACK/Show.S01E01.mkv"]) isEqualToString:source01];
         check(e03.downloadStatus == PTTorrentDownloadStatusFinished && e01.downloadStatus == PTTorrentDownloadStatusFinished
-              && ([e03.savePath isEqualToString:e01.savePath] == (shared.length > 0)),
-              [NSString stringWithFormat:@"%@: both episodes downloaded", how],
-              [NSString stringWithFormat:@"E03 in %@: %@; E01 in %@: %@", e03.savePath.lastPathComponent, [listing(e03.savePath) componentsJoinedByString:@", "],
+              && bytes03 && bytes01 && ([e03.savePath isEqualToString:e01.savePath] == (shared.length > 0)),
+              [NSString stringWithFormat:@"%@: both episodes downloaded, with their bytes", how],
+              [NSString stringWithFormat:@"E03 %@ in %@: %@; E01 %@ in %@: %@", bytes03 ? @"right bytes" : @"WRONG BYTES", e03.savePath.lastPathComponent,
+               [listing(e03.savePath) componentsJoinedByString:@", "], bytes01 ? @"right bytes" : @"WRONG BYTES",
                e01.savePath.lastPathComponent, [listing(e01.savePath) componentsJoinedByString:@", "]]);
 
         // The next launch: one download per plist.
@@ -1454,9 +1468,100 @@ static int runRestart(NSString *work) {
     return 0;
 }
 
+#pragma mark - finish
+
+/// Full mode: libtorrent's "finished" with pieces of the file missing. The gap a forward seek
+/// (or a resume) leaves behind the reader is at priority 0 while the window ahead has missing
+/// pieces (planWindow, holdGap); when the last wanted pieces pass before the stream's next
+/// plan, libtorrent turns the torrent finished with the gap missing (and drops its seeds),
+/// then back to downloading at that plan. Made here at once: every missing piece of the file
+/// at priority 0. Not a finish: the torrent is never stopped with pieces missing, the file
+/// completes with the right bytes, and the progress the stream reports never goes back and
+/// reaches 1 only with the whole file (before: 1 at once, then the torrent paused for good).
+static int runFinish(NSString *work) {
+    NSString *downloads = [work stringByAppendingPathComponent:@"streams"];
+    Payload p = makePayload(work, @"finish", 48LL << 20, 1 << 20);
+    int const pieces = p.ti->num_pieces();
+    Seeder seeder;
+    int const seederPort = seeder.port;
+    (void)seeder.seed(p, 4 << 20); // 4 MiB/s: about 12 s for the file
+    auto r = std::make_shared<StreamResult>();
+    PTTorrentStreamer *s = [PTTorrentStreamer new];
+    s.downloadDirectoryOverride = downloads;
+    // Every totalProgress the progress block gets (main queue), and whether 1 came early.
+    NSMutableArray<NSNumber *> *published = [NSMutableArray array];
+    __block BOOL oneWithPiecesMissing = NO;
+    __weak PTTorrentStreamer *weakStreamer = s;
+    [s startStreamingFromMultiTorrentFileOrMagnetLink:p.torrent
+        progress:^(PTTorrentStatus status) {
+            [published addObject:@(status.totalProgress)];
+            lt::torrent_handle h = weakStreamer.torrentHandle;
+            if (status.totalProgress >= 1 && h.is_valid() && h.status().num_pieces < pieces) oneWithPiecesMissing = YES;
+        }
+        readyToPlay:^(NSURL *url, NSURL *file) { r->url = url; r->ready = YES; logf(@"readyToPlay %@", url); }
+        failure:^(NSError *error) { r->failure = error.localizedDescription; logf(@"failure %ld: %@", (long)error.code, error.localizedDescription); }
+        selectFileToStream:^int(NSArray<NSString *> *names, NSArray<NSNumber *> *sizes) { return 0; }];
+    BOOL const ready = waitReady(s, r, seederPort, 60);
+    check(ready && s.storageMode == PTStorageModeFull, @"the stream is ready, in full mode", describe(s));
+    lt::torrent_handle h = s.torrentHandle;
+
+    // A third of the file missing: all of it at priority 0 at once.
+    spin(60, ^BOOL { nudge(s, seederPort); return h.status().num_pieces >= pieces * 2 / 3; });
+    lt::torrent_status before = h.status();
+    std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> unwanted;
+    for (int i = 0; i < pieces; ++i) {
+        if (!before.pieces.get_bit(lt::piece_index_t(i))) unwanted.push_back({lt::piece_index_t(i), lt::dont_download});
+    }
+    float const progressBefore = s.torrentStatus.totalProgress;
+    h.prioritize_pieces(unwanted);
+    logf(@"%zu of %d pieces missing, set to priority 0 (progress %.3f)", unwanted.size(), pieces, progressBefore);
+
+    // Until the file is complete: never paused with pieces missing.
+    __block BOOL pausedMissing = NO;
+    __block BOOL sawFinished = NO;
+    spin(90, ^BOOL {
+        lt::torrent_status const st = h.status();
+        if (st.is_finished && st.num_pieces < pieces) sawFinished = YES;
+        if ((st.flags & lt::torrent_flags::paused) && st.num_pieces < pieces) pausedMissing = YES;
+        if (!pausedMissing) nudge(s, seederPort); // the finish dropped the seeder
+        return st.num_pieces == pieces || pausedMissing;
+    });
+    spin(2, nil); // the last alerts and progress
+    lt::torrent_status const after = h.status();
+    long long const early = [s.storageStatistics[@"earlyFinishes"] longLongValue];
+    check(!unwanted.empty() && early >= 1, @"libtorrent's finish with pieces missing is seen as not a finish",
+          [NSString stringWithFormat:@"%zu pieces at 0, earlyFinishes %lld (finished with pieces missing seen by the harness: %d)",
+           unwanted.size(), early, sawFinished]);
+    check(!pausedMissing && after.num_pieces == pieces, @"the torrent is never stopped with pieces missing, and the file completes",
+          [NSString stringWithFormat:@"paused with pieces missing %d; %@", pausedMissing, describe(s)]);
+    check(after.num_pieces == pieces && (bool)(after.flags & lt::torrent_flags::paused) && s.torrentStatus.totalProgress == 1,
+          @"complete, the stream stops its torrent (no seeding) and reports 1", describe(s));
+
+    float lowest = 1, highest = 0, drop = 0;
+    for (NSNumber *value in published) {
+        float const v = value.floatValue;
+        highest = std::max(highest, v);
+        drop = std::max(drop, highest - v);
+        lowest = std::min(lowest, v);
+    }
+    check(published.count > 0 && drop < 1e-6f && !oneWithPiecesMissing && published.lastObject.floatValue == 1,
+          @"the progress never goes back, and reaches 1 only with every piece",
+          [NSString stringWithFormat:@"%lu values from %.3f to %.3f, largest drop %.3f, 1 with pieces missing %d, before the priorities %.3f",
+           (unsigned long)published.count, lowest, published.lastObject.floatValue, drop, oneWithPiecesMissing, progressBefore]);
+
+    // The pieces that were missing, served with the right bytes.
+    int64_t const from = unwanted.empty() ? 0 : int64_t(static_cast<int>(unwanted.front().first)) << 20;
+    NSString *detail = nil;
+    BOOL const bytes = r->url && readAndCompare(r->url.port.intValue, s.fileName, p, from, p.size - from, 30, &detail);
+    check(bytes, @"the pieces that were missing are served with the right bytes", detail ?: @"");
+    [s cancelStreamingAndDeleteData:YES];
+    spin(2, nil);
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata|network|nofile|packs|restart|trackers <workdir> [tv|ios|mac]\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: SessionHarness zombie|starve|guest|background|legacy|premetadata|network|nofile|packs|restart|trackers|finish <workdir> [tv|ios|mac]\n"); return 2; }
         NSString *mode = [NSString stringWithUTF8String:argv[1]];
         NSString *work = [NSString stringWithUTF8String:argv[2]];
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
@@ -1476,6 +1581,7 @@ int main(int argc, const char *argv[]) {
         else if ([mode isEqualToString:@"packs"]) rc = runPacks(work);
         else if ([mode isEqualToString:@"restart"]) rc = runRestart(work);
         else if ([mode isEqualToString:@"trackers"]) rc = runTrackers(work);
+        else if ([mode isEqualToString:@"finish"]) rc = runFinish(work);
         logf(@"RESULT %@: %d passed, %d failed (rc %d)", mode, gPasses, gFailures, rc);
         [[NSFileManager defaultManager] removeItemAtPath:work error:nil];
         return gFailures > 0 ? 1 : rc;

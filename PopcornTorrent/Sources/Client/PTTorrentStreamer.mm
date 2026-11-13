@@ -31,6 +31,22 @@ int const PTTorrentStreamerNoFileIndex = -1;
 
 using namespace libtorrent;
 
+/// Full mode: the bytes of the selected file (`geometry`) in the pieces libtorrent has
+/// (`status.pieces`: passed their hash check), and whether it has them all; -1 when that is
+/// not known (no controller geometry or no pieces in the status yet).
+static int64_t presentFileBytes(ptbounded::FileGeometry const& geometry, torrent_status const& status, bool *complete) {
+    if (complete) *complete = false;
+    if (!geometry.valid() || status.pieces.size() <= geometry.lastPiece()) return -1;
+    int64_t present = 0;
+    bool all = true;
+    for (int32_t piece = geometry.firstPiece(); piece <= geometry.lastPiece(); ++piece) {
+        if (status.pieces.get_bit(piece_index_t(piece))) present += geometry.pieceBytes(piece);
+        else all = false;
+    }
+    if (complete) *complete = all;
+    return present;
+}
+
 @implementation PTTorrentStreamer {
     BOOL _allowsBoundedStorage;
     int64_t _storageReserve;
@@ -58,6 +74,9 @@ using namespace libtorrent;
     // The selection chose no file and the failure was reported (once: the metadata alert
     // and the direct call at start may both come).
     std::atomic<bool> _noFileReported;
+    // Full mode: libtorrent's "finished" alerts that came with pieces of the file missing
+    // (torrentFinishedAlert:), for storageStatistics.
+    std::atomic<int64_t> _earlyFinishes;
 }
 
 - (instancetype)init {
@@ -68,6 +87,7 @@ using namespace libtorrent;
         _monitorGeneration = 0;
         _monitorLoopGeneration = 0;
         _noFileReported = false;
+        _earlyFinishes = 0;
         selectedFileIndex = -1;
         // Opt-in: bounded storage only works when the consumer releases what it read
         // (setConsumedBefore:), which an app has to do on purpose.
@@ -929,6 +949,22 @@ using namespace libtorrent;
             downloaded = controller->everDownloadedBytes();
             finished = controller->isFileComplete();
             totalProgress = finished ? 1 : std::min(0.999f, float(double(downloaded) / double(MAX(1LL, _requiredSpace))));
+        } else {
+            // Full mode: the file's own pieces. libtorrent's progress is total_wanted_done /
+            // total_wanted, and the gap a forward seek or a resume leaves behind the reader is
+            // not wanted while the window ahead has missing pieces (planWindow, holdGap): the
+            // progress rose while the reader starved and fell back once the window was on disk
+            // (NetworkBench forward seek: 38, 22, 47, 32 %), and the direct path's recovery
+            // (directDataReady) waited for a share of the file instead of 0.4 %. Finished only
+            // with every piece of the file (a "finished" torrent may lack the gap, see
+            // torrentFinishedAlert:).
+            bool complete = false;
+            int64_t const present = presentFileBytes(controller->geometry(), status, &complete);
+            if (present >= 0) {
+                downloaded = present;
+                finished = finished && complete;
+                totalProgress = finished ? 1 : std::min(0.999f, float(double(present) / double(MAX(1LL, controller->fileSize()))));
+            }
         }
     }
     _torrentStatus = {
@@ -975,7 +1011,9 @@ using namespace libtorrent;
 /// there is nothing to publish.
 - (BOOL)publishTorrentProgress {
     BOOL const bounded = self.storageMode == PTStorageModeBounded;
-    if (!_progressBlock || !_torrentHandle.is_valid() || (self.status.is_finished && !bounded)) {
+    // Full mode stops at a real finish (_isFinished: every piece of the file), not at
+    // libtorrent's, which may come with the gap behind the reader missing.
+    if (!_progressBlock || !_torrentHandle.is_valid() || (_isFinished && !bounded)) {
         return NO;
     }
     if (bounded && [self failStarvedStart]) return NO;
@@ -1052,6 +1090,32 @@ using namespace libtorrent;
             if (_progressBlock) _progressBlock(_torrentStatus);
             [[NSNotificationCenter defaultCenter] postNotificationName:PTTorrentStatusDidChangeNotification object:self];
         });
+        return;
+    }
+
+    // Full mode: libtorrent finishes a torrent once no wanted piece is missing. The gap a
+    // forward seek or a resume leaves behind the reader is not wanted while the window ahead
+    // has missing pieces (planWindow, holdGap); when the last wanted pieces pass before the
+    // next plan wants the gap again, the torrent turns finished with the gap missing, then
+    // back to downloading at that plan (torrent::update_peer_interest). A download added in a
+    // folder another episode of its pack finished before 5.2.0 starts finished too (the
+    // folder's resume data wants only that episode's file). Not a finish: stopped here, the
+    // stream never fetched the gap (a seek back into it waited forever) and a download was kept
+    // as finished with a hole (that download, with its file empty).
+    auto controller = [self controller];
+    bool complete = true;
+    if (controller && controller->isConfigured()
+        && presentFileBytes(controller->geometry(), status, &complete) >= 0 && !complete) {
+        _earlyFinishes++;
+        NSLog(@"PopcornTorrent: torrent finished with pieces of the file missing (the gap behind the reader): not a finish");
+        [self refreshTorrentStatus:status];
+        // A plan that wants the missing pieces again (libtorrent then resumes the download),
+        // and the peers the finish dropped connected again at once, not in 60 s
+        // (min_reconnect_time; StreamController::apply for a torrent that knew only seeds).
+        controller->noteEarlyFinish();
+        [self.session retryDroppedPeersSoon];
+        // Publishes the status, and runs the 0.5 s loop again if it had stopped.
+        [self updateAndMonitorTorrentProgress];
         return;
     }
 
@@ -1300,6 +1364,7 @@ using namespace libtorrent;
         @"downloadLimit": @(s.downloadLimit),
         @"paceState": @(s.paceState),
         @"consumeRate": @(s.consumeRate),
+        @"earlyFinishes": @(_earlyFinishes.load()),
     };
 }
 

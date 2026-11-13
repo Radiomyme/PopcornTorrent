@@ -218,7 +218,8 @@ PlanOutput planWindow(PlanInput const& in) {
     // 6 MB/s from a 12 MB/s swarm). At 0 it is fetched whenever the window is on disk. One gap
     // piece stays wanted when nothing else beyond the window is (the sentinel): the window's
     // last piece must never be the last wanted one, or libtorrent marks the torrent finished
-    // (the stream stops it, and it drops its seeds) with the gap still missing.
+    // with the gap still missing and drops its seeds. Two pieces passing before the next plan
+    // still can (the stream ignores that finish: PTTorrentStreamer torrentFinishedAlert:).
     bool holdGap = false;
     bool gapSentinelNeeded = false;
     if (!in.bounded) {

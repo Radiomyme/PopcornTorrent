@@ -125,7 +125,7 @@ typedef NS_ENUM(NSInteger, PTStorageMode) {
 - (void)cancelStreamingAndDeleteData:(BOOL)deleteData;
     
 /**
- Status of the torrent that is currently streaming. Will return all 0 struct if no torrent is being streamed. In bounded mode `totalProgress` is the share of the file downloaded once and reaches 1 only if the whole file is on disk (`fileComplete`).
+ Status of the torrent that is currently streaming. Will return all 0 struct if no torrent is being streamed. In bounded mode `totalProgress` is the share of the file downloaded once and reaches 1 only if the whole file is on disk (`fileComplete`). In full mode it is the share of the selected file's pieces downloaded (never libtorrent's progress, which leaves out the gap behind the reader while it waits) and reaches 1 once every piece of the file is there.
  */
 @property (nonatomic, readonly) PTTorrentStatus torrentStatus;
 

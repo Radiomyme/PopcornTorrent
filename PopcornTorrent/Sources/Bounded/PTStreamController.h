@@ -125,6 +125,8 @@ public:
     bool isConfigured() const { return m_configured.load(); }
     bool isBounded() const { return m_bounded.load(); }
     int64_t fileSize() const { return m_configured ? m_config.geometry.fileSize : 0; }
+    /// Where the selected file sits in the torrent's pieces (invalid before `configure`).
+    FileGeometry geometry() const { return m_configured ? m_config.geometry : FileGeometry(); }
     void setReadPosition(int64_t offset);
     void setConsumedBefore(int64_t offset);
     void setTorrentBudget(int64_t bytes);
@@ -169,6 +171,10 @@ public:
     void setAvailabilityHandler(std::function<void()> handler);
     void cancel();
     void requestUpdate();
+    /// Full mode: libtorrent turned the torrent finished with pieces of the file missing
+    /// (PTTorrentStreamer torrentFinishedAlert:). Asks for a plan, and makes sure the torrent
+    /// connects to its known peers again once that plan wants the missing pieces (see apply).
+    void noteEarlyFinish();
     /// Shared torrents (a stream joined a download's torrent): only the newest controller of
     /// a torrent drives its priorities and deadlines. `suspendPlanning` hands the torrent
     /// over (this controller's deadlines are reset; its state, verification and HTTP reads go
@@ -288,6 +294,7 @@ private:
     bool m_cacheFlushRequested = false;
     std::atomic<void *> m_io{nullptr};
     std::atomic<bool> m_updatePosted{false};
+    std::atomic<bool> m_earlyFinish{false};   // noteEarlyFinish, until the torrent is not finished
     std::vector<uint8_t> m_appliedPriorities;
     std::map<int32_t, int> m_appliedDeadlines;
     bool m_initialSynced = false;

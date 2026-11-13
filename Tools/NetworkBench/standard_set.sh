@@ -8,7 +8,8 @@
 #   s1seek  the same stream read at 3 MB/s, a forward seek from 15 % to 90 % of the file
 #   s1seekhi  1 GiB read at 6 MB/s (a 4K remux's rate, half the swarm's), a forward seek from 5 %
 #           to 60 %: the gap left behind must not compete with the window (stall under 5 s;
-#           56 s when it did)
+#           56 s when it did), and the stream's progress must not go back (progressDrop 0;
+#           22 points when it was libtorrent's, which leaves the waiting gap out)
 #   s2      6 peers x 6 MB/s, RTT 40-140 ms: a stream of 1 GiB
 #   h       8 peers x 1.5 MB/s, RTT 1.2-1.5 s (distant peers, bloated uplinks): a download of
 #           256 MiB. The request queue must cover a peer's round trip (request_queue_time):

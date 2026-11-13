@@ -525,7 +525,11 @@ static int run(Options o) {
     std::vector<double> rates;
     std::mutex ratesMutex;
     int maxPeers = 0;
+    // The stream's own progress (torrentStatus.totalProgress), once a second: the largest fall
+    // below its highest value so far, in points (it must never go back).
+    std::atomic<double> progressDrop{0};
     std::thread sampler([&] {
+        float progressHigh = 0;
         int64_t lastDone = 0;
         Clock::time_point lastT = Clock::now();
         int tick = 0;
@@ -546,15 +550,26 @@ static int run(Options o) {
                         int(bool(st.flags & lt::torrent_flags::paused)), int(bool(st.flags & lt::torrent_flags::sequential_download)));
             }
             if (++tick % 10 == 0) {
+                // A finished download stops its torrent and its status goes back to 0: not a fall.
+                __block float progress = 0;
+                __block bool stopped = false;
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    progress = gStreamer.torrentStatus.totalProgress;
+                    stopped = isDownload && gDownload.downloadStatus == PTTorrentDownloadStatusFinished;
+                });
+                if (!stopped) {
+                    progressHigh = std::max(progressHigh, progress);
+                    progressDrop = std::max(progressDrop.load(), 100.0 * double(progressHigh - progress));
+                }
                 double const dt = std::chrono::duration<double>(Clock::now() - lastT).count();
                 double const rate = double(wantedDone - lastDone) / dt;
                 lastDone = wantedDone;
                 lastT = Clock::now();
                 std::lock_guard<std::mutex> lock(ratesMutex);
                 rates.push_back(rate);
-                logLine("t %5.1f  %6.2f MB/s  done %5.1f%%  peers %d  read %lld MiB", since(startTime), rate / 1e6,
+                logLine("t %5.1f  %6.2f MB/s  done %5.1f%%  progress %5.1f%%  peers %d  read %lld MiB", since(startTime), rate / 1e6,
                         valid && st.total_wanted > 0 ? 100.0 * double(st.total_wanted_done) / double(st.total_wanted) : 100.0,
-                        valid ? st.num_peers : 0, readBytes.load() / MiB);
+                        100.0 * progress, valid ? st.num_peers : 0, readBytes.load() / MiB);
                 if (valid && st.num_peers < int(proxies.size())) connectAll();
             }
         }
@@ -644,9 +659,10 @@ static int run(Options o) {
     double const readDone = readDoneAt.load();
     int64_t const readTotal = readBytes.load();
     double const readRate = readDone > 0 && readyAt > 0 ? double(readTotal) / (readDone - readyAt) / 1e6 : -1;
-    logLine("RESULT label=%s mode=%s profile=%s peers=%zu ready=%.2f firstMiB=%.2f readDone=%.2f readMBs=%.2f complete=%.2f avgMBs=%.2f peakMBs=%.2f stall=%.1f seek=%.2f rescued=%lld uploadedMiB=%lld maxPeers=%d",
+    logLine("RESULT label=%s mode=%s profile=%s peers=%zu ready=%.2f firstMiB=%.2f readDone=%.2f readMBs=%.2f complete=%.2f avgMBs=%.2f peakMBs=%.2f stall=%.1f seek=%.2f rescued=%lld uploadedMiB=%lld maxPeers=%d progressDrop=%.1f",
             o.label.c_str(), o.mode.c_str(), o.profile.empty() ? "-" : o.profile.c_str(), proxies.size(), readyAt.load(), firstMiBReadAt.load(),
-            readDone, readRate, complete, avg, peak / 1e6, stallSeconds.load(), seekLatency.load(), rescued, uploaded / MiB, maxPeers);
+            readDone, readRate, complete, avg, peak / 1e6, stallSeconds.load(), seekLatency.load(), rescued, uploaded / MiB, maxPeers,
+            progressDrop.load());
 
     dispatch_sync(dispatch_get_main_queue(), ^{
         if (isDownload) [gDownload stop];

@@ -53,4 +53,9 @@ class StreamController;
 /// time in the background (its sockets may have been reclaimed while it was suspended).
 - (void)reopenNetwork;
 
+/// Peers dropped a moment ago are retried at once for a little while (min_reconnect_time 1 s
+/// for 30 s, instead of 60 s), for every torrent: after a torrent that turned finished with
+/// pieces of its file missing dropped its seeds (PTTorrentStreamer torrentFinishedAlert:).
+- (void)retryDroppedPeersSoon;
+
 @end
